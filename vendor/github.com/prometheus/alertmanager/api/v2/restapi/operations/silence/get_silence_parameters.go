@@ -29,7 +29,8 @@ import (
 )
 
 // NewGetSilenceParams creates a new GetSilenceParams object
-// no default values defined in spec.
+//
+// There are no default values defined in the spec.
 func NewGetSilenceParams() GetSilenceParams {
 
 	return GetSilenceParams{}
@@ -40,7 +41,6 @@ func NewGetSilenceParams() GetSilenceParams {
 //
 // swagger:parameters getSilence
 type GetSilenceParams struct {
-
 	// HTTP Request Object
 	HTTPRequest *http.Request `json:"-"`
 
@@ -64,7 +64,6 @@ func (o *GetSilenceParams) BindRequest(r *http.Request, route *middleware.Matche
 	if err := o.bindSilenceID(rSilenceID, rhkSilenceID, route.Formats); err != nil {
 		res = append(res, err)
 	}
-
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
@@ -95,7 +94,7 @@ func (o *GetSilenceParams) bindSilenceID(rawData []string, hasKey bool, formats 
 	return nil
 }
 
-// validateSilenceID carries on validations for parameter SilenceID
+// validateSilenceID carries out validations for parameter SilenceID
 func (o *GetSilenceParams) validateSilenceID(formats strfmt.Registry) error {
 
 	if err := validate.FormatOf("silenceID", "path", "uuid", o.SilenceID.String(), formats); err != nil {

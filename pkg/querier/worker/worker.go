@@ -3,20 +3,24 @@ package worker
 import (
 	"context"
 	"flag"
+	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/grpcclient"
-	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/weaveworks/common/httpgrpc"
 	"google.golang.org/grpc"
 
+	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/grpcclient"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 type Config struct {
@@ -31,6 +35,12 @@ type Config struct {
 	QuerierID string `yaml:"id"`
 
 	GRPCClientConfig grpcclient.Config `yaml:"grpc_client_config"`
+
+	TargetHeaders []string `yaml:"-"` // Propagated by config.
+
+	InstanceInterfaceNames []string `yaml:"instance_interface_names"`
+	ListenPort             int      `yaml:"-"`
+	InstanceAddr           string   `yaml:"instance_addr" doc:"hidden"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
@@ -43,7 +53,11 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.MatchMaxConcurrency, "querier.worker-match-max-concurrent", false, "Force worker concurrency to match the -querier.max-concurrent option. Overrides querier.worker-parallelism.")
 	f.StringVar(&cfg.QuerierID, "querier.id", "", "Querier ID, sent to frontend service to identify requests from the same querier. Defaults to hostname.")
 
-	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("querier.frontend-client", f)
+	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("querier.frontend-client", "", f)
+
+	cfg.InstanceInterfaceNames = []string{"eth0", "en0"}
+	f.Var((*flagext.StringSlice)(&cfg.InstanceInterfaceNames), "querier.instance-interface-names", "Name of network interface to read address from.")
+	f.StringVar(&cfg.InstanceAddr, "querier.instance-addr", "", "IP address of the querier")
 }
 
 func (cfg *Config) Validate(log log.Logger) error {
@@ -107,7 +121,14 @@ func NewQuerierWorker(cfg Config, handler RequestHandler, log log.Logger, reg pr
 		level.Info(log).Log("msg", "Starting querier worker connected to query-scheduler", "scheduler", cfg.SchedulerAddress)
 
 		address = cfg.SchedulerAddress
-		processor, servs = newSchedulerProcessor(cfg, handler, log, reg)
+
+		ipAddr, err := ring.GetInstanceAddr(cfg.InstanceAddr, cfg.InstanceInterfaceNames, log)
+		if err != nil {
+			return nil, err
+		}
+		querierAddr := net.JoinHostPort(ipAddr, strconv.Itoa(cfg.ListenPort))
+
+		processor, servs = newSchedulerProcessor(cfg, handler, log, reg, querierAddr)
 
 	case cfg.FrontendAddress != "":
 		level.Info(log).Log("msg", "Starting querier worker connected to query-frontend", "frontend", cfg.FrontendAddress)
@@ -191,7 +212,7 @@ func (w *querierWorker) AddressAdded(address string) {
 	}
 
 	level.Info(w.log).Log("msg", "adding connection", "addr", address)
-	conn, err := w.connect(context.Background(), address)
+	conn, err := w.connect(address)
 	if err != nil {
 		level.Error(w.log).Log("msg", "error connecting", "addr", address, "err", err)
 		return
@@ -257,14 +278,14 @@ func (w *querierWorker) resetConcurrency() {
 	}
 }
 
-func (w *querierWorker) connect(ctx context.Context, address string) (*grpc.ClientConn, error) {
+func (w *querierWorker) connect(address string) (*grpc.ClientConn, error) {
 	// Because we only use single long-running method, it doesn't make sense to inject user ID, send over tracing or add metrics.
 	opts, err := w.cfg.GRPCClientConfig.DialOption(nil, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := grpc.DialContext(ctx, address, opts...)
+	conn, err := grpc.NewClient(address, opts...)
 	if err != nil {
 		return nil, err
 	}

@@ -27,7 +27,8 @@ import (
 )
 
 // NewGetStatusParams creates a new GetStatusParams object
-// no default values defined in spec.
+//
+// There are no default values defined in the spec.
 func NewGetStatusParams() GetStatusParams {
 
 	return GetStatusParams{}
@@ -38,7 +39,6 @@ func NewGetStatusParams() GetStatusParams {
 //
 // swagger:parameters getStatus
 type GetStatusParams struct {
-
 	// HTTP Request Object
 	HTTPRequest *http.Request `json:"-"`
 }

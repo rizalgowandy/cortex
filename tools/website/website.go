@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -20,7 +19,7 @@ func main() {
 		log.Fatal("provide a file to process")
 	}
 	filepath := os.Args[1]
-	buff, err := ioutil.ReadFile(filepath)
+	buff, err := os.ReadFile(filepath)
 	if err != nil {
 		panic(err)
 	}
@@ -33,19 +32,23 @@ func main() {
 		content = addPRLinks(content)
 	}
 
-	if err := ioutil.WriteFile(filepath, []byte(content), 0); err != nil {
+	if err := os.WriteFile(filepath, []byte(content), 0); err != nil {
 		panic(err)
 	}
 }
 
 var (
-	ref    = regexp.MustCompile(`\[([^\\\]]+?)\](\(.*?\))`)
-	link   = regexp.MustCompile(`(\(.*?\))`)
-	prRef  = regexp.MustCompile(`#(\d+)`)
-	images = regexp.MustCompile(`\..*images/(.*)\.(png|gif|jpeg|jpg|pdf)`)
+	ref     = regexp.MustCompile(`\[([^\\\]]+?)\](\(.*?\))`)
+	link    = regexp.MustCompile(`(\(.*?\))`)
+	prRef   = regexp.MustCompile(`#(\d+)`)
+	images  = regexp.MustCompile(`\..*images/(.*)\.(png|gif|jpeg|jpg|pdf)`)
+	diagram = regexp.MustCompile(`(\.\./)+tools/diagram/cortex-architecture\.html`)
 )
 
 func convertLinks(md string) string {
+	// the interactive diagram is linked repo-relatively so it resolves on GitHub; on the website
+	// tools/website/web-pre.sh copies it to website/static/diagrams/, so point at that path instead.
+	md = diagram.ReplaceAllString(md, "/diagrams/cortex-architecture.html")
 	// grabs relative image path and make then relative to the root of the website where the static images are served.
 	// images in the root folder `images/` of this repository are copied over the website/static/images/
 	md = images.ReplaceAllStringFunc(md, func(imagePath string) string {

@@ -3,14 +3,15 @@ package bucketindex
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/oklog/ulid"
-	"github.com/prometheus/prometheus/tsdb"
+	"github.com/oklog/ulid/v2"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
+	"github.com/cortexproject/cortex/pkg/storage/parquet"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util"
 )
@@ -51,17 +52,44 @@ func (idx *Index) GetUpdatedAt() time.Time {
 func (idx *Index) RemoveBlock(id ulid.ULID) {
 	for i := 0; i < len(idx.Blocks); i++ {
 		if idx.Blocks[i].ID == id {
-			idx.Blocks = append(idx.Blocks[:i], idx.Blocks[i+1:]...)
+			idx.Blocks = slices.Delete(idx.Blocks, i, i+1)
 			break
 		}
 	}
 
 	for i := 0; i < len(idx.BlockDeletionMarks); i++ {
 		if idx.BlockDeletionMarks[i].ID == id {
-			idx.BlockDeletionMarks = append(idx.BlockDeletionMarks[:i], idx.BlockDeletionMarks[i+1:]...)
+			idx.BlockDeletionMarks = slices.Delete(idx.BlockDeletionMarks, i, i+1)
 			break
 		}
 	}
+}
+
+func (idx *Index) IsEmpty() bool {
+	return len(idx.Blocks) == 0 && len(idx.BlockDeletionMarks) == 0
+}
+
+// ParquetBlocks returns all blocks that are available in Parquet format.
+func (idx *Index) ParquetBlocks() []*Block {
+	blocks := make([]*Block, 0, len(idx.Blocks))
+	for _, b := range idx.Blocks {
+		if b.Parquet != nil {
+			blocks = append(blocks, b)
+		}
+	}
+	return blocks
+}
+
+// NonParquetBlocks returns all blocks that are not available in Parquet format.
+func (idx *Index) NonParquetBlocks() []*Block {
+	blocks := make([]*Block, 0, len(idx.Blocks))
+	for _, b := range idx.Blocks {
+		if b.Parquet != nil {
+			continue
+		}
+		blocks = append(blocks, b)
+	}
+	return blocks
 }
 
 // Block holds the information about a block in the index.
@@ -80,9 +108,16 @@ type Block struct {
 	SegmentsFormat string `json:"segments_format,omitempty"`
 	SegmentsNum    int    `json:"segments_num,omitempty"`
 
+	// Max size in bytes of series and chunk in the block.
+	SeriesMaxSize int64 `json:"series_max_size,omitempty"`
+	ChunkMaxSize  int64 `json:"chunk_max_size,omitempty"`
+
 	// UploadedAt is a unix timestamp (seconds precision) of when the block has been completed to be uploaded
 	// to the storage.
 	UploadedAt int64 `json:"uploaded_at"`
+
+	// Parquet metadata if exists. If doesn't exist it will be nil.
+	Parquet *parquet.ConverterMarkMeta `json:"parquet,omitempty"`
 }
 
 // Within returns whether the block contains samples within the provided range.
@@ -101,18 +136,20 @@ func (m *Block) GetUploadedAt() time.Time {
 // of it.
 func (m *Block) ThanosMeta(userID string) *metadata.Meta {
 	return &metadata.Meta{
-		BlockMeta: tsdb.BlockMeta{
-			ULID:    m.ID,
-			MinTime: m.MinTime,
-			MaxTime: m.MaxTime,
-			Version: metadata.TSDBVersion1,
-		},
+		ULID:    m.ID,
+		MinTime: m.MinTime,
+		MaxTime: m.MaxTime,
+		Version: metadata.TSDBVersion1,
 		Thanos: metadata.Thanos{
 			Version: metadata.ThanosVersion1,
 			Labels: map[string]string{
 				cortex_tsdb.TenantIDExternalLabel: userID,
 			},
 			SegmentFiles: m.thanosMetaSegmentFiles(),
+			IndexStats: metadata.IndexStats{
+				SeriesMaxSize: m.SeriesMaxSize,
+				ChunkMaxSize:  m.ChunkMaxSize,
+			},
 		},
 	}
 }
@@ -143,6 +180,8 @@ func BlockFromThanosMeta(meta metadata.Meta) *Block {
 		MaxTime:        meta.MaxTime,
 		SegmentsFormat: segmentsFormat,
 		SegmentsNum:    segmentsNum,
+		SeriesMaxSize:  meta.Thanos.IndexStats.SeriesMaxSize,
+		ChunkMaxSize:   meta.Thanos.IndexStats.ChunkMaxSize,
 	}
 }
 
@@ -199,7 +238,7 @@ func (m *BlockDeletionMark) GetDeletionTime() time.Time {
 	return time.Unix(m.DeletionTime, 0)
 }
 
-// ThanosMeta returns the Thanos deletion mark.
+// ThanosDeletionMark returns the Thanos deletion mark.
 func (m *BlockDeletionMark) ThanosDeletionMark() *metadata.DeletionMark {
 	return &metadata.DeletionMark{
 		ID:           m.ID,

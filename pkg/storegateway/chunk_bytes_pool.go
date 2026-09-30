@@ -7,28 +7,30 @@ import (
 )
 
 type chunkBytesPool struct {
-	pool *pool.BucketedBytes
+	pool *pool.BucketedPool[byte]
 
 	// Metrics.
-	requestedBytes prometheus.Counter
-	returnedBytes  prometheus.Counter
+	poolByteStats  *prometheus.CounterVec
+	poolInUseBytes prometheus.GaugeFunc
 }
 
 func newChunkBytesPool(minBucketSize, maxBucketSize int, maxChunkPoolBytes uint64, reg prometheus.Registerer) (*chunkBytesPool, error) {
-	upstream, err := pool.NewBucketedBytes(minBucketSize, maxBucketSize, 2, maxChunkPoolBytes)
+	upstream, err := pool.NewBucketedPool[byte](minBucketSize, maxBucketSize, 2, maxChunkPoolBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	return &chunkBytesPool{
 		pool: upstream,
-		requestedBytes: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-			Name: "cortex_bucket_store_chunk_pool_requested_bytes_total",
-			Help: "Total bytes requested to chunk bytes pool.",
-		}),
-		returnedBytes: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-			Name: "cortex_bucket_store_chunk_pool_returned_bytes_total",
-			Help: "Total bytes returned by the chunk bytes pool.",
+		poolByteStats: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "cortex_bucket_store_chunk_pool_operation_bytes_total",
+			Help: "Total bytes number of bytes pooled by operation.",
+		}, []string{"operation", "stats"}),
+		poolInUseBytes: promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "cortex_bucket_store_chunk_pool_inuse_bytes",
+			Help: "Total bytes in use in the chunk pool.",
+		}, func() float64 {
+			return float64(upstream.UsedBytes())
 		}),
 	}, nil
 }
@@ -39,12 +41,14 @@ func (p *chunkBytesPool) Get(sz int) (*[]byte, error) {
 		return buffer, err
 	}
 
-	p.requestedBytes.Add(float64(sz))
-	p.returnedBytes.Add(float64(cap(*buffer)))
+	p.poolByteStats.WithLabelValues("get", "requested").Add(float64(sz))
+	p.poolByteStats.WithLabelValues("get", "cap").Add(float64(cap(*buffer)))
 
 	return buffer, err
 }
 
 func (p *chunkBytesPool) Put(b *[]byte) {
+	p.poolByteStats.WithLabelValues("put", "len").Add(float64(len(*b)))
+	p.poolByteStats.WithLabelValues("put", "cap").Add(float64(cap(*b)))
 	p.pool.Put(b)
 }

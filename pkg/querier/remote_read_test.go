@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
@@ -23,7 +24,8 @@ import (
 )
 
 func TestRemoteReadHandler(t *testing.T) {
-	q := storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+	t.Parallel()
+	q := storage.QueryableFunc(func(mint, maxt int64) (storage.Querier, error) {
 		return mockQuerier{
 			matrix: model.Matrix{
 				{
@@ -56,7 +58,7 @@ func TestRemoteReadHandler(t *testing.T) {
 
 	require.Equal(t, 200, recorder.Result().StatusCode)
 	require.Equal(t, []string([]string{"application/x-protobuf"}), recorder.Result().Header["Content-Type"])
-	responseBody, err := ioutil.ReadAll(recorder.Result().Body)
+	responseBody, err := io.ReadAll(recorder.Result().Body)
 	require.NoError(t, err)
 	responseBody, err = snappy.Decode(nil, responseBody)
 	require.NoError(t, err)
@@ -90,18 +92,18 @@ type mockQuerier struct {
 	matrix model.Matrix
 }
 
-func (m mockQuerier) Select(_ bool, sp *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+func (m mockQuerier) Select(ctx context.Context, sortSeries bool, sp *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	if sp == nil {
 		panic(fmt.Errorf("select params must be set"))
 	}
-	return series.MatrixToSeriesSet(m.matrix)
+	return series.MatrixToSeriesSet(sortSeries, m.matrix)
 }
 
-func (m mockQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+func (m mockQuerier) LabelValues(ctx context.Context, name string, _ *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	return nil, nil, nil
 }
 
-func (m mockQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+func (m mockQuerier) LabelNames(ctx context.Context, _ *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	return nil, nil, nil
 }
 

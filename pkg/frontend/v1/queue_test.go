@@ -9,21 +9,23 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc/metadata"
 
+	"github.com/cortexproject/cortex/pkg/frontend/transport"
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
-func setupFrontend(t *testing.T, config Config) (*Frontend, error) {
+func setupFrontend(t *testing.T, maxOutstanding int, config Config) (*Frontend, error) {
 	logger := log.NewNopLogger()
 
-	frontend, err := New(config, limits{queriers: 3}, logger, nil)
+	limits := MockLimits{Queriers: 3, MaxOutstanding: maxOutstanding}
+	frontend, err := New(config, limits, logger, nil, transport.NewRetry(0, nil))
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -48,10 +50,9 @@ func testReq(ctx context.Context, reqID, user string) *request {
 func TestDequeuesExpiredRequests(t *testing.T) {
 	var config Config
 	flagext.DefaultValues(&config)
-	config.MaxOutstandingPerTenant = 10
 	userID := "1"
 
-	f, err := setupFrontend(t, config)
+	f, err := setupFrontend(t, 10, config)
 	require.NoError(t, err)
 
 	ctx := user.InjectOrgID(context.Background(), userID)
@@ -59,7 +60,7 @@ func TestDequeuesExpiredRequests(t *testing.T) {
 	cancel()
 
 	good := 0
-	for i := 0; i < config.MaxOutstandingPerTenant; i++ {
+	for i := range 10 {
 		var err error
 		if i%5 == 0 {
 			good++
@@ -96,12 +97,10 @@ func TestRoundRobinQueues(t *testing.T) {
 		tenants  = 10
 	)
 
-	config.MaxOutstandingPerTenant = requests
-
-	f, err := setupFrontend(t, config)
+	f, err := setupFrontend(t, requests, config)
 	require.NoError(t, err)
 
-	for i := 0; i < requests; i++ {
+	for i := range requests {
 		userID := fmt.Sprint(i / tenants)
 		ctx := user.InjectOrgID(context.Background(), userID)
 
@@ -167,5 +166,5 @@ func (p *processServerMock) SetHeader(_ metadata.MD) error  { return nil }
 func (p *processServerMock) SendHeader(_ metadata.MD) error { return nil }
 func (p *processServerMock) SetTrailer(md metadata.MD)      {}
 func (p *processServerMock) Context() context.Context       { return p.ctx }
-func (p *processServerMock) SendMsg(m interface{}) error    { return nil }
-func (p *processServerMock) RecvMsg(m interface{}) error    { return nil }
+func (p *processServerMock) SendMsg(m any) error            { return nil }
+func (p *processServerMock) RecvMsg(m any) error            { return nil }

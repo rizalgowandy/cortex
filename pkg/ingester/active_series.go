@@ -1,17 +1,12 @@
 package ingester
 
 import (
-	"hash"
 	"math"
 	"sync"
 	"time"
 
-	"github.com/cespare/xxhash"
-	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"go.uber.org/atomic"
-
-	"github.com/cortexproject/cortex/pkg/util"
 )
 
 const (
@@ -30,22 +25,24 @@ type activeSeriesStripe struct {
 	// without holding the lock -- hence the atomic).
 	oldestEntryTs atomic.Int64
 
-	mu     sync.RWMutex
-	refs   map[uint64][]activeSeriesEntry
-	active int // Number of active entries in this stripe. Only decreased during purge or clear.
+	mu                    sync.RWMutex
+	refs                  map[uint64][]activeSeriesEntry
+	active                int // Number of active entries in this stripe. Only decreased during purge or clear.
+	activeNativeHistogram int // Number of active entries only for Native Histogram in this stripe. Only decreased during purge or clear.
 }
 
 // activeSeriesEntry holds a timestamp for single series.
 type activeSeriesEntry struct {
-	lbs   labels.Labels
-	nanos *atomic.Int64 // Unix timestamp in nanoseconds. Needs to be a pointer because we don't store pointers to entries in the stripe.
+	lbs               labels.Labels
+	nanos             *atomic.Int64 // Unix timestamp in nanoseconds. Needs to be a pointer because we don't store pointers to entries in the stripe.
+	isNativeHistogram bool
 }
 
 func NewActiveSeries() *ActiveSeries {
 	c := &ActiveSeries{}
 
 	// Stripes are pre-allocated so that we only read on them and no lock is required.
-	for i := 0; i < numActiveSeriesStripes; i++ {
+	for i := range numActiveSeriesStripes {
 		c.stripes[i].refs = map[uint64][]activeSeriesEntry{}
 	}
 
@@ -53,67 +50,55 @@ func NewActiveSeries() *ActiveSeries {
 }
 
 // Updates series timestamp to 'now'. Function is called to make a copy of labels if entry doesn't exist yet.
-func (c *ActiveSeries) UpdateSeries(series labels.Labels, now time.Time, labelsCopy func(labels.Labels) labels.Labels) {
-	fp := fingerprint(series)
-	stripeID := fp % numActiveSeriesStripes
+func (c *ActiveSeries) UpdateSeries(series labels.Labels, hash uint64, now time.Time, nativeHistogram bool, labelsCopy func(labels.Labels) labels.Labels) {
+	stripeID := hash % numActiveSeriesStripes
 
-	c.stripes[stripeID].updateSeriesTimestamp(now, series, fp, labelsCopy)
-}
-
-var sep = []byte{model.SeparatorByte}
-
-var hashPool = sync.Pool{New: func() interface{} { return xxhash.New() }}
-
-func fingerprint(series labels.Labels) uint64 {
-	sum := hashPool.Get().(hash.Hash64)
-	defer hashPool.Put(sum)
-
-	sum.Reset()
-	for _, label := range series {
-		_, _ = sum.Write(util.YoloBuf(label.Name))
-		_, _ = sum.Write(sep)
-		_, _ = sum.Write(util.YoloBuf(label.Value))
-		_, _ = sum.Write(sep)
-	}
-
-	return sum.Sum64()
+	c.stripes[stripeID].updateSeriesTimestamp(now, series, hash, nativeHistogram, labelsCopy)
 }
 
 // Purge removes expired entries from the cache. This function should be called
 // periodically to avoid memory leaks.
 func (c *ActiveSeries) Purge(keepUntil time.Time) {
-	for s := 0; s < numActiveSeriesStripes; s++ {
+	for s := range numActiveSeriesStripes {
 		c.stripes[s].purge(keepUntil)
 	}
 }
 
-//nolint // Linter reports that this method is unused, but it is.
+// nolint // Linter reports that this method is unused, but it is.
 func (c *ActiveSeries) clear() {
-	for s := 0; s < numActiveSeriesStripes; s++ {
+	for s := range numActiveSeriesStripes {
 		c.stripes[s].clear()
 	}
 }
 
 func (c *ActiveSeries) Active() int {
 	total := 0
-	for s := 0; s < numActiveSeriesStripes; s++ {
+	for s := range numActiveSeriesStripes {
 		total += c.stripes[s].getActive()
 	}
 	return total
 }
 
-func (s *activeSeriesStripe) updateSeriesTimestamp(now time.Time, series labels.Labels, fingerprint uint64, labelsCopy func(labels.Labels) labels.Labels) {
+func (c *ActiveSeries) ActiveNativeHistogram() int {
+	total := 0
+	for s := range numActiveSeriesStripes {
+		total += c.stripes[s].getActiveNativeHistogram()
+	}
+	return total
+}
+
+func (s *activeSeriesStripe) updateSeriesTimestamp(now time.Time, series labels.Labels, fingerprint uint64, nativeHistogram bool, labelsCopy func(labels.Labels) labels.Labels) {
 	nowNanos := now.UnixNano()
 
 	e := s.findEntryForSeries(fingerprint, series)
 	entryTimeSet := false
 	if e == nil {
-		e, entryTimeSet = s.findOrCreateEntryForSeries(fingerprint, series, nowNanos, labelsCopy)
+		e, entryTimeSet = s.findOrCreateEntryForSeries(fingerprint, series, nowNanos, nativeHistogram, labelsCopy)
 	}
 
 	if !entryTimeSet {
 		if prev := e.Load(); nowNanos > prev {
-			entryTimeSet = e.CAS(prev, nowNanos)
+			entryTimeSet = e.CompareAndSwap(prev, nowNanos)
 		}
 	}
 
@@ -121,7 +106,7 @@ func (s *activeSeriesStripe) updateSeriesTimestamp(now time.Time, series labels.
 		for prevOldest := s.oldestEntryTs.Load(); nowNanos < prevOldest; {
 			// If recent purge already removed entries older than "oldest entry timestamp", setting this to 0 will make
 			// sure that next purge doesn't take the shortcut route.
-			if s.oldestEntryTs.CAS(prevOldest, 0) {
+			if s.oldestEntryTs.CompareAndSwap(prevOldest, 0) {
 				break
 			}
 		}
@@ -142,7 +127,7 @@ func (s *activeSeriesStripe) findEntryForSeries(fingerprint uint64, series label
 	return nil
 }
 
-func (s *activeSeriesStripe) findOrCreateEntryForSeries(fingerprint uint64, series labels.Labels, nowNanos int64, labelsCopy func(labels.Labels) labels.Labels) (*atomic.Int64, bool) {
+func (s *activeSeriesStripe) findOrCreateEntryForSeries(fingerprint uint64, series labels.Labels, nowNanos int64, nativeHistogram bool, labelsCopy func(labels.Labels) labels.Labels) (*atomic.Int64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -154,9 +139,13 @@ func (s *activeSeriesStripe) findOrCreateEntryForSeries(fingerprint uint64, seri
 	}
 
 	s.active++
+	if nativeHistogram {
+		s.activeNativeHistogram++
+	}
 	e := activeSeriesEntry{
-		lbs:   labelsCopy(series),
-		nanos: atomic.NewInt64(nowNanos),
+		lbs:               labelsCopy(series),
+		nanos:             atomic.NewInt64(nowNanos),
+		isNativeHistogram: nativeHistogram,
 	}
 
 	s.refs[fingerprint] = append(s.refs[fingerprint], e)
@@ -164,7 +153,7 @@ func (s *activeSeriesStripe) findOrCreateEntryForSeries(fingerprint uint64, seri
 	return e.nanos, true
 }
 
-//nolint // Linter reports that this method is unused, but it is.
+// nolint // Linter reports that this method is unused, but it is.
 func (s *activeSeriesStripe) clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -185,6 +174,7 @@ func (s *activeSeriesStripe) purge(keepUntil time.Time) {
 	defer s.mu.Unlock()
 
 	active := 0
+	activeNativeHistogram := 0
 
 	oldest := int64(math.MaxInt64)
 	for fp, entries := range s.refs {
@@ -198,6 +188,9 @@ func (s *activeSeriesStripe) purge(keepUntil time.Time) {
 			}
 
 			active++
+			if entries[0].isNativeHistogram {
+				activeNativeHistogram++
+			}
 			if ts < oldest {
 				oldest = ts
 			}
@@ -224,6 +217,11 @@ func (s *activeSeriesStripe) purge(keepUntil time.Time) {
 			delete(s.refs, fp)
 		} else {
 			active += cnt
+			for _, e := range entries {
+				if e.isNativeHistogram {
+					activeNativeHistogram++
+				}
+			}
 			s.refs[fp] = entries
 		}
 	}
@@ -234,6 +232,7 @@ func (s *activeSeriesStripe) purge(keepUntil time.Time) {
 		s.oldestEntryTs.Store(oldest)
 	}
 	s.active = active
+	s.activeNativeHistogram = activeNativeHistogram
 }
 
 func (s *activeSeriesStripe) getActive() int {
@@ -241,4 +240,21 @@ func (s *activeSeriesStripe) getActive() int {
 	defer s.mu.RUnlock()
 
 	return s.active
+}
+
+func (s *activeSeriesStripe) getActiveNativeHistogram() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.activeNativeHistogram
+}
+
+// matchesAll returns true if the labels satisfy all given matchers.
+func matchesAll(lbs labels.Labels, matchers []*labels.Matcher) bool {
+	for _, m := range matchers {
+		if !m.Matches(lbs.Get(m.Name)) {
+			return false
+		}
+	}
+	return true
 }

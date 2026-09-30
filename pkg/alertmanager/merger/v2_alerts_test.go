@@ -18,16 +18,16 @@ func TestV2Alerts(t *testing.T) {
 		[]byte(`[` +
 			`{"annotations":{},"endsAt":"2021-04-21T10:47:32.161+02:00","fingerprint":"c4b6b79a607b6ba0",` +
 			`"receivers":[{"name":"dummy"}],"startsAt":"2021-04-21T09:47:32.161+02:00",` +
-			`"status":{"inhibitedBy":[],"silencedBy":[],"state":"unprocessed"},` +
+			`"status":{"inhibitedBy":[],"mutedBy":[],"silencedBy":[],"state":"unprocessed"},` +
 			`"updatedAt":"2021-04-21T07:47:32.163Z","labels":{"group":"group_1","name":"alert_1"}},` +
 			`{"annotations":{},"endsAt":"2021-04-21T10:47:32.163+02:00","fingerprint":"c4b8b79a607bee77",` +
 			`"receivers":[{"name":"dummy"}],"startsAt":"2021-04-21T09:47:32.163+02:00",` +
-			`"status":{"inhibitedBy":[],"silencedBy":[],"state":"unprocessed"},` +
+			`"status":{"inhibitedBy":[],"mutedBy":[],"silencedBy":[],"state":"unprocessed"},` +
 			`"updatedAt":"2021-04-21T07:47:32.165Z","labels":{"group":"group_1","name":"alert_2"}}` +
 			`]`),
 		[]byte(`[{"annotations":{},"endsAt":"2021-04-21T10:47:32.165+02:00","fingerprint":"465de60f606461c3",` +
 			`"receivers":[{"name":"dummy"}],"startsAt":"2021-04-21T09:47:32.165+02:00",` +
-			`"status":{"inhibitedBy":[],"silencedBy":[],"state":"unprocessed"},` +
+			`"status":{"inhibitedBy":[], "mutedBy":[], "silencedBy":[],"state":"unprocessed"},` +
 			`"updatedAt":"2021-04-21T07:47:32.167Z","labels":{"group":"group_2","name":"alert_3"}}]`),
 		[]byte(`[]`),
 	}
@@ -35,15 +35,15 @@ func TestV2Alerts(t *testing.T) {
 	expected := []byte(`[` +
 		`{"annotations":{},"endsAt":"2021-04-21T10:47:32.165+02:00","fingerprint":"465de60f606461c3",` +
 		`"receivers":[{"name":"dummy"}],"startsAt":"2021-04-21T09:47:32.165+02:00",` +
-		`"status":{"inhibitedBy":[],"silencedBy":[],"state":"unprocessed"},` +
+		`"status":{"inhibitedBy":[],"mutedBy":[],"silencedBy":[],"state":"unprocessed"},` +
 		`"updatedAt":"2021-04-21T07:47:32.167Z","labels":{"group":"group_2","name":"alert_3"}},` +
 		`{"annotations":{},"endsAt":"2021-04-21T10:47:32.161+02:00","fingerprint":"c4b6b79a607b6ba0",` +
 		`"receivers":[{"name":"dummy"}],"startsAt":"2021-04-21T09:47:32.161+02:00",` +
-		`"status":{"inhibitedBy":[],"silencedBy":[],"state":"unprocessed"},` +
+		`"status":{"inhibitedBy":[],"mutedBy":[],"silencedBy":[],"state":"unprocessed"},` +
 		`"updatedAt":"2021-04-21T07:47:32.163Z","labels":{"group":"group_1","name":"alert_1"}},` +
 		`{"annotations":{},"endsAt":"2021-04-21T10:47:32.163+02:00","fingerprint":"c4b8b79a607bee77",` +
 		`"receivers":[{"name":"dummy"}],"startsAt":"2021-04-21T09:47:32.163+02:00",` +
-		`"status":{"inhibitedBy":[],"silencedBy":[],"state":"unprocessed"},` +
+		`"status":{"inhibitedBy":[],"mutedBy":[],"silencedBy":[],"state":"unprocessed"},` +
 		`"updatedAt":"2021-04-21T07:47:32.165Z","labels":{"group":"group_1","name":"alert_2"}}` +
 		`]`)
 
@@ -68,18 +68,16 @@ func v2alert(fingerprint, annotation, updatedAt string) *v2_models.GettableAlert
 		},
 		EndsAt:      v2ParseTime("2020-01-01T12:00:00.000Z"),
 		Fingerprint: &fingerprint,
-		Receivers: []*v2_models.Receiver{
+		Receivers: []*v2_models.ReceiverReference{
 			{
 				Name: &receiver,
 			},
 		},
-		StartsAt:  v2ParseTime("2020-01-01T12:00:00.000Z"),
-		Status:    &v2_models.AlertStatus{},
-		UpdatedAt: v2ParseTime(updatedAt),
-		Alert: v2_models.Alert{
-			GeneratorURL: strfmt.URI("something"),
-			Labels:       v2_models.LabelSet{"label1": "foo"},
-		},
+		StartsAt:     v2ParseTime("2020-01-01T12:00:00.000Z"),
+		Status:       &v2_models.AlertStatus{},
+		UpdatedAt:    v2ParseTime(updatedAt),
+		GeneratorURL: strfmt.URI("something"),
+		Labels:       v2_models.LabelSet{"label1": "foo"},
 	}
 }
 

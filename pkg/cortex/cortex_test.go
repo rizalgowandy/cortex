@@ -4,45 +4,50 @@ import (
 	"bytes"
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"net"
-	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/kv"
-	"github.com/grafana/dskit/ring"
-	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/server"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/cortexproject/cortex/pkg/chunk/aws"
-	"github.com/cortexproject/cortex/pkg/chunk/storage"
+	"github.com/cortexproject/cortex/pkg/alertmanager"
+	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
+	"github.com/cortexproject/cortex/pkg/configs"
+	"github.com/cortexproject/cortex/pkg/cortex/storage"
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
 	"github.com/cortexproject/cortex/pkg/ingester"
-	"github.com/cortexproject/cortex/pkg/ruler"
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
+	"github.com/cortexproject/cortex/pkg/ruler/rulestore/local"
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/bucket/s3"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 func TestCortex(t *testing.T) {
-	rulerURL, err := url.Parse("inmemory:///rules")
-	require.NoError(t, err)
-
 	cfg := Config{
 		// Include the network names here explicitly. When CLI flags are registered
 		// these values are set as defaults but since we aren't registering them, we
 		// need to include the defaults here. These were hardcoded in a previous version
 		// of weaveworks server.
+		NameValidationScheme: model.LegacyValidation,
 		Server: server.Config{
 			GRPCListenNetwork: server.DefaultNetwork,
 			HTTPListenNetwork: server.DefaultNetwork,
@@ -55,7 +60,8 @@ func TestCortex(t *testing.T) {
 				Bucket: bucket.Config{
 					Backend: bucket.S3,
 					S3: s3.Config{
-						Endpoint: "localhost",
+						Endpoint:         "localhost",
+						BucketLookupType: s3.BucketPathLookup,
 					},
 				},
 			},
@@ -73,7 +79,8 @@ func TestCortex(t *testing.T) {
 			Bucket: bucket.Config{
 				Backend: bucket.S3,
 				S3: s3.Config{
-					Endpoint: "localhost",
+					Endpoint:         "localhost",
+					BucketLookupType: s3.BucketPathLookup,
 				},
 			},
 			BucketStore: tsdb.BucketStoreConfig{
@@ -82,21 +89,36 @@ func TestCortex(t *testing.T) {
 				IndexCache: tsdb.IndexCacheConfig{
 					Backend: tsdb.IndexCacheBackendInMemory,
 				},
+				BucketStoreType: string(tsdb.TSDBBucketStore),
+			},
+			UsersScanner: users.UsersScannerConfig{
+				Strategy: users.UserScanStrategyList,
 			},
 		},
-		Ruler: ruler.Config{
-			StoreConfig: ruler.RuleStoreConfig{
-				Type: "s3",
-				S3: aws.S3Config{
-					S3: flagext.URLValue{
-						URL: rulerURL,
-					},
-				},
+		RulerStorage: rulestore.Config{
+			Config: bucket.Config{
+				Backend: "local",
+			},
+			Local: local.Config{
+				Directory: os.TempDir(),
 			},
 		},
-
-		Target: []string{All, Compactor},
+		AlertmanagerStorage: alertstore.Config{
+			Config: bucket.Config{
+				Backend: "local",
+			},
+		},
+		Target: []string{All},
 	}
+
+	externalURL := flagext.URLValue{}
+	err := externalURL.Set("http://localhost/alertmanager")
+	require.NoError(t, err)
+
+	multiAlertmanagerCfg := &alertmanager.MultitenantAlertmanagerConfig{}
+	flagext.DefaultValues(multiAlertmanagerCfg)
+	multiAlertmanagerCfg.ExternalURL = externalURL
+	cfg.Alertmanager = *multiAlertmanagerCfg
 
 	c, err := New(cfg)
 	require.NoError(t, err)
@@ -116,8 +138,9 @@ func TestCortex(t *testing.T) {
 	require.NotNil(t, serviceMap[Ring])
 	require.NotNil(t, serviceMap[DistributorService])
 
-	// check that compactor is configured which is not part of Target=All
+	// check compactor and alertmanager are configured.
 	require.NotNil(t, serviceMap[Compactor])
+	require.NotNil(t, serviceMap[AlertManager])
 }
 
 func TestConfigValidation(t *testing.T) {
@@ -151,11 +174,129 @@ func TestConfigValidation(t *testing.T) {
 			},
 			expectedError: errInvalidHTTPPrefix,
 		},
+		{
+			name: "should fail validation if federated rules are enabled without tenant federation",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.Ruler.EnableFederatedRules = true
+				return configuration
+			},
+			expectedError: errRulerFederatedRulesRequireTenantFederation,
+		},
+		{
+			name: "should pass validation if federated rules are enabled with tenant federation",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.Ruler.EnableFederatedRules = true
+				configuration.TenantFederation.Enabled = true
+				return configuration
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should fail validation for invalid resource to monitor",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.ResourceMonitor = configs.ResourceMonitor{
+					Resources: []string{"wrong"},
+				}
+				return configuration
+			},
+			expectedError: fmt.Errorf("unsupported resource type to monitor: %s", "wrong"),
+		},
+		{
+			name: "should fail validation for invalid resource to monitor - 2",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.ResourceMonitor = configs.ResourceMonitor{
+					Interval: -1,
+				}
+				return configuration
+			},
+			expectedError: fmt.Errorf("resource monitor interval must be greater than zero"),
+		},
+		{
+			name: "should fail validation for invalid resource to monitor - 3",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.ResourceMonitor = configs.ResourceMonitor{
+					Interval:        time.Second,
+					CPURateInterval: time.Millisecond,
+				}
+				return configuration
+			},
+			expectedError: fmt.Errorf("resource monitor cpu rate interval cannot be smaller than resource monitor interval"),
+		},
+		{
+			name: "should not fail validation for valid resources to monitor",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.ResourceMonitor = configs.ResourceMonitor{
+					Resources:       []string{"cpu", "heap"},
+					Interval:        time.Second,
+					CPURateInterval: time.Minute,
+				}
+				return configuration
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should pass utf8 name validation scheme",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.NameValidationScheme = model.UTF8Validation
+				return configuration
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should fail unset name validation scheme",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.NameValidationScheme = model.UnsetValidation
+				return configuration
+			},
+			expectedError: fmt.Errorf("unsupported name validation scheme: unset"),
+		},
+		{
+			name: "should fail when timeout classification is enabled but query stats is disabled",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.Querier.TimeoutClassificationEnabled = true
+				configuration.Querier.TimeoutClassificationDeadline = time.Minute + 59*time.Second
+				configuration.Querier.TimeoutClassificationEvalThreshold = time.Minute + 30*time.Second
+				configuration.Frontend.Handler.QueryStatsEnabled = false
+				return configuration
+			},
+			expectedError: errTimeoutClassificationRequiresQueryStats,
+		},
+		{
+			name: "should pass when timeout classification is enabled and query stats is enabled",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.Querier.TimeoutClassificationEnabled = true
+				configuration.Querier.TimeoutClassificationDeadline = time.Minute + 59*time.Second
+				configuration.Querier.TimeoutClassificationEvalThreshold = time.Minute + 30*time.Second
+				configuration.Frontend.Handler.QueryStatsEnabled = true
+				return configuration
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should pass when timeout classification is disabled and query stats is disabled",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.Querier.TimeoutClassificationEnabled = false
+				configuration.Frontend.Handler.QueryStatsEnabled = false
+				return configuration
+			},
+			expectedError: nil,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.getTestConfig().Validate(nil)
 			if tc.expectedError != nil {
-				require.Equal(t, tc.expectedError, err)
+				require.ErrorContains(t, err, tc.expectedError.Error())
 			} else {
 				require.NoError(t, err)
 			}
@@ -167,9 +308,10 @@ func TestGrpcAuthMiddleware(t *testing.T) {
 	prepareGlobalMetricsRegistry(t)
 
 	cfg := Config{
-		AuthEnabled: true, // We must enable this to enable Auth middleware for gRPC server.
-		Server:      getServerConfig(t),
-		Target:      []string{API}, // Something innocent that doesn't require much config.
+		AuthEnabled:          true, // We must enable this to enable Auth middleware for gRPC server.
+		Server:               getServerConfig(t),
+		Target:               []string{API}, // Something innocent that doesn't require much config.
+		NameValidationScheme: model.LegacyValidation,
 	}
 
 	msch := &mockGrpcServiceHandler{}
@@ -192,7 +334,7 @@ func TestGrpcAuthMiddleware(t *testing.T) {
 		}()
 	}
 
-	conn, err := grpc.Dial(net.JoinHostPort(cfg.Server.GRPCListenAddress, strconv.Itoa(cfg.Server.GRPCListenPort)), grpc.WithInsecure())
+	conn, err := grpc.NewClient(net.JoinHostPort(cfg.Server.GRPCListenAddress, strconv.Itoa(cfg.Server.GRPCListenPort)), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, conn.Close())

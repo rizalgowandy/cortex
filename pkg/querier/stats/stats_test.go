@@ -8,6 +8,26 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestStats_Copy(t *testing.T) {
+	t.Run("stats is nil", func(t *testing.T) {
+		var stats *QueryStats
+		copied := stats.Copy()
+		assert.Nil(t, copied)
+	})
+	t.Run("stats is not nil", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddWallTime(time.Second)
+		copied := stats.Copy()
+
+		// value should be the same
+		assert.Equal(t, time.Second, copied.LoadWallTime())
+		p1, p2 := &copied, &stats
+
+		// address should be different
+		assert.False(t, p1 == p2)
+	})
+}
+
 func TestStats_WallTime(t *testing.T) {
 	t.Run("add and load wall time", func(t *testing.T) {
 		stats, _ := ContextWithEmptyStats(context.Background())
@@ -18,7 +38,7 @@ func TestStats_WallTime(t *testing.T) {
 	})
 
 	t.Run("add and load wall time nil receiver", func(t *testing.T) {
-		var stats *Stats
+		var stats *QueryStats
 		stats.AddWallTime(time.Second)
 
 		assert.Equal(t, time.Duration(0), stats.LoadWallTime())
@@ -26,6 +46,7 @@ func TestStats_WallTime(t *testing.T) {
 }
 
 func TestStats_AddFetchedSeries(t *testing.T) {
+	t.Parallel()
 	t.Run("add and load series", func(t *testing.T) {
 		stats, _ := ContextWithEmptyStats(context.Background())
 		stats.AddFetchedSeries(100)
@@ -35,14 +56,33 @@ func TestStats_AddFetchedSeries(t *testing.T) {
 	})
 
 	t.Run("add and load series nil receiver", func(t *testing.T) {
-		var stats *Stats
+		var stats *QueryStats
 		stats.AddFetchedSeries(50)
 
 		assert.Equal(t, uint64(0), stats.LoadFetchedSeries())
 	})
 }
 
+func TestQueryStats_AddExtraFields(t *testing.T) {
+	t.Parallel()
+	t.Run("add and load extra fields", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddExtraFields("a", "b")
+		stats.AddExtraFields("c")
+
+		checkExtraFields(t, []any{"a", "b", "c", ""}, stats.LoadExtraFields())
+	})
+
+	t.Run("add and load extra fields nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.AddExtraFields("a", "b")
+
+		checkExtraFields(t, []any{}, stats.LoadExtraFields())
+	})
+}
+
 func TestStats_AddFetchedChunkBytes(t *testing.T) {
+	t.Parallel()
 	t.Run("add and load bytes", func(t *testing.T) {
 		stats, _ := ContextWithEmptyStats(context.Background())
 		stats.AddFetchedChunkBytes(4096)
@@ -52,40 +92,286 @@ func TestStats_AddFetchedChunkBytes(t *testing.T) {
 	})
 
 	t.Run("add and load bytes nil receiver", func(t *testing.T) {
-		var stats *Stats
+		var stats *QueryStats
 		stats.AddFetchedChunkBytes(1024)
 
 		assert.Equal(t, uint64(0), stats.LoadFetchedChunkBytes())
 	})
 }
 
+func TestStats_AddFetchedDataBytes(t *testing.T) {
+	t.Parallel()
+	t.Run("add and load bytes", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddFetchedDataBytes(4096)
+		stats.AddFetchedDataBytes(4096)
+
+		assert.Equal(t, uint64(8192), stats.LoadFetchedDataBytes())
+	})
+
+	t.Run("add and load bytes nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.AddFetchedDataBytes(1024)
+
+		assert.Equal(t, uint64(0), stats.LoadFetchedDataBytes())
+	})
+}
+
+func TestStats_AddFetchedChunks(t *testing.T) {
+	t.Parallel()
+	t.Run("add and load chunks", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddFetchedChunks(4096)
+		stats.AddFetchedChunks(4096)
+
+		assert.Equal(t, uint64(8192), stats.LoadFetchedChunks())
+	})
+
+	t.Run("add and load chunks nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.AddFetchedChunks(1024)
+
+		assert.Equal(t, uint64(0), stats.LoadFetchedChunks())
+	})
+}
+
+func TestStats_AddFetchedSamples(t *testing.T) {
+	t.Parallel()
+	t.Run("add and load samples", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddFetchedSamples(4096)
+		stats.AddFetchedSamples(4096)
+
+		assert.Equal(t, uint64(8192), stats.LoadFetchedSamples())
+	})
+
+	t.Run("add and load samples nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.AddFetchedSamples(1024)
+
+		assert.Equal(t, uint64(0), stats.LoadFetchedSamples())
+	})
+}
+
+func TestStats_AddStoreGatewayTouchedPostings(t *testing.T) {
+	t.Parallel()
+	t.Run("add and load touched postings", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddStoreGatewayTouchedPostings(4096)
+		stats.AddStoreGatewayTouchedPostings(4096)
+
+		assert.Equal(t, uint64(8192), stats.LoadStoreGatewayTouchedPostings())
+	})
+
+	t.Run("add and load touched postings nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.AddStoreGatewayTouchedPostings(4096)
+
+		assert.Equal(t, uint64(0), stats.LoadStoreGatewayTouchedPostings())
+	})
+}
+
+func TestStats_AddStoreGatewayTouchedPostingBytes(t *testing.T) {
+	t.Parallel()
+	t.Run("add and load touched postings bytes", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddStoreGatewayTouchedPostingBytes(4096)
+		stats.AddStoreGatewayTouchedPostingBytes(4096)
+
+		assert.Equal(t, uint64(8192), stats.LoadStoreGatewayTouchedPostingBytes())
+	})
+
+	t.Run("add and load touched posting bytes nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.AddStoreGatewayTouchedPostingBytes(4096)
+
+		assert.Equal(t, uint64(0), stats.LoadStoreGatewayTouchedPostingBytes())
+	})
+}
+
+func TestStats_StorageWallTime(t *testing.T) {
+	t.Run("add and load query storage wall time", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddQueryStorageWallTime(time.Second)
+		stats.AddQueryStorageWallTime(time.Second)
+
+		assert.Equal(t, 2*time.Second, stats.LoadQueryStorageWallTime())
+	})
+
+	t.Run("add and load query storage wall time nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.AddQueryStorageWallTime(time.Second)
+
+		assert.Equal(t, time.Duration(0), stats.LoadQueryStorageWallTime())
+	})
+}
+
 func TestStats_Merge(t *testing.T) {
+	t.Parallel()
 	t.Run("merge two stats objects", func(t *testing.T) {
-		stats1 := &Stats{}
+		stats1 := &QueryStats{}
 		stats1.AddWallTime(time.Millisecond)
+		stats1.AddQueryStorageWallTime(2 * time.Second)
 		stats1.AddFetchedSeries(50)
 		stats1.AddFetchedChunkBytes(42)
+		stats1.AddFetchedDataBytes(100)
+		stats1.AddStoreGatewayTouchedPostings(200)
+		stats1.AddStoreGatewayTouchedPostingBytes(300)
+		stats1.AddFetchedChunks(105)
+		stats1.AddFetchedSamples(109)
+		stats1.AddScannedSamples(100)
+		stats1.AddPeakSamples(100)
+		stats1.AddExtraFields("a", "b")
+		stats1.AddExtraFields("a", "b")
 
-		stats2 := &Stats{}
+		stats2 := &QueryStats{}
 		stats2.AddWallTime(time.Second)
+		stats2.AddQueryStorageWallTime(3 * time.Second)
 		stats2.AddFetchedSeries(60)
 		stats2.AddFetchedChunkBytes(100)
+		stats2.AddFetchedDataBytes(101)
+		stats1.AddStoreGatewayTouchedPostings(201)
+		stats1.AddStoreGatewayTouchedPostingBytes(301)
+		stats2.AddFetchedChunks(102)
+		stats2.AddFetchedSamples(103)
+		stats2.AddPeakSamples(105)
+		stats2.AddScannedSamples(105)
+		stats2.AddExtraFields("c", "d")
 
 		stats1.Merge(stats2)
 
 		assert.Equal(t, 1001*time.Millisecond, stats1.LoadWallTime())
+		assert.Equal(t, 5*time.Second, stats1.LoadQueryStorageWallTime())
 		assert.Equal(t, uint64(110), stats1.LoadFetchedSeries())
 		assert.Equal(t, uint64(142), stats1.LoadFetchedChunkBytes())
+		assert.Equal(t, uint64(201), stats1.LoadFetchedDataBytes())
+		assert.Equal(t, uint64(207), stats1.LoadFetchedChunks())
+		assert.Equal(t, uint64(212), stats1.LoadFetchedSamples())
+		assert.Equal(t, uint64(205), stats1.LoadScannedSamples())
+		assert.Equal(t, uint64(105), stats1.LoadPeakSamples())
+		assert.Equal(t, uint64(401), stats1.LoadStoreGatewayTouchedPostings())
+		assert.Equal(t, uint64(601), stats1.LoadStoreGatewayTouchedPostingBytes())
+		checkExtraFields(t, []any{"a", "b", "c", "d"}, stats1.LoadExtraFields())
 	})
 
 	t.Run("merge two nil stats objects", func(t *testing.T) {
-		var stats1 *Stats
-		var stats2 *Stats
+		var stats1 *QueryStats
+		var stats2 *QueryStats
 
 		stats1.Merge(stats2)
 
 		assert.Equal(t, time.Duration(0), stats1.LoadWallTime())
+		assert.Equal(t, time.Duration(0), stats1.LoadQueryStorageWallTime())
 		assert.Equal(t, uint64(0), stats1.LoadFetchedSeries())
 		assert.Equal(t, uint64(0), stats1.LoadFetchedChunkBytes())
+		assert.Equal(t, uint64(0), stats1.LoadFetchedDataBytes())
+		checkExtraFields(t, []any{}, stats1.LoadExtraFields())
+	})
+}
+
+func checkExtraFields(t *testing.T, expected, actual []any) {
+	t.Parallel()
+	assert.Equal(t, len(expected), len(actual))
+	expectedMap := map[string]string{}
+	actualMap := map[string]string{}
+
+	for i := 0; i < len(expected); i += 2 {
+		expectedMap[expected[i].(string)] = expected[i+1].(string)
+		actualMap[actual[i].(string)] = actual[i+1].(string)
+	}
+
+	assert.Equal(t, expectedMap, actualMap)
+}
+
+func TestStats_QueryStart(t *testing.T) {
+	t.Run("set and load query start", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		now := time.Now()
+		stats.SetQueryStart(now)
+
+		loaded := stats.LoadQueryStart()
+		assert.Equal(t, now.UnixNano(), loaded.UnixNano())
+	})
+
+	t.Run("nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.SetQueryStart(time.Now())
+
+		assert.True(t, stats.LoadQueryStart().IsZero())
+	})
+
+	t.Run("zero value when unset", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+
+		assert.True(t, stats.LoadQueryStart().IsZero())
+	})
+}
+
+func TestStats_QueueJoinTime(t *testing.T) {
+	t.Run("set and load queue join time", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		now := time.Now()
+		stats.SetQueueJoinTime(now)
+
+		loaded := stats.LoadQueueJoinTime()
+		assert.Equal(t, now.UnixNano(), loaded.UnixNano())
+	})
+
+	t.Run("nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.SetQueueJoinTime(time.Now())
+
+		assert.True(t, stats.LoadQueueJoinTime().IsZero())
+	})
+
+	t.Run("zero value when unset", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+
+		assert.True(t, stats.LoadQueueJoinTime().IsZero())
+	})
+}
+
+func TestStats_QueueLeaveTime(t *testing.T) {
+	t.Run("set and load queue leave time", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		now := time.Now()
+		stats.SetQueueLeaveTime(now)
+
+		loaded := stats.LoadQueueLeaveTime()
+		assert.Equal(t, now.UnixNano(), loaded.UnixNano())
+	})
+
+	t.Run("nil receiver", func(t *testing.T) {
+		var stats *QueryStats
+		stats.SetQueueLeaveTime(time.Now())
+
+		assert.True(t, stats.LoadQueueLeaveTime().IsZero())
+	})
+
+	t.Run("zero value when unset", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+
+		assert.True(t, stats.LoadQueueLeaveTime().IsZero())
+	})
+}
+
+func TestStats_Merge_DoesNotCopyPhaseTrackingFields(t *testing.T) {
+	t.Run("merge does not copy phase tracking fields", func(t *testing.T) {
+		source := &QueryStats{}
+		source.SetQueryStart(time.Now())
+		source.SetQueueJoinTime(time.Now())
+		source.SetQueueLeaveTime(time.Now())
+		source.AddWallTime(time.Second)
+
+		target := &QueryStats{}
+		target.Merge(source)
+
+		// Phase tracking fields should NOT be copied
+		assert.True(t, target.LoadQueryStart().IsZero())
+		assert.True(t, target.LoadQueueJoinTime().IsZero())
+		assert.True(t, target.LoadQueueLeaveTime().IsZero())
+
+		// Regular fields should still be merged
+		assert.Equal(t, time.Second, target.LoadWallTime())
 	})
 }

@@ -5,12 +5,12 @@ import (
 
 	"github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/thanos-io/thanos/pkg/store/hintspb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
-// bucketStoreSeriesServer is an fake in-memory gRPC server used to
+// bucketStoreSeriesServer is a fake in-memory gRPC server used to
 // call Thanos BucketStore.Series() without having to go through the
 // gRPC networking stack.
 type bucketStoreSeriesServer struct {
@@ -20,7 +20,7 @@ type bucketStoreSeriesServer struct {
 	ctx context.Context
 
 	SeriesSet []*storepb.Series
-	Warnings  storage.Warnings
+	Warnings  annotations.Annotations
 	Hints     hintspb.SeriesResponseHints
 }
 
@@ -30,7 +30,7 @@ func newBucketStoreSeriesServer(ctx context.Context) *bucketStoreSeriesServer {
 
 func (s *bucketStoreSeriesServer) Send(r *storepb.SeriesResponse) error {
 	if r.GetWarning() != "" {
-		s.Warnings = append(s.Warnings, errors.New(r.GetWarning()))
+		s.Warnings.Add(errors.New(r.GetWarning()))
 	}
 
 	if rawHints := r.GetHints(); rawHints != nil {

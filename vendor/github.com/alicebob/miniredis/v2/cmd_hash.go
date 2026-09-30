@@ -3,9 +3,11 @@
 package miniredis
 
 import (
+	"fmt"
 	"math/big"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alicebob/miniredis/v2/server"
 )
@@ -13,33 +15,27 @@ import (
 // commandsHash handles all hash value operations.
 func commandsHash(m *Miniredis) {
 	m.srv.Register("HDEL", m.cmdHdel)
-	m.srv.Register("HEXISTS", m.cmdHexists)
-	m.srv.Register("HGET", m.cmdHget)
-	m.srv.Register("HGETALL", m.cmdHgetall)
+	m.srv.Register("HEXISTS", m.cmdHexists, server.ReadOnlyOption())
+	m.srv.Register("HGET", m.cmdHget, server.ReadOnlyOption())
+	m.srv.Register("HGETALL", m.cmdHgetall, server.ReadOnlyOption())
 	m.srv.Register("HINCRBY", m.cmdHincrby)
 	m.srv.Register("HINCRBYFLOAT", m.cmdHincrbyfloat)
-	m.srv.Register("HKEYS", m.cmdHkeys)
-	m.srv.Register("HLEN", m.cmdHlen)
-	m.srv.Register("HMGET", m.cmdHmget)
+	m.srv.Register("HKEYS", m.cmdHkeys, server.ReadOnlyOption())
+	m.srv.Register("HLEN", m.cmdHlen, server.ReadOnlyOption())
+	m.srv.Register("HMGET", m.cmdHmget, server.ReadOnlyOption())
 	m.srv.Register("HMSET", m.cmdHmset)
 	m.srv.Register("HSET", m.cmdHset)
 	m.srv.Register("HSETNX", m.cmdHsetnx)
-	m.srv.Register("HSTRLEN", m.cmdHstrlen)
-	m.srv.Register("HVALS", m.cmdHvals)
-	m.srv.Register("HSCAN", m.cmdHscan)
+	m.srv.Register("HSTRLEN", m.cmdHstrlen, server.ReadOnlyOption())
+	m.srv.Register("HVALS", m.cmdHvals, server.ReadOnlyOption())
+	m.srv.Register("HSCAN", m.cmdHscan, server.ReadOnlyOption())
+	m.srv.Register("HRANDFIELD", m.cmdHrandfield, server.ReadOnlyOption())
+	m.srv.Register("HEXPIRE", m.cmdHexpire)
 }
 
 // HSET
 func (m *Miniredis) cmdHset(c *server.Peer, cmd string, args []string) {
-	if len(args) < 3 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(3)) {
 		return
 	}
 
@@ -53,7 +49,7 @@ func (m *Miniredis) cmdHset(c *server.Peer, cmd string, args []string) {
 			return
 		}
 
-		if t, ok := db.keys[key]; ok && t != "hash" {
+		if t, ok := db.keys[key]; ok && t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -65,54 +61,46 @@ func (m *Miniredis) cmdHset(c *server.Peer, cmd string, args []string) {
 
 // HSETNX
 func (m *Miniredis) cmdHsetnx(c *server.Peer, cmd string, args []string) {
-	if len(args) != 3 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(3)) {
 		return
 	}
 
-	key, field, value := args[0], args[1], args[2]
+	opts := struct {
+		key   string
+		field string
+		value string
+	}{
+		key:   args[0],
+		field: args[1],
+		value: args[2],
+	}
 
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 
-		if t, ok := db.keys[key]; ok && t != "hash" {
+		if t, ok := db.keys[opts.key]; ok && t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
 
-		if _, ok := db.hashKeys[key]; !ok {
-			db.hashKeys[key] = map[string]string{}
-			db.keys[key] = "hash"
+		if _, ok := db.hashKeys[opts.key]; !ok {
+			db.hashKeys[opts.key] = map[string]string{}
+			db.keys[opts.key] = keyTypeHash
 		}
-		_, ok := db.hashKeys[key][field]
+		_, ok := db.hashKeys[opts.key][opts.field]
 		if ok {
 			c.WriteInt(0)
 			return
 		}
-		db.hashKeys[key][field] = value
-		db.keyVersion[key]++
+		db.hashKeys[opts.key][opts.field] = opts.value
+		db.incr(opts.key)
 		c.WriteInt(1)
 	})
 }
 
 // HMSET
 func (m *Miniredis) cmdHmset(c *server.Peer, cmd string, args []string) {
-	if len(args) < 3 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(3)) {
 		return
 	}
 
@@ -126,7 +114,7 @@ func (m *Miniredis) cmdHmset(c *server.Peer, cmd string, args []string) {
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 
-		if t, ok := db.keys[key]; ok && t != "hash" {
+		if t, ok := db.keys[key]; ok && t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -142,15 +130,7 @@ func (m *Miniredis) cmdHmset(c *server.Peer, cmd string, args []string) {
 
 // HGET
 func (m *Miniredis) cmdHget(c *server.Peer, cmd string, args []string) {
-	if len(args) != 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(2)) {
 		return
 	}
 
@@ -164,7 +144,7 @@ func (m *Miniredis) cmdHget(c *server.Peer, cmd string, args []string) {
 			c.WriteNull()
 			return
 		}
-		if t != "hash" {
+		if t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -179,82 +159,78 @@ func (m *Miniredis) cmdHget(c *server.Peer, cmd string, args []string) {
 
 // HDEL
 func (m *Miniredis) cmdHdel(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
-	key, fields := args[0], args[1:]
+	opts := struct {
+		key    string
+		fields []string
+	}{
+		key:    args[0],
+		fields: args[1:],
+	}
 
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 
-		t, ok := db.keys[key]
+		t, ok := db.keys[opts.key]
 		if !ok {
 			// No key is zero deleted
 			c.WriteInt(0)
 			return
 		}
-		if t != "hash" {
+		if t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
 
 		deleted := 0
-		for _, f := range fields {
-			_, ok := db.hashKeys[key][f]
+		for _, f := range opts.fields {
+			_, ok := db.hashKeys[opts.key][f]
 			if !ok {
 				continue
 			}
-			delete(db.hashKeys[key], f)
+			delete(db.hashKeys[opts.key], f)
 			deleted++
 		}
 		c.WriteInt(deleted)
 
 		// Nothing left. Remove the whole key.
-		if len(db.hashKeys[key]) == 0 {
-			db.del(key, true)
+		if len(db.hashKeys[opts.key]) == 0 {
+			db.del(opts.key, true)
 		}
 	})
 }
 
 // HEXISTS
 func (m *Miniredis) cmdHexists(c *server.Peer, cmd string, args []string) {
-	if len(args) != 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(2)) {
 		return
 	}
 
-	key, field := args[0], args[1]
+	opts := struct {
+		key   string
+		field string
+	}{
+		key:   args[0],
+		field: args[1],
+	}
 
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 
-		t, ok := db.keys[key]
+		t, ok := db.keys[opts.key]
 		if !ok {
 			c.WriteInt(0)
 			return
 		}
-		if t != "hash" {
+		if t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
 
-		if _, ok := db.hashKeys[key][field]; !ok {
+		if _, ok := db.hashKeys[opts.key][opts.field]; !ok {
 			c.WriteInt(0)
 			return
 		}
@@ -264,15 +240,7 @@ func (m *Miniredis) cmdHexists(c *server.Peer, cmd string, args []string) {
 
 // HGETALL
 func (m *Miniredis) cmdHgetall(c *server.Peer, cmd string, args []string) {
-	if len(args) != 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(1)) {
 		return
 	}
 
@@ -286,7 +254,7 @@ func (m *Miniredis) cmdHgetall(c *server.Peer, cmd string, args []string) {
 			c.WriteMapLen(0)
 			return
 		}
-		if t != "hash" {
+		if t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -301,15 +269,7 @@ func (m *Miniredis) cmdHgetall(c *server.Peer, cmd string, args []string) {
 
 // HKEYS
 func (m *Miniredis) cmdHkeys(c *server.Peer, cmd string, args []string) {
-	if len(args) != 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(1)) {
 		return
 	}
 
@@ -322,7 +282,7 @@ func (m *Miniredis) cmdHkeys(c *server.Peer, cmd string, args []string) {
 			c.WriteLen(0)
 			return
 		}
-		if db.t(key) != "hash" {
+		if db.t(key) != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -337,15 +297,7 @@ func (m *Miniredis) cmdHkeys(c *server.Peer, cmd string, args []string) {
 
 // HSTRLEN
 func (m *Miniredis) cmdHstrlen(c *server.Peer, cmd string, args []string) {
-	if len(args) != 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(2)) {
 		return
 	}
 
@@ -359,7 +311,7 @@ func (m *Miniredis) cmdHstrlen(c *server.Peer, cmd string, args []string) {
 			c.WriteInt(0)
 			return
 		}
-		if t != "hash" {
+		if t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -371,15 +323,7 @@ func (m *Miniredis) cmdHstrlen(c *server.Peer, cmd string, args []string) {
 
 // HVALS
 func (m *Miniredis) cmdHvals(c *server.Peer, cmd string, args []string) {
-	if len(args) != 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(1)) {
 		return
 	}
 
@@ -393,7 +337,7 @@ func (m *Miniredis) cmdHvals(c *server.Peer, cmd string, args []string) {
 			c.WriteLen(0)
 			return
 		}
-		if t != "hash" {
+		if t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -408,15 +352,7 @@ func (m *Miniredis) cmdHvals(c *server.Peer, cmd string, args []string) {
 
 // HLEN
 func (m *Miniredis) cmdHlen(c *server.Peer, cmd string, args []string) {
-	if len(args) != 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(1)) {
 		return
 	}
 
@@ -430,7 +366,7 @@ func (m *Miniredis) cmdHlen(c *server.Peer, cmd string, args []string) {
 			c.WriteInt(0)
 			return
 		}
-		if t != "hash" {
+		if t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -441,15 +377,7 @@ func (m *Miniredis) cmdHlen(c *server.Peer, cmd string, args []string) {
 
 // HMGET
 func (m *Miniredis) cmdHmget(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
@@ -458,7 +386,7 @@ func (m *Miniredis) cmdHmget(c *server.Peer, cmd string, args []string) {
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 
-		if t, ok := db.keys[key]; ok && t != "hash" {
+		if t, ok := db.keys[key]; ok && t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
@@ -482,36 +410,31 @@ func (m *Miniredis) cmdHmget(c *server.Peer, cmd string, args []string) {
 
 // HINCRBY
 func (m *Miniredis) cmdHincrby(c *server.Peer, cmd string, args []string) {
-	if len(args) != 3 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(3)) {
 		return
 	}
 
-	key, field, deltas := args[0], args[1], args[2]
-
-	delta, err := strconv.Atoi(deltas)
-	if err != nil {
-		setDirty(c)
-		c.WriteError(msgInvalidInt)
+	opts := struct {
+		key   string
+		field string
+		delta int
+	}{
+		key:   args[0],
+		field: args[1],
+	}
+	if ok := optInt(c, args[2], &opts.delta); !ok {
 		return
 	}
 
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 
-		if t, ok := db.keys[key]; ok && t != "hash" {
+		if t, ok := db.keys[opts.key]; ok && t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
 
-		v, err := db.hashIncr(key, field, delta)
+		v, err := db.hashIncr(opts.key, opts.field, opts.delta)
 		if err != nil {
 			c.WriteError(err.Error())
 			return
@@ -522,36 +445,35 @@ func (m *Miniredis) cmdHincrby(c *server.Peer, cmd string, args []string) {
 
 // HINCRBYFLOAT
 func (m *Miniredis) cmdHincrbyfloat(c *server.Peer, cmd string, args []string) {
-	if len(args) != 3 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(3)) {
 		return
 	}
 
-	key, field, deltas := args[0], args[1], args[2]
-
-	delta, _, err := big.ParseFloat(deltas, 10, 128, 0)
+	opts := struct {
+		key   string
+		field string
+		delta *big.Float
+	}{
+		key:   args[0],
+		field: args[1],
+	}
+	delta, _, err := big.ParseFloat(args[2], 10, 128, 0)
 	if err != nil {
 		setDirty(c)
 		c.WriteError(msgInvalidFloat)
 		return
 	}
+	opts.delta = delta
 
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 
-		if t, ok := db.keys[key]; ok && t != "hash" {
+		if t, ok := db.keys[opts.key]; ok && t != keyTypeHash {
 			c.WriteError(msgWrongType)
 			return
 		}
 
-		v, err := db.hashIncrfloat(key, field, delta)
+		v, err := db.hashIncrfloat(opts.key, opts.field, opts.delta)
 		if err != nil {
 			c.WriteError(err.Error())
 			return
@@ -562,30 +484,24 @@ func (m *Miniredis) cmdHincrbyfloat(c *server.Peer, cmd string, args []string) {
 
 // HSCAN
 func (m *Miniredis) cmdHscan(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
-	key := args[0]
-	cursor, err := strconv.Atoi(args[1])
-	if err != nil {
-		setDirty(c)
-		c.WriteError(msgInvalidCursor)
+	opts := struct {
+		key       string
+		cursor    int
+		withMatch bool
+		match     string
+	}{
+		key: args[0],
+	}
+	if ok := optIntErr(c, args[1], &opts.cursor, msgInvalidCursor); !ok {
 		return
 	}
 	args = args[2:]
 
 	// MATCH and COUNT options
-	var withMatch bool
-	var match string
 	for len(args) > 0 {
 		if strings.ToLower(args[0]) == "count" {
 			// we do nothing with count
@@ -609,8 +525,8 @@ func (m *Miniredis) cmdHscan(c *server.Peer, cmd string, args []string) {
 				c.WriteError(msgSyntaxError)
 				return
 			}
-			withMatch = true
-			match, args = args[1], args[2:]
+			opts.withMatch = true
+			opts.match, args = args[1], args[2:]
 			continue
 		}
 		setDirty(c)
@@ -622,21 +538,21 @@ func (m *Miniredis) cmdHscan(c *server.Peer, cmd string, args []string) {
 		db := m.db(ctx.selectedDB)
 		// return _all_ (matched) keys every time
 
-		if cursor != 0 {
+		if opts.cursor != 0 {
 			// Invalid cursor.
 			c.WriteLen(2)
 			c.WriteBulk("0") // no next cursor
 			c.WriteLen(0)    // no elements
 			return
 		}
-		if db.exists(key) && db.t(key) != "hash" {
+		if db.exists(opts.key) && db.t(opts.key) != keyTypeHash {
 			c.WriteError(ErrWrongType.Error())
 			return
 		}
 
-		members := db.hashFields(key)
-		if withMatch {
-			members, _ = matchKeys(members, match)
+		members := db.hashFields(opts.key)
+		if opts.withMatch {
+			members, _ = matchKeys(members, opts.match)
 		}
 
 		c.WriteLen(2)
@@ -645,7 +561,237 @@ func (m *Miniredis) cmdHscan(c *server.Peer, cmd string, args []string) {
 		c.WriteLen(len(members) * 2)
 		for _, k := range members {
 			c.WriteBulk(k)
-			c.WriteBulk(db.hashGet(key, k))
+			c.WriteBulk(db.hashGet(opts.key, k))
 		}
 	})
+}
+
+// HRANDFIELD
+func (m *Miniredis) cmdHrandfield(c *server.Peer, cmd string, args []string) {
+	if !m.isValidCMD(c, cmd, args, between(1, 3)) {
+		return
+	}
+
+	opts := struct {
+		key        string
+		count      int
+		countSet   bool
+		withValues bool
+	}{
+		key: args[0],
+	}
+
+	if len(args) > 1 {
+		if ok := optIntErr(c, args[1], &opts.count, msgInvalidInt); !ok {
+			return
+		}
+		opts.countSet = true
+	}
+
+	if len(args) == 3 {
+		if strings.ToLower(args[2]) == "withvalues" {
+			opts.withValues = true
+		} else {
+			setDirty(c)
+			c.WriteError(msgSyntaxError)
+			return
+		}
+	}
+
+	withTx(m, c, func(peer *server.Peer, ctx *connCtx) {
+		db := m.db(ctx.selectedDB)
+		members := db.hashFields(opts.key)
+		m.shuffle(members)
+
+		if !opts.countSet {
+			// > When called with just the key argument, return a random field from the
+			// hash value stored at key.
+			if len(members) == 0 {
+				peer.WriteNull()
+				return
+			}
+			peer.WriteBulk(members[0])
+			return
+		}
+
+		if len(members) > abs(opts.count) {
+			members = members[:abs(opts.count)]
+		}
+		switch {
+		case opts.count >= 0:
+			// if count is positive there can't be duplicates, and the length is restricted
+		case opts.count < 0:
+			// if count is negative there can be duplicates, but length will match
+			if len(members) > 0 {
+				for len(members) < -opts.count {
+					members = append(members, members[m.randIntn(len(members))])
+				}
+			}
+		}
+
+		if opts.withValues {
+			peer.WriteMapLen(len(members))
+			for _, m := range members {
+				peer.WriteBulk(m)
+				peer.WriteBulk(db.hashGet(opts.key, m))
+			}
+			return
+		}
+		peer.WriteLen(len(members))
+		for _, m := range members {
+			peer.WriteBulk(m)
+		}
+	})
+}
+
+// HEXPIRE
+func (m *Miniredis) cmdHexpire(c *server.Peer, cmd string, args []string) {
+	if !m.isValidCMD(c, cmd, args, atLeast(5)) {
+		return
+	}
+
+	opts, err := parseHExpireArgs(args)
+	if err != "" {
+		setDirty(c)
+		c.WriteError(err)
+		return
+	}
+
+	withTx(m, c, func(peer *server.Peer, ctx *connCtx) {
+		db := m.db(ctx.selectedDB)
+
+		if _, ok := db.keys[opts.key]; !ok {
+			c.WriteLen(len(opts.fields))
+			for range opts.fields {
+				c.WriteInt(-2)
+			}
+			return
+		}
+
+		if db.t(opts.key) != keyTypeHash {
+			c.WriteError(msgWrongType)
+			return
+		}
+
+		fieldTTLs := db.hashTTLs[opts.key]
+		if fieldTTLs == nil {
+			fieldTTLs = map[string]time.Duration{}
+			db.hashTTLs[opts.key] = fieldTTLs
+		}
+
+		c.WriteLen(len(opts.fields))
+		for _, field := range opts.fields {
+			if _, ok := db.hashKeys[opts.key][field]; !ok {
+				c.WriteInt(-2)
+				continue
+			}
+
+			currentTtl, ok := fieldTTLs[field]
+			newTTL := time.Duration(opts.ttl) * time.Second
+
+			// NX -- For each specified field,
+			// set expiration only when the field has no expiration.
+			if opts.nx && ok {
+				c.WriteInt(0)
+				continue
+			}
+
+			// XX -- For each specified field,
+			// set expiration only when the field has an existing expiration.
+			if opts.xx && !ok {
+				c.WriteInt(0)
+				continue
+			}
+
+			// GT -- For each specified field,
+			// set expiration only when the new expiration is greater than current one.
+			if opts.gt && (!ok || newTTL <= currentTtl) {
+				c.WriteInt(0)
+				continue
+			}
+
+			// LT -- For each specified field,
+			// set expiration only when the new expiration is less than current one.
+			if opts.lt && ok && newTTL >= currentTtl {
+				c.WriteInt(0)
+				continue
+			}
+
+			fieldTTLs[field] = newTTL
+			c.WriteInt(1)
+		}
+	})
+}
+
+type hexpireOpts struct {
+	key    string
+	ttl    int
+	nx     bool
+	xx     bool
+	gt     bool
+	lt     bool
+	fields []string
+}
+
+func parseHExpireArgs(args []string) (hexpireOpts, string) {
+	var opts hexpireOpts
+	opts.key = args[0]
+
+	if err := optIntSimple(args[1], &opts.ttl); err != nil {
+		return hexpireOpts{}, err.Error()
+	}
+
+	args = args[2:]
+
+	for len(args) > 0 {
+		switch strings.ToLower(args[0]) {
+		case "nx":
+			opts.nx = true
+			args = args[1:]
+		case "xx":
+			opts.xx = true
+			args = args[1:]
+		case "gt":
+			opts.gt = true
+			args = args[1:]
+		case "lt":
+			opts.lt = true
+			args = args[1:]
+		case "fields":
+			var numFields int
+			if err := optIntSimple(args[1], &numFields); err != nil {
+				return hexpireOpts{}, msgNumFieldsInvalid
+			}
+			if numFields <= 0 {
+				return hexpireOpts{}, msgNumFieldsInvalid
+			}
+
+			// FIELDS numFields field1 field2 ...
+			if len(args) < 2+numFields {
+				return hexpireOpts{}, msgNumFieldsParameter
+			}
+
+			opts.fields = append([]string{}, args[2:2+numFields]...)
+			args = args[2+numFields:]
+		default:
+			return hexpireOpts{}, fmt.Sprintf(msgMandatoryArgument, "FIELDS")
+		}
+	}
+
+	if opts.gt && opts.lt {
+		return hexpireOpts{}, msgGTandLT
+	}
+
+	if opts.nx && (opts.xx || opts.gt || opts.lt) {
+		return hexpireOpts{}, msgNXandXXGTLT
+	}
+
+	return opts, ""
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }

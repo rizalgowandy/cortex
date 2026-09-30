@@ -5,14 +5,17 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/services"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/thanos-io/objstore"
+
+	"github.com/cortexproject/cortex/pkg/util/validation"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketindex"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 var (
@@ -24,6 +27,7 @@ type BucketIndexBlocksFinderConfig struct {
 	IndexLoader              bucketindex.LoaderConfig
 	MaxStalePeriod           time.Duration
 	IgnoreDeletionMarksDelay time.Duration
+	IgnoreBlocksWithin       time.Duration
 }
 
 // BucketIndexBlocksFinder implements BlocksFinder interface and find blocks in the bucket
@@ -46,7 +50,7 @@ func NewBucketIndexBlocksFinder(cfg BucketIndexBlocksFinderConfig, bkt objstore.
 }
 
 // GetBlocks implements BlocksFinder.
-func (f *BucketIndexBlocksFinder) GetBlocks(ctx context.Context, userID string, minT, maxT int64) (bucketindex.Blocks, map[ulid.ULID]*bucketindex.BlockDeletionMark, error) {
+func (f *BucketIndexBlocksFinder) GetBlocks(ctx context.Context, userID string, minT, maxT int64, _ []*labels.Matcher) (bucketindex.Blocks, map[ulid.ULID]*bucketindex.BlockDeletionMark, error) {
 	if f.State() != services.Running {
 		return nil, nil, errBucketIndexBlocksFinderNotRunning
 	}
@@ -55,12 +59,20 @@ func (f *BucketIndexBlocksFinder) GetBlocks(ctx context.Context, userID string, 
 	}
 
 	// Get the bucket index for this user.
-	idx, err := f.loader.GetIndex(ctx, userID)
+	idx, ss, err := f.loader.GetIndex(ctx, userID)
 	if errors.Is(err, bucketindex.ErrIndexNotFound) {
 		// This is a legit edge case, happening when a new tenant has not shipped blocks to the storage yet
 		// so the bucket index hasn't been created yet.
 		return nil, nil, nil
+	} else if errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied) {
+		return nil, nil, validation.AccessDeniedError(err.Error())
 	}
+
+	// Short circuit when bucket failed to be updated due CMK errors recently
+	if time.Since(ss.GetNonQueryableUntil()) < 0 && ss.NonQueryableReason == bucketindex.CustomerManagedKeyError {
+		return nil, nil, validation.AccessDeniedError(bucket.ErrCustomerManagedKeyAccessDenied.Error())
+	}
+
 	if err != nil {
 		return nil, nil, err
 	}

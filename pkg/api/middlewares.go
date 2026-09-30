@@ -3,27 +3,50 @@ package api
 import (
 	"net/http"
 
-	"github.com/weaveworks/common/middleware"
+	"github.com/google/uuid"
 
-	"github.com/cortexproject/cortex/pkg/chunk/purger"
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
 )
 
-// middleware for setting cache gen header to let consumer of response know all previous responses could be invalid due to delete operation
-func getHTTPCacheGenNumberHeaderSetterMiddleware(cacheGenNumbersLoader *purger.TombstonesLoader) middleware.Interface {
-	return middleware.Func(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tenantIDs, err := tenant.TenantIDs(r.Context())
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusUnauthorized)
-				return
-			}
+// HTTPHeaderMiddleware adds specified HTTPHeaders to the request context
+type HTTPHeaderMiddleware struct {
+	TargetHeaders   []string
+	RequestIdHeader string
+}
 
-			cacheGenNumber := cacheGenNumbersLoader.GetResultsCacheGenNumber(tenantIDs)
+// injectRequestContext injects request related metadata into the request context
+func (h HTTPHeaderMiddleware) injectRequestContext(r *http.Request) *http.Request {
+	requestContextMap := make(map[string]string)
 
-			w.Header().Set(queryrange.ResultsCacheGenNumberHeaderName, cacheGenNumber)
-			next.ServeHTTP(w, r)
-		})
+	// Check to make sure that request context have not already been injected
+	checkMapInContext := requestmeta.MapFromContext(r.Context())
+	if checkMapInContext != nil {
+		return r
+	}
+
+	for _, target := range h.TargetHeaders {
+		contents := r.Header.Get(target)
+		if contents != "" {
+			requestContextMap[target] = contents
+		}
+	}
+	requestContextMap[requestmeta.LoggingHeadersKey] = requestmeta.LoggingHeaderKeysToString(h.TargetHeaders)
+
+	reqId := r.Header.Get(h.RequestIdHeader)
+	if reqId == "" {
+		reqId = uuid.NewString()
+	}
+	requestContextMap[requestmeta.RequestIdKey] = reqId
+	requestContextMap[requestmeta.RequestSourceKey] = requestmeta.SourceAPI
+
+	ctx := requestmeta.ContextWithRequestMetadataMap(r.Context(), requestContextMap)
+	return r.WithContext(ctx)
+}
+
+// Wrap implements Middleware
+func (h HTTPHeaderMiddleware) Wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = h.injectRequestContext(r)
+		next.ServeHTTP(w, r)
 	})
 }

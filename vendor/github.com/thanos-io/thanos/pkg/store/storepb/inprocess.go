@@ -5,24 +5,93 @@ package storepb
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"iter"
+	"runtime/debug"
+	"sync"
 
+	"go.uber.org/atomic"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
-func ServerAsClient(srv StoreServer, clientReceiveBufferSize int) StoreClient {
-	return &serverAsClient{srv: srv, clientReceiveBufferSize: clientReceiveBufferSize}
+type inProcessServer struct {
+	Store_SeriesServer
+	ctx   context.Context
+	yield func(response *SeriesResponse, err error) bool
+}
+
+func newInProcessServer(ctx context.Context, yield func(*SeriesResponse, error) bool) *inProcessServer {
+	return &inProcessServer{
+		ctx:   ctx,
+		yield: yield,
+	}
+}
+
+func (s *inProcessServer) Send(resp *SeriesResponse) error {
+	s.yield(resp, nil)
+	return nil
+}
+
+func (s *inProcessServer) Context() context.Context {
+	return s.ctx
+}
+
+type inProcessClient struct {
+	Store_SeriesClient
+	ctx  context.Context
+	next func() (*SeriesResponse, error, bool)
+	stop func()
+	mu   sync.Mutex // protects next and stop
+}
+
+func newInProcessClient(ctx context.Context, next func() (*SeriesResponse, error, bool), stop func()) *inProcessClient {
+	return &inProcessClient{
+		ctx:  ctx,
+		next: next,
+		stop: stop,
+		mu:   sync.Mutex{},
+	}
+}
+
+func (c *inProcessClient) Recv() (*SeriesResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	resp, err, ok := c.next()
+	if err != nil {
+		c.stop()
+		return nil, err
+	}
+	if !ok {
+		if c.ctx.Err() != nil {
+			return nil, c.ctx.Err()
+		}
+		return nil, io.EOF
+	}
+	return resp, err
+}
+
+func (c *inProcessClient) Context() context.Context {
+	return c.ctx
+}
+
+func (c *inProcessClient) CloseSend() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stop()
+	return nil
+}
+
+func ServerAsClient(srv StoreServer, readOnly atomic.Bool) StoreClient {
+	return &serverAsClient{srv: srv, readOnly: readOnly}
 }
 
 // serverAsClient allows to use servers as clients.
 // NOTE: Passing CallOptions does not work - it would be needed to be implemented in grpc itself (before, after are private).
 type serverAsClient struct {
-	clientReceiveBufferSize int
-	srv                     StoreServer
-}
-
-func (s serverAsClient) Info(ctx context.Context, in *InfoRequest, _ ...grpc.CallOption) (*InfoResponse, error) {
-	return s.srv.Info(ctx, in)
+	srv      StoreServer
+	readOnly atomic.Bool
 }
 
 func (s serverAsClient) LabelNames(ctx context.Context, in *LabelNamesRequest, _ ...grpc.CallOption) (*LabelNamesResponse, error) {
@@ -33,65 +102,59 @@ func (s serverAsClient) LabelValues(ctx context.Context, in *LabelValuesRequest,
 	return s.srv.LabelValues(ctx, in)
 }
 
-func (s serverAsClient) Series(ctx context.Context, in *SeriesRequest, _ ...grpc.CallOption) (Store_SeriesClient, error) {
-	inSrv := &inProcessStream{recv: make(chan *SeriesResponse, s.clientReceiveBufferSize), err: make(chan error)}
-	inSrv.ctx, inSrv.cancel = context.WithCancel(ctx)
-	go func() {
-		inSrv.err <- s.srv.Series(in, inSrv)
-		close(inSrv.err)
-		close(inSrv.recv)
-	}()
-	return &inProcessClientStream{srv: inSrv}, nil
+type readOnlySeriesClient struct {
+	ctx context.Context
 }
 
-// TODO(bwplotka): Add streaming attributes, metadata etc. Currently those are disconnected. Follow up on https://github.com/grpc/grpc-go/issues/906.
-// TODO(bwplotka): Use this in proxy.go and receiver multi tenant proxy.
-type inProcessStream struct {
-	grpc.ServerStream
+var _ Store_SeriesClient = &readOnlySeriesClient{}
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	recv   chan *SeriesResponse
-	err    chan error
+func (r *readOnlySeriesClient) Recv() (*SeriesResponse, error) {
+	return nil, io.EOF
 }
 
-func (s *inProcessStream) Context() context.Context { return s.ctx }
-
-func (s *inProcessStream) Send(r *SeriesResponse) error {
-	select {
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-	case s.recv <- r:
-		return nil
-	}
+func (r *readOnlySeriesClient) Header() (metadata.MD, error) {
+	return nil, nil
 }
 
-type inProcessClientStream struct {
-	grpc.ClientStream
-
-	srv *inProcessStream
-}
-
-func (s *inProcessClientStream) Context() context.Context { return s.srv.ctx }
-
-func (s *inProcessClientStream) CloseSend() error {
-	s.srv.cancel()
+func (r *readOnlySeriesClient) Trailer() metadata.MD {
 	return nil
 }
 
-func (s *inProcessClientStream) Recv() (*SeriesResponse, error) {
-	select {
-	case <-s.srv.ctx.Done():
-		return nil, s.srv.ctx.Err()
-	case r, ok := <-s.srv.recv:
-		if !ok {
-			return nil, io.EOF
-		}
-		return r, nil
-	case err := <-s.srv.err:
-		if err == nil {
-			return nil, io.EOF
-		}
-		return nil, err
+func (r *readOnlySeriesClient) CloseSend() error {
+	return nil
+}
+
+func (r *readOnlySeriesClient) Context() context.Context {
+	return r.ctx
+}
+
+func (r *readOnlySeriesClient) SendMsg(m interface{}) error {
+	return nil
+}
+
+func (r *readOnlySeriesClient) RecvMsg(m interface{}) error {
+	return io.EOF
+}
+
+func (s serverAsClient) Series(ctx context.Context, in *SeriesRequest, _ ...grpc.CallOption) (Store_SeriesClient, error) {
+	if s.readOnly.Load() {
+		return &readOnlySeriesClient{ctx: ctx}, nil
 	}
+	var srvIter iter.Seq2[*SeriesResponse, error] = func(yield func(*SeriesResponse, error) bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				st := debug.Stack()
+				panic(fmt.Sprintf("panic %v in server iterator: %s", r, st))
+			}
+		}()
+		srv := newInProcessServer(ctx, yield)
+		err := s.srv.Series(in, srv)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+	}
+
+	clientIter, stop := iter.Pull2(srvIter)
+	return newInProcessClient(ctx, clientIter, stop), nil
 }

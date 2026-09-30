@@ -8,15 +8,16 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/services"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
 )
 
 func TestResetConcurrency(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name                                  string
 		parallelism                           int
@@ -69,6 +70,7 @@ func TestResetConcurrency(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			cfg := Config{
 				Parallelism:           tt.parallelism,
 				MatchMaxConcurrency:   tt.maxConcurrent > 0,
@@ -85,13 +87,13 @@ func TestResetConcurrency(t *testing.T) {
 				w.AddressAdded(fmt.Sprintf("127.0.0.1:%d", i))
 			}
 
-			test.Poll(t, 250*time.Millisecond, tt.expectedConcurrency, func() interface{} {
+			test.Poll(t, 250*time.Millisecond, tt.expectedConcurrency, func() any {
 				return getConcurrentProcessors(w)
 			})
 
 			// now we remove an address and ensure we still have the expected concurrency
 			w.AddressRemoved(fmt.Sprintf("127.0.0.1:%d", rand.Intn(tt.numTargets)))
-			test.Poll(t, 250*time.Millisecond, tt.expectedConcurrencyAfterTargetRemoval, func() interface{} {
+			test.Poll(t, 250*time.Millisecond, tt.expectedConcurrencyAfterTargetRemoval, func() any {
 				return getConcurrentProcessors(w)
 			})
 

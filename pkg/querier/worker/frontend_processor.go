@@ -4,17 +4,20 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/textproto"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/backoff"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
-	"github.com/cortexproject/cortex/pkg/querier/stats"
 	querier_stats "github.com/cortexproject/cortex/pkg/querier/stats"
+	"github.com/cortexproject/cortex/pkg/util/backoff"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
 )
 
 var (
@@ -30,6 +33,7 @@ func newFrontendProcessor(cfg Config, handler RequestHandler, log log.Logger) pr
 		handler:        handler,
 		maxMessageSize: cfg.GRPCClientConfig.MaxSendMsgSize,
 		querierID:      cfg.QuerierID,
+		targetHeaders:  cfg.TargetHeaders,
 	}
 }
 
@@ -40,6 +44,8 @@ type frontendProcessor struct {
 	querierID      string
 
 	log log.Logger
+
+	targetHeaders []string
 }
 
 // notifyShutdown implements processor.
@@ -95,7 +101,7 @@ func (fp *frontendProcessor) process(c frontendv1pb.Frontend_ProcessClient) erro
 			// and cancel the query.  We don't actually handle queries in parallel
 			// here, as we're running in lock step with the server - each Recv is
 			// paired with a Send.
-			go fp.runRequest(ctx, request.HttpRequest, request.StatsEnabled, func(response *httpgrpc.HTTPResponse, stats *stats.Stats) error {
+			go fp.runRequest(ctx, request.HttpRequest, request.StatsEnabled, func(response *httpgrpc.HTTPResponse, stats *querier_stats.QueryStats) error {
 				return c.Send(&frontendv1pb.ClientToFrontend{
 					HttpResponse: response,
 					Stats:        stats,
@@ -114,10 +120,25 @@ func (fp *frontendProcessor) process(c frontendv1pb.Frontend_ProcessClient) erro
 	}
 }
 
-func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.HTTPRequest, statsEnabled bool, sendHTTPResponse func(response *httpgrpc.HTTPResponse, stats *stats.Stats) error) {
-	var stats *querier_stats.Stats
+func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.HTTPRequest, statsEnabled bool, sendHTTPResponse func(response *httpgrpc.HTTPResponse, stats *querier_stats.QueryStats) error) {
+	var stats *querier_stats.QueryStats
 	if statsEnabled {
 		stats, ctx = querier_stats.ContextWithEmptyStats(ctx)
+	}
+
+	headers := make(map[string]string, 0)
+	for _, h := range request.Headers {
+		headers[h.Key] = h.Values[0]
+	}
+	ctx = requestmeta.ContextWithRequestMetadataMapFromHeaders(ctx, headers, fp.targetHeaders)
+
+	orgID, ok := headers[textproto.CanonicalMIMEHeaderKey(user.OrgIDHeaderName)]
+	if ok {
+		ctx = user.InjectOrgID(ctx, orgID)
+	}
+	logger := util_log.WithContext(ctx, fp.log)
+	if statsEnabled {
+		level.Info(logger).Log("msg", "started running request")
 	}
 
 	response, err := fp.handler.Handle(ctx, request)
@@ -131,6 +152,12 @@ func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.H
 			}
 		}
 	}
+	if statsEnabled {
+		level.Info(logger).Log("msg", "finished request", "status_code", response.Code, "response_size", len(response.GetBody()))
+	}
+
+	// Compute timing breakdown before sending stats back to the frontend.
+	stats.ComputeAndStoreTimingBreakdown()
 
 	// Ensure responses that are too big are not retried.
 	if len(response.Body) >= fp.maxMessageSize {

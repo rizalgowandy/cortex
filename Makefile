@@ -9,6 +9,9 @@
 VERSION=$(shell cat "./VERSION" 2> /dev/null)
 GOPROXY_VALUE=$(shell go env GOPROXY)
 
+# ARCHS
+ARCHS       = amd64 arm64
+
 # Boiler plate for building Docker containers.
 # All this must go at top of file I'm afraid.
 IMAGE_PREFIX ?= quay.io/cortexproject/
@@ -37,8 +40,9 @@ SED ?= $(shell which gsed 2>/dev/null || which sed)
 # Dependencies (i.e. things that go in the image) still need to be explicitly
 # declared.
 %/$(UPTODATE): %/Dockerfile
-	@echo
-	$(SUDO) docker build --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)) -t $(IMAGE_PREFIX)$(shell basename $(@D)):$(IMAGE_TAG) $(@D)/
+	for arch in $(ARCHS); do \
+		$(SUDO) docker buildx build --provenance false --platform linux/$$arch --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)) -t $(IMAGE_PREFIX)$(shell basename $(@D)):$(IMAGE_TAG)-$$arch $(@D)/ ; \
+	done
 	@echo
 	@echo Please use push-multiarch-build-image to build and push build image for all supported architectures.
 	touch $@
@@ -49,14 +53,7 @@ fetch-build-image:
 	docker tag $(BUILD_IMAGE):$(LATEST_BUILD_IMAGE_TAG) $(BUILD_IMAGE):latest
 	touch build-image/.uptodate
 
-push-multiarch-build-image:
-	@echo
-	# Build image for each platform separately... it tends to generate fewer errors.
-	$(SUDO) docker buildx build --platform linux/amd64 --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) build-image/
-	$(SUDO) docker buildx build --platform linux/arm64 --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) build-image/
-	# This command will run the same build as above, but it will reuse existing platform-specific images,
-	# put them together and push to registry.
-	$(SUDO) docker buildx build -o type=registry --platform linux/amd64,linux/arm64 --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)build-image:$(IMAGE_TAG) build-image/
+-include build-image/Makefile
 
 # We don't want find to scan inside a bunch of directories, to accelerate the
 # 'make: Entering directory '/go/src/github.com/cortexproject/cortex' phase.
@@ -90,28 +87,23 @@ $(foreach exe, $(EXES), $(eval $(call dep_exe, $(exe))))
 pkg/cortexpb/cortex.pb.go: pkg/cortexpb/cortex.proto
 pkg/ingester/client/ingester.pb.go: pkg/ingester/client/ingester.proto
 pkg/distributor/distributorpb/distributor.pb.go: pkg/distributor/distributorpb/distributor.proto
-pkg/ingester/wal.pb.go: pkg/ingester/wal.proto
 pkg/ring/ring.pb.go: pkg/ring/ring.proto
 pkg/frontend/v1/frontendv1pb/frontend.pb.go: pkg/frontend/v1/frontendv1pb/frontend.proto
 pkg/frontend/v2/frontendv2pb/frontend.pb.go: pkg/frontend/v2/frontendv2pb/frontend.proto
-pkg/querier/queryrange/queryrange.pb.go: pkg/querier/queryrange/queryrange.proto
+pkg/querier/tripperware/queryrange/queryrange.pb.go: pkg/querier/tripperware/queryrange/queryrange.proto
+pkg/querier/tripperware/query.pb.go: pkg/querier/tripperware/query.proto
 pkg/querier/stats/stats.pb.go: pkg/querier/stats/stats.proto
-pkg/chunk/storage/caching_index_client.pb.go: pkg/chunk/storage/caching_index_client.proto
-pkg/distributor/ha_tracker.pb.go: pkg/distributor/ha_tracker.proto
 pkg/ruler/rulespb/rules.pb.go: pkg/ruler/rulespb/rules.proto
 pkg/ruler/ruler.pb.go: pkg/ruler/ruler.proto
 pkg/ring/kv/memberlist/kv.pb.go: pkg/ring/kv/memberlist/kv.proto
 pkg/scheduler/schedulerpb/scheduler.pb.go: pkg/scheduler/schedulerpb/scheduler.proto
 pkg/storegateway/storegatewaypb/gateway.pb.go: pkg/storegateway/storegatewaypb/gateway.proto
-pkg/chunk/grpc/grpc.pb.go: pkg/chunk/grpc/grpc.proto
-tools/blocksconvert/scheduler.pb.go: tools/blocksconvert/scheduler.proto
 pkg/alertmanager/alertmanagerpb/alertmanager.pb.go: pkg/alertmanager/alertmanagerpb/alertmanager.proto
 pkg/alertmanager/alertspb/alerts.pb.go: pkg/alertmanager/alertspb/alerts.proto
 
 all: $(UPTODATE_FILES)
 test: protos
 mod-check: protos
-configs-integration-test: protos
 lint: protos
 build-image/$(UPTODATE): build-image/*
 
@@ -119,13 +111,13 @@ build-image/$(UPTODATE): build-image/*
 SUDO := $(shell docker info >/dev/null 2>&1 || echo "sudo -E")
 BUILD_IN_CONTAINER := true
 BUILD_IMAGE ?= $(IMAGE_PREFIX)build-image
-LATEST_BUILD_IMAGE_TAG ?= 20210713_update-go-1.16.6-178ab0c4f
+LATEST_BUILD_IMAGE_TAG ?= master-7bc8b2491b
 
 # TTY is parameterized to allow Google Cloud Builder to run builds,
 # as it currently disallows TTY devices. This value needs to be overridden
 # in any custom cloudbuild.yaml files
 TTY := --tty
-GO_FLAGS := -ldflags "-X main.Branch=$(GIT_BRANCH) -X main.Revision=$(GIT_REVISION) -X main.Version=$(VERSION) -extldflags \"-static\" -s -w" -tags netgo
+GO_FLAGS := -ldflags "-X main.Branch=$(GIT_BRANCH) -X main.Revision=$(GIT_REVISION) -X main.Version=$(VERSION) -extldflags \"-static\" -s -w" -tags "netgo slicelabels"
 
 ifeq ($(BUILD_IN_CONTAINER),true)
 
@@ -133,35 +125,23 @@ GOVOLUMES=	-v $(shell pwd)/.cache:/go/cache:delegated,z \
 			-v $(shell pwd)/.pkg:/go/pkg:delegated,z \
 			-v $(shell pwd):/go/src/github.com/cortexproject/cortex:delegated,z
 
-exes $(EXES) protos $(PROTO_GOS) lint test cover shell mod-check check-protos web-build web-pre web-deploy doc: build-image/$(UPTODATE)
+exes $(EXES) protos $(PROTO_GOS) lint test cover shell mod-check check-protos doc: build-image/$(UPTODATE)
 	@mkdir -p $(shell pwd)/.pkg
 	@mkdir -p $(shell pwd)/.cache
 	@echo
 	@echo ">>>> Entering build container: $@"
 	@$(SUDO) time docker run --rm $(TTY) -i $(GOVOLUMES) $(BUILD_IMAGE) $@;
 
-configs-integration-test: build-image/$(UPTODATE)
-	@mkdir -p $(shell pwd)/.pkg
-	@mkdir -p $(shell pwd)/.cache
-	@DB_CONTAINER="$$(docker run -d -e 'POSTGRES_DB=configs_test' postgres:9.6.16)"; \
-	echo ; \
-	echo ">>>> Entering build container: $@"; \
-	$(SUDO) docker run --rm $(TTY) -i $(GOVOLUMES) \
-		-v $(shell pwd)/cmd/cortex/migrations:/migrations:z \
-		--workdir /go/src/github.com/cortexproject/cortex \
-		--link "$$DB_CONTAINER":configs-db.cortex.local \
-		-e DB_ADDR=configs-db.cortex.local \
-		$(BUILD_IMAGE) $@; \
-	status=$$?; \
-	docker rm -f "$$DB_CONTAINER"; \
-	exit $$status
-
 else
 
 exes: $(EXES)
 
 $(EXES):
-	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
+	@for arch in $(ARCHS); do \
+  		echo "Building $@ for $$arch";\
+  		CGO_ENABLED=0 GOARCH=$$arch GOOS=linux go build $(GO_FLAGS) -o $@-$$arch ./$(@D); \
+  	done
+
 
 protos: $(PROTO_GOS)
 
@@ -173,11 +153,12 @@ protos: $(PROTO_GOS)
 lint:
 	misspell -error docs
 
+
 	# Configured via .golangci.yml.
 	golangci-lint run
 
 	# Ensure no blocklisted package is imported.
-	GOFLAGS="-tags=requires_docker" faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,\
+	GOFLAGS="-tags=requires_docker,integration,integration_alertmanager,integration_backward_compatibility,integration_configs_db,integration_memberlist,integration_querier,integration_ruler,integration_query_fuzz,integration_remote_write_v2" go tool faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,\
 		golang.org/x/net/context=context,\
 		sync/atomic=go.uber.org/atomic,\
 		github.com/prometheus/client_golang/prometheus.{MultiError}=github.com/prometheus/prometheus/tsdb/errors.{NewMulti},\
@@ -185,28 +166,30 @@ lint:
 		github.com/weaveworks/common/user.{ExtractOrgIDFromHTTPRequest}=github.com/cortexproject/cortex/pkg/tenant.{ExtractTenantIDFromHTTPRequest}" ./pkg/... ./cmd/... ./tools/... ./integration/...
 
 	# Ensure clean pkg structure.
-	faillint -paths "\
+	go tool faillint -paths "\
 		github.com/cortexproject/cortex/pkg/scheduler,\
 		github.com/cortexproject/cortex/pkg/frontend,\
 		github.com/cortexproject/cortex/pkg/frontend/transport,\
 		github.com/cortexproject/cortex/pkg/frontend/v1,\
 		github.com/cortexproject/cortex/pkg/frontend/v2" \
 		./pkg/querier/...
-	faillint -paths "github.com/cortexproject/cortex/pkg/querier/..." ./pkg/scheduler/...
-	faillint -paths "github.com/cortexproject/cortex/pkg/storage/tsdb/..." ./pkg/storage/bucket/...
-	faillint -paths "github.com/cortexproject/cortex/pkg/..." ./pkg/alertmanager/alertspb/...
-	faillint -paths "github.com/cortexproject/cortex/pkg/..." ./pkg/ruler/rulespb/...
+	go tool faillint -paths "github.com/cortexproject/cortex/pkg/querier/..." ./pkg/scheduler/...
+	go tool faillint -paths "github.com/cortexproject/cortex/pkg/storage/tsdb/..." ./pkg/storage/bucket/...
+	go tool faillint -paths "github.com/cortexproject/cortex/pkg/..." ./pkg/alertmanager/alertspb/...
+	go tool faillint -paths "github.com/cortexproject/cortex/pkg/..." ./pkg/ruler/rulespb/...
 
 	# Ensure the query path is supporting multiple tenants
-	faillint -paths "\
+	go tool faillint -paths "\
 		github.com/cortexproject/cortex/pkg/tenant.{TenantID}=github.com/cortexproject/cortex/pkg/tenant.{TenantIDs}" \
 		./pkg/scheduler/... \
 		./pkg/frontend/... \
 		./pkg/querier/tenantfederation/... \
-		./pkg/querier/queryrange/...
+		./pkg/querier/tripperware/... \
+		./pkg/querier/tripperware/instantquery/... \
+		./pkg/querier/tripperware/queryrange/...
 
 	# Ensure packages that no longer use a global logger don't reintroduce it
-	faillint -paths "github.com/cortexproject/cortex/pkg/util/log.{Logger}" \
+	go tool faillint -paths "github.com/cortexproject/cortex/pkg/util/log.{Logger}" \
 		./pkg/alertmanager/alertstore/... \
 		./pkg/ingester/... \
 		./pkg/flusher/... \
@@ -214,20 +197,20 @@ lint:
 		./pkg/ruler/...
 
 test:
-	go test -tags netgo -timeout 30m -race -count 1 ./...
+	go test -tags "netgo slicelabels" -timeout 30m -race -count 1 ./...
+
+test-no-race:
+	go test -tags "netgo slicelabels" -timeout 30m -count 1 ./...
 
 cover:
 	$(eval COVERDIR := $(shell mktemp -d coverage.XXXXXXXXXX))
 	$(eval COVERFILE := $(shell mktemp $(COVERDIR)/unit.XXXXXXXXXX))
-	go test -tags netgo -timeout 30m -race -count 1 -coverprofile=$(COVERFILE) ./...
+	go test -tags netgo,slicelabels -timeout 30m -race -count 1 -coverprofile=$(COVERFILE) ./...
 	go tool cover -html=$(COVERFILE) -o cover.html
 	go tool cover -func=cover.html | tail -n1
 
 shell:
 	bash
-
-configs-integration-test:
-	/bin/bash -c "go test -v -tags 'netgo integration' -timeout 30s ./pkg/configs/... ./pkg/ruler/..."
 
 mod-check:
 	GO111MODULE=on go mod download
@@ -239,25 +222,16 @@ mod-check:
 check-protos: clean-protos protos
 	@git diff --exit-code -- $(PROTO_GOS)
 
-web-pre:
-	cd website && git submodule update --init --recursive
-	./tools/website/web-pre.sh
-
-web-build: web-pre
-	cd website && HUGO_ENV=production hugo --config config.toml  --minify -v
-
-web-deploy:
-	./tools/website/web-deploy.sh
-
 # Generates the config file documentation.
 doc: clean-doc
-	go run ./tools/doc-generator ./docs/configuration/config-file-reference.template > ./docs/configuration/config-file-reference.md
-	go run ./tools/doc-generator ./docs/blocks-storage/compactor.template            > ./docs/blocks-storage/compactor.md
-	go run ./tools/doc-generator ./docs/blocks-storage/store-gateway.template        > ./docs/blocks-storage/store-gateway.md
-	go run ./tools/doc-generator ./docs/blocks-storage/querier.template              > ./docs/blocks-storage/querier.md
-	go run ./tools/doc-generator ./docs/guides/encryption-at-rest.template           > ./docs/guides/encryption-at-rest.md
+	go run -tags slicelabels ./tools/doc-generator ./docs/configuration/config-file-reference.template > ./docs/configuration/config-file-reference.md
+	go run -tags slicelabels ./tools/doc-generator ./docs/blocks-storage/compactor.template            > ./docs/blocks-storage/compactor.md
+	go run -tags slicelabels ./tools/doc-generator ./docs/blocks-storage/store-gateway.template        > ./docs/blocks-storage/store-gateway.md
+	go run -tags slicelabels ./tools/doc-generator ./docs/blocks-storage/querier.template              > ./docs/blocks-storage/querier.md
+	go run -tags slicelabels ./tools/doc-generator ./docs/guides/encryption-at-rest.template           > ./docs/guides/encryption-at-rest.md
 	embedmd -w docs/operations/requests-mirroring-to-secondary-cluster.md
 	embedmd -w docs/guides/overrides-exporter.md
+	go run -tags slicelabels ./tools/doc-generator -json-schema            						       > ./schemas/cortex-config-schema.json
 
 endif
 
@@ -271,16 +245,20 @@ clean-protos:
 
 save-images:
 	@mkdir -p docker-images
-	for image_name in $(IMAGE_NAMES); do \
+	@for image_name in $(IMAGE_NAMES); do \
 		if ! echo $$image_name | grep build; then \
-			docker save $$image_name:$(IMAGE_TAG) -o docker-images/$$(echo $$image_name | tr "/" _):$(IMAGE_TAG); \
+		  	for arch in $(ARCHS); do \
+				docker save $$image_name:$(IMAGE_TAG)-$$arch -o docker-images/$$(echo $$image_name | tr "/" _):$(IMAGE_TAG)-$$arch; \
+			done;\
 		fi \
 	done
 
 load-images:
-	for image_name in $(IMAGE_NAMES); do \
+	@for image_name in $(IMAGE_NAMES); do \
 		if ! echo $$image_name | grep build; then \
-			docker load -i docker-images/$$(echo $$image_name | tr "/" _):$(IMAGE_TAG); \
+		  	for arch in $(ARCHS); do \
+				docker load -i docker-images/$$(echo $$image_name | tr "/" _):$(IMAGE_TAG)-$$arch; \
+			done;\
 		fi \
 	done
 
@@ -293,7 +271,7 @@ clean-doc:
 		./docs/guides/encryption-at-rest.md
 
 check-doc: doc
-	@git diff --exit-code -- ./docs/configuration/config-file-reference.md ./docs/blocks-storage/*.md ./docs/configuration/*.md
+	@git diff --exit-code -- ./docs/configuration/config-file-reference.md ./docs/blocks-storage/*.md ./docs/configuration/*.md ./schemas/cortex-config-schema.json
 
 clean-white-noise:
 	@find . -path ./.pkg -prune -o -path ./vendor -prune -o -path ./website -prune -or -type f -name "*.md" -print | \
@@ -329,6 +307,8 @@ FPM_OPTS := fpm -s dir -v $(VERSION) -n cortex -f \
 	--url "https://github.com/cortexproject/cortex"
 
 PACKAGE_IN_CONTAINER := true
+
+# The fpm image can be built from packaging/fpm//Dockerfile
 PACKAGE_IMAGE ?= $(IMAGE_PREFIX)fpm
 ifeq ($(PACKAGE_IN_CONTAINER), true)
 
@@ -357,20 +337,22 @@ dist/$(UPTODATE)-packages: dist $(wildcard packaging/deb/**) $(wildcard packagin
 			--architecture $$deb_arch \
 			--after-install packaging/deb/control/postinst \
 			--before-remove packaging/deb/control/prerm \
+			--config-files /etc/default/cortex \
 			--package dist/cortex-$(VERSION)_$$arch.deb \
-			dist/cortex-linux-$$arch=/usr/local/bin/cortex \
-			docs/chunks-storage/single-process-config.yaml=/etc/cortex/single-process-config.yaml \
+			dist/cortex-linux-$$arch=/usr/bin/cortex \
+			docs/configuration/single-process-config-blocks.yaml=/etc/cortex/single-process-config.yaml \
 			packaging/deb/default/cortex=/etc/default/cortex \
-			packaging/deb/systemd/cortex.service=/etc/systemd/system/cortex.service; \
+			packaging/deb/systemd/cortex.service=/lib/systemd/system/cortex.service; \
 		$(FPM_OPTS) -t rpm  \
 			--architecture $$rpm_arch \
 			--after-install packaging/rpm/control/post \
 			--before-remove packaging/rpm/control/preun \
+			--config-files /etc/sysconfig/cortex \
 			--package dist/cortex-$(VERSION)_$$arch.rpm \
-			dist/cortex-linux-$$arch=/usr/local/bin/cortex \
-			docs/chunks-storage/single-process-config.yaml=/etc/cortex/single-process-config.yaml \
+			dist/cortex-linux-$$arch=/usr/bin/cortex \
+			docs/configuration/single-process-config-blocks.yaml=/etc/cortex/single-process-config.yaml \
 			packaging/rpm/sysconfig/cortex=/etc/sysconfig/cortex \
-			packaging/rpm/systemd/cortex.service=/etc/systemd/system/cortex.service; \
+			packaging/rpm/systemd/cortex.service=/usr/lib/systemd/system/cortex.service; \
 	done
 	for pkg in dist/*.deb dist/*.rpm; do \
   		sha256sum $$pkg | cut -d ' ' -f 1 > $${pkg}-sha-256; \
@@ -379,17 +361,19 @@ dist/$(UPTODATE)-packages: dist $(wildcard packaging/deb/**) $(wildcard packagin
 
 endif
 
-# Build both arm64 and amd64 images, so that we can test deb/rpm packages for both architectures.
-packaging/rpm/centos-systemd/$(UPTODATE): packaging/rpm/centos-systemd/Dockerfile
-	$(SUDO) docker build --platform linux/amd64 --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)):amd64 $(@D)/
-	$(SUDO) docker build --platform linux/arm64 --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)):arm64 $(@D)/
+# Build test images for the architectures specified by ARCHS.
+packaging/rpm/rockylinux-systemd/$(UPTODATE): packaging/rpm/rockylinux-systemd/Dockerfile
+	@for arch in $(ARCHS); do \
+		$(SUDO) docker build --platform linux/$$arch --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)):$$arch $(@D)/ ; \
+	done
 	touch $@
 
 packaging/deb/debian-systemd/$(UPTODATE): packaging/deb/debian-systemd/Dockerfile
-	$(SUDO) docker build --platform linux/amd64 --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)):amd64 $(@D)/
-	$(SUDO) docker build --platform linux/arm64 --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)):arm64 $(@D)/
+	@for arch in $(ARCHS); do \
+		$(SUDO) docker build --platform linux/$$arch --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)):$$arch $(@D)/ ; \
+	done
 	touch $@
 
 .PHONY: test-packages
-test-packages: packages packaging/rpm/centos-systemd/$(UPTODATE) packaging/deb/debian-systemd/$(UPTODATE)
-	./tools/packaging/test-packages $(IMAGE_PREFIX) $(VERSION)
+test-packages: packages packaging/rpm/rockylinux-systemd/$(UPTODATE) packaging/deb/debian-systemd/$(UPTODATE)
+	./tools/packaging/test-packages $(IMAGE_PREFIX) $(VERSION) $(ARCHS)

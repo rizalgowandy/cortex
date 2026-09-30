@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,8 +25,8 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
@@ -34,11 +34,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"gopkg.in/yaml.v2"
 
+	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/exemplars/exemplarspb"
-	"github.com/thanos-io/thanos/pkg/httpconfig"
 	"github.com/thanos-io/thanos/pkg/metadata/metadatapb"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/status/statuspb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/targets/targetspb"
 	"github.com/thanos-io/thanos/pkg/tracing"
@@ -86,7 +87,7 @@ func NewClient(c HTTPClient, logger log.Logger, userAgent string) *Client {
 
 // NewDefaultClient returns Client with tracing tripperware.
 func NewDefaultClient() *Client {
-	client, _ := httpconfig.NewHTTPClient(httpconfig.ClientConfig{}, "")
+	client, _ := clientconfig.NewHTTPClient(clientconfig.HTTPClientConfig{}, "")
 	return NewWithTracingClient(
 		log.NewNopLogger(),
 		client,
@@ -106,7 +107,7 @@ func NewWithTracingClient(logger log.Logger, httpClient *http.Client, userAgent 
 
 // req2xx sends a request to the given url.URL. If method is http.MethodPost then
 // the raw query is encoded in the body and the appropriate Content-Type is set.
-func (c *Client) req2xx(ctx context.Context, u *url.URL, method string) (_ []byte, _ int, err error) {
+func (c *Client) req2xx(ctx context.Context, u *url.URL, method string, headers http.Header) (_ []byte, _ int, err error) {
 	var b io.Reader
 	if method == http.MethodPost {
 		rq := u.RawQuery
@@ -118,6 +119,10 @@ func (c *Client) req2xx(ctx context.Context, u *url.URL, method string) (_ []byt
 	if err != nil {
 		return nil, 0, errors.Wrapf(err, "create %s request", method)
 	}
+	if headers != nil {
+		req.Header = headers
+	}
+
 	if c.userAgent != "" {
 		req.Header.Set("User-Agent", c.userAgent)
 	}
@@ -131,7 +136,7 @@ func (c *Client) req2xx(ctx context.Context, u *url.URL, method string) (_ []byt
 	}
 	defer runutil.ExhaustCloseWithErrCapture(&err, resp.Body, "%s: close body", req.URL.String())
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, resp.StatusCode, errors.Wrap(err, "read body")
 	}
@@ -158,6 +163,22 @@ func IsWALDirAccessible(dir string) error {
 	return nil
 }
 
+// IsDirAccessible returns no error if dir can be found.
+func IsDirAccessible(dir string) error {
+	const errMsg = "Dir is not accessible."
+
+	f, err := os.Stat(dir)
+	if err != nil {
+		return errors.Wrap(err, errMsg)
+	}
+
+	if !f.IsDir() {
+		return errors.New(errMsg)
+	}
+
+	return nil
+}
+
 // ExternalLabels returns sorted external labels from /api/v1/status/config Prometheus endpoint.
 // Note that configuration can be hot reloadable on Prometheus, so this config might change in runtime.
 func (c *Client) ExternalLabels(ctx context.Context, base *url.URL) (labels.Labels, error) {
@@ -167,9 +188,9 @@ func (c *Client) ExternalLabels(ctx context.Context, base *url.URL) (labels.Labe
 	span, ctx := tracing.StartSpan(ctx, "/prom_config HTTP[client]")
 	defer span.Finish()
 
-	body, _, err := c.req2xx(ctx, &u, http.MethodGet)
+	body, _, err := c.req2xx(ctx, &u, http.MethodGet, nil)
 	if err != nil {
-		return nil, err
+		return labels.EmptyLabels(), err
 	}
 	var d struct {
 		Data struct {
@@ -177,18 +198,18 @@ func (c *Client) ExternalLabels(ctx context.Context, base *url.URL) (labels.Labe
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &d); err != nil {
-		return nil, errors.Wrapf(err, "unmarshal response: %v", string(body))
+		return labels.EmptyLabels(), errors.Wrapf(err, "unmarshal response: %v", string(body))
 	}
 	var cfg struct {
-		GlobalConfig config.GlobalConfig `yaml:"global"`
+		GlobalConfig struct {
+			ExternalLabels map[string]string `yaml:"external_labels"`
+		} `yaml:"global"`
 	}
 	if err := yaml.Unmarshal([]byte(d.Data.YAML), &cfg); err != nil {
-		return nil, errors.Wrapf(err, "parse Prometheus config: %v", d.Data.YAML)
+		return labels.EmptyLabels(), errors.Wrapf(err, "parse Prometheus config: %v", d.Data.YAML)
 	}
 
-	lset := cfg.GlobalConfig.ExternalLabels
-	sort.Sort(lset)
-	return lset, nil
+	return labels.FromMap(cfg.GlobalConfig.ExternalLabels), nil
 }
 
 type Flags struct {
@@ -196,6 +217,7 @@ type Flags struct {
 	TSDBRetention      model.Duration `json:"storage.tsdb.retention"`
 	TSDBMinTime        model.Duration `json:"storage.tsdb.min-block-duration"`
 	TSDBMaxTime        model.Duration `json:"storage.tsdb.max-block-duration"`
+	TSDBDelayCompact   string         `json:"storage.tsdb.delay-compact-file.path"`
 	WebEnableAdminAPI  bool           `json:"web.enable-admin-api"`
 	WebEnableLifecycle bool           `json:"web.enable-lifecycle"`
 }
@@ -210,6 +232,7 @@ func (f *Flags) UnmarshalJSON(b []byte) error {
 		TSDBRetention      modelDuration `json:"storage.tsdb.retention"`
 		TSDBMinTime        modelDuration `json:"storage.tsdb.min-block-duration"`
 		TSDBMaxTime        modelDuration `json:"storage.tsdb.max-block-duration"`
+		TSDBDelayCompact   string        `json:"storage.tsdb.delay-compact-file.path"`
 		WebEnableAdminAPI  modelBool     `json:"web.enable-admin-api"`
 		WebEnableLifecycle modelBool     `json:"web.enable-lifecycle"`
 	}{}
@@ -223,6 +246,7 @@ func (f *Flags) UnmarshalJSON(b []byte) error {
 		TSDBRetention:      model.Duration(parsableFlags.TSDBRetention),
 		TSDBMinTime:        model.Duration(parsableFlags.TSDBMinTime),
 		TSDBMaxTime:        model.Duration(parsableFlags.TSDBMaxTime),
+		TSDBDelayCompact:   parsableFlags.TSDBDelayCompact,
 		WebEnableAdminAPI:  bool(parsableFlags.WebEnableAdminAPI),
 		WebEnableLifecycle: bool(parsableFlags.WebEnableLifecycle),
 	}
@@ -283,7 +307,7 @@ func (c *Client) ConfiguredFlags(ctx context.Context, base *url.URL) (Flags, err
 	}
 	defer runutil.ExhaustCloseWithLogOnErr(c.logger, resp.Body, "query body")
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return Flags{}, errors.New("failed to read body")
 	}
@@ -335,7 +359,7 @@ func (c *Client) Snapshot(ctx context.Context, base *url.URL, skipHead bool) (st
 	}
 	defer runutil.ExhaustCloseWithLogOnErr(c.logger, resp.Body, "query body")
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", errors.New("failed to read body")
 	}
@@ -357,10 +381,15 @@ func (c *Client) Snapshot(ctx context.Context, base *url.URL, skipHead bool) (st
 }
 
 type QueryOptions struct {
+	DoNotAddThanosParams    bool
 	Deduplicate             bool
 	PartialResponseStrategy storepb.PartialResponseStrategy
 	Method                  string
 	MaxSourceResolution     string
+	Engine                  string
+	Explain                 bool
+	Analyze                 bool
+	HTTPHeaders             http.Header
 }
 
 func (p *QueryOptions) AddTo(values url.Values) error {
@@ -368,6 +397,10 @@ func (p *QueryOptions) AddTo(values url.Values) error {
 	if len(p.MaxSourceResolution) > 0 {
 		values.Add("max_source_resolution", p.MaxSourceResolution)
 	}
+
+	values.Add("explain", fmt.Sprintf("%v", p.Explain))
+	values.Add("analyze", fmt.Sprintf("%v", p.Analyze))
+	values.Add("engine", p.Engine)
 
 	var partialResponseValue string
 	switch p.PartialResponseStrategy {
@@ -385,16 +418,23 @@ func (p *QueryOptions) AddTo(values url.Values) error {
 	return nil
 }
 
+type Explanation struct {
+	Name     string         `json:"name"`
+	Children []*Explanation `json:"children,omitempty"`
+}
+
 // QueryInstant performs an instant query using a default HTTP client and returns results in model.Vector type.
-func (c *Client) QueryInstant(ctx context.Context, base *url.URL, query string, t time.Time, opts QueryOptions) (model.Vector, []string, error) {
+func (c *Client) QueryInstant(ctx context.Context, base *url.URL, query string, t time.Time, opts QueryOptions) (model.Vector, []string, *Explanation, error) {
 	params, err := url.ParseQuery(base.RawQuery)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "parse raw query %s", base.RawQuery)
+		return nil, nil, nil, errors.Wrapf(err, "parse raw query %s", base.RawQuery)
 	}
 	params.Add("query", query)
 	params.Add("time", t.Format(time.RFC3339Nano))
-	if err := opts.AddTo(params); err != nil {
-		return nil, nil, errors.Wrap(err, "add thanos opts query params")
+	if !opts.DoNotAddThanosParams {
+		if err := opts.AddTo(params); err != nil {
+			return nil, nil, nil, errors.Wrap(err, "add thanos opts query params")
+		}
 	}
 
 	u := *base
@@ -411,27 +451,28 @@ func (c *Client) QueryInstant(ctx context.Context, base *url.URL, query string, 
 		method = http.MethodGet
 	}
 
-	body, _, err := c.req2xx(ctx, &u, method)
+	body, _, err := c.req2xx(ctx, &u, method, opts.HTTPHeaders)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "read query instant response")
+		return nil, nil, nil, errors.Wrap(err, "read query instant response")
 	}
 
 	// Decode only ResultType and load Result only as RawJson since we don't know
 	// structure of the Result yet.
 	var m struct {
 		Data struct {
-			ResultType string          `json:"resultType"`
-			Result     json.RawMessage `json:"result"`
+			ResultType  string          `json:"resultType"`
+			Result      json.RawMessage `json:"result"`
+			Explanation *Explanation    `json:"explanation,omitempty"`
 		} `json:"data"`
 
 		Error     string `json:"error,omitempty"`
 		ErrorType string `json:"errorType,omitempty"`
-		// Extra field supported by Thanos Querier.
+		// Extra fields supported by Thanos Querier.
 		Warnings []string `json:"warnings"`
 	}
 
 	if err = json.Unmarshal(body, &m); err != nil {
-		return nil, nil, errors.Wrap(err, "unmarshal query instant response")
+		return nil, nil, nil, errors.Wrap(err, "unmarshal query instant response")
 	}
 
 	var vectorResult model.Vector
@@ -441,49 +482,49 @@ func (c *Client) QueryInstant(ctx context.Context, base *url.URL, query string, 
 	switch m.Data.ResultType {
 	case string(parser.ValueTypeVector):
 		if err = json.Unmarshal(m.Data.Result, &vectorResult); err != nil {
-			return nil, nil, errors.Wrap(err, "decode result into ValueTypeVector")
+			return nil, nil, nil, errors.Wrap(err, "decode result into ValueTypeVector")
 		}
 	case string(parser.ValueTypeScalar):
 		vectorResult, err = convertScalarJSONToVector(m.Data.Result)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "decode result into ValueTypeScalar")
+			return nil, nil, nil, errors.Wrap(err, "decode result into ValueTypeScalar")
 		}
 	default:
 		if m.Warnings != nil {
-			return nil, nil, errors.Errorf("error: %s, type: %s, warning: %s", m.Error, m.ErrorType, strings.Join(m.Warnings, ", "))
+			return nil, nil, nil, errors.Errorf("error: %s, type: %s, warning: %s", m.Error, m.ErrorType, strings.Join(m.Warnings, ", "))
 		}
 		if m.Error != "" {
-			return nil, nil, errors.Errorf("error: %s, type: %s", m.Error, m.ErrorType)
+			return nil, nil, nil, errors.Errorf("error: %s, type: %s", m.Error, m.ErrorType)
 		}
-		return nil, nil, errors.Errorf("received status code: 200, unknown response type: '%q'", m.Data.ResultType)
+		return nil, nil, nil, errors.Errorf("received status code: 200, unknown response type: '%q'", m.Data.ResultType)
 	}
 
-	return vectorResult, m.Warnings, nil
+	return vectorResult, m.Warnings, m.Data.Explanation, nil
 }
 
 // PromqlQueryInstant performs instant query and returns results in promql.Vector type that is compatible with promql package.
 func (c *Client) PromqlQueryInstant(ctx context.Context, base *url.URL, query string, t time.Time, opts QueryOptions) (promql.Vector, []string, error) {
-	vectorResult, warnings, err := c.QueryInstant(ctx, base, query, t, opts)
+	vectorResult, warnings, _, err := c.QueryInstant(ctx, base, query, t, opts)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	vec := make(promql.Vector, 0, len(vectorResult))
 
+	b := labels.NewScratchBuilder(0)
 	for _, e := range vectorResult {
-		lset := make(labels.Labels, 0, len(e.Metric))
+		b.Reset()
 
 		for k, v := range e.Metric {
-			lset = append(lset, labels.Label{
-				Name:  string(k),
-				Value: string(v),
-			})
+			b.Add(string(k), string(v))
 		}
-		sort.Sort(lset)
+		// TODO(mhoffm): shouldn't labels from prometheus results be already sorted?
+		b.Sort()
 
 		vec = append(vec, promql.Sample{
-			Metric: lset,
-			Point:  promql.Point{T: int64(e.Timestamp), V: float64(e.Value)},
+			Metric: b.Labels(),
+			T:      int64(e.Timestamp),
+			F:      float64(e.Value),
 		})
 	}
 
@@ -491,17 +532,19 @@ func (c *Client) PromqlQueryInstant(ctx context.Context, base *url.URL, query st
 }
 
 // QueryRange performs a range query using a default HTTP client and returns results in model.Matrix type.
-func (c *Client) QueryRange(ctx context.Context, base *url.URL, query string, startTime, endTime, step int64, opts QueryOptions) (model.Matrix, []string, error) {
+func (c *Client) QueryRange(ctx context.Context, base *url.URL, query string, startTime, endTime, step int64, opts QueryOptions) (model.Matrix, []string, *Explanation, error) {
 	params, err := url.ParseQuery(base.RawQuery)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "parse raw query %s", base.RawQuery)
+		return nil, nil, nil, errors.Wrapf(err, "parse raw query %s", base.RawQuery)
 	}
 	params.Add("query", query)
 	params.Add("start", formatTime(timestamp.Time(startTime)))
 	params.Add("end", formatTime(timestamp.Time(endTime)))
 	params.Add("step", strconv.FormatInt(step, 10))
-	if err := opts.AddTo(params); err != nil {
-		return nil, nil, errors.Wrap(err, "add thanos opts query params")
+	if !opts.DoNotAddThanosParams {
+		if err := opts.AddTo(params); err != nil {
+			return nil, nil, nil, errors.Wrap(err, "add thanos opts query params")
+		}
 	}
 
 	u := *base
@@ -513,27 +556,28 @@ func (c *Client) QueryRange(ctx context.Context, base *url.URL, query string, st
 	span, ctx := tracing.StartSpan(ctx, "/prom_query_range HTTP[client]")
 	defer span.Finish()
 
-	body, _, err := c.req2xx(ctx, &u, http.MethodGet)
+	body, _, err := c.req2xx(ctx, &u, http.MethodGet, opts.HTTPHeaders)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "read query range response")
+		return nil, nil, nil, errors.Wrap(err, "read query range response")
 	}
 
 	// Decode only ResultType and load Result only as RawJson since we don't know
 	// structure of the Result yet.
 	var m struct {
 		Data struct {
-			ResultType string          `json:"resultType"`
-			Result     json.RawMessage `json:"result"`
+			ResultType  string          `json:"resultType"`
+			Result      json.RawMessage `json:"result"`
+			Explanation *Explanation    `json:"explanation,omitempty"`
 		} `json:"data"`
 
 		Error     string `json:"error,omitempty"`
 		ErrorType string `json:"errorType,omitempty"`
-		// Extra field supported by Thanos Querier.
+		// Extra fields supported by Thanos Querier.
 		Warnings []string `json:"warnings"`
 	}
 
 	if err = json.Unmarshal(body, &m); err != nil {
-		return nil, nil, errors.Wrap(err, "unmarshal query range response")
+		return nil, nil, nil, errors.Wrap(err, "unmarshal query range response")
 	}
 
 	var matrixResult model.Matrix
@@ -542,19 +586,19 @@ func (c *Client) QueryRange(ctx context.Context, base *url.URL, query string, st
 	switch m.Data.ResultType {
 	case string(parser.ValueTypeMatrix):
 		if err = json.Unmarshal(m.Data.Result, &matrixResult); err != nil {
-			return nil, nil, errors.Wrap(err, "decode result into ValueTypeMatrix")
+			return nil, nil, nil, errors.Wrap(err, "decode result into ValueTypeMatrix")
 		}
 	default:
 		if m.Warnings != nil {
-			return nil, nil, errors.Errorf("error: %s, type: %s, warning: %s", m.Error, m.ErrorType, strings.Join(m.Warnings, ", "))
+			return nil, nil, nil, errors.Errorf("error: %s, type: %s, warning: %s", m.Error, m.ErrorType, strings.Join(m.Warnings, ", "))
 		}
 		if m.Error != "" {
-			return nil, nil, errors.Errorf("error: %s, type: %s", m.Error, m.ErrorType)
+			return nil, nil, nil, errors.Errorf("error: %s, type: %s", m.Error, m.ErrorType)
 		}
 
-		return nil, nil, errors.Errorf("received status code: 200, unknown response type: '%q'", m.Data.ResultType)
+		return nil, nil, nil, errors.Errorf("received status code: 200, unknown response type: '%q'", m.Data.ResultType)
 	}
-	return matrixResult, m.Warnings, nil
+	return matrixResult, m.Warnings, m.Data.Explanation, nil
 }
 
 // Scalar response consists of array with mixed types so it needs to be
@@ -595,7 +639,7 @@ func (c *Client) AlertmanagerAlerts(ctx context.Context, base *url.URL) ([]*mode
 	span, ctx := tracing.StartSpan(ctx, "/alertmanager_alerts HTTP[client]")
 	defer span.Finish()
 
-	body, _, err := c.req2xx(ctx, &u, http.MethodGet)
+	body, _, err := c.req2xx(ctx, &u, http.MethodGet, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -625,10 +669,13 @@ func (c *Client) BuildVersion(ctx context.Context, base *url.URL) (string, error
 	span, ctx := tracing.StartSpan(ctx, "/prom_buildversion HTTP[client]")
 	defer span.Finish()
 
-	// We get status code 404 for prometheus versions lower than 2.14.0
-	body, code, err := c.req2xx(ctx, &u, http.MethodGet)
+	// We get status code 404 or 405 for prometheus versions lower than 2.14.0
+	body, code, err := c.req2xx(ctx, &u, http.MethodGet, nil)
 	if err != nil {
 		if code == http.StatusNotFound {
+			return "0", nil
+		}
+		if code == http.StatusMethodNotAllowed {
 			return "0", nil
 		}
 		return "", err
@@ -647,15 +694,57 @@ func (c *Client) BuildVersion(ctx context.Context, base *url.URL) (string, error
 	return b.Data.Version, nil
 }
 
+// LowestTimestamp returns the lowest timestamp in the TSDB by parsing the /metrics endpoint
+// and extracting the prometheus_tsdb_lowest_timestamp_seconds metric from it.
+func (c *Client) LowestTimestamp(ctx context.Context, base *url.URL) (int64, error) {
+	u := *base
+	u.Path = path.Join(u.Path, "/metrics")
+
+	level.Debug(c.logger).Log("msg", "lowest timestamp", "url", u.String())
+
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, errors.Wrap(err, "create request")
+	}
+
+	span, ctx := tracing.StartSpan(ctx, "/lowest_timestamp HTTP[client]")
+	defer span.Finish()
+
+	resp, err := c.Do(req.WithContext(ctx))
+	if err != nil {
+		return 0, errors.Wrapf(err, "request metric against %s", u.String())
+	}
+	defer runutil.ExhaustCloseWithLogOnErr(c.logger, resp.Body, "request body")
+
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(resp.Body)
+	if err != nil {
+		return 0, errors.Wrapf(err, "parsing metric families against %s", u.String())
+	}
+	mf, ok := families["prometheus_tsdb_lowest_timestamp_seconds"]
+	if !ok {
+		return 0, errors.Wrapf(err, "metric families did not contain 'prometheus_tsdb_lowest_timestamp_seconds'")
+	}
+	val := 1000 * mf.GetMetric()[0].GetGauge().GetValue()
+
+	// in the case that we dont have cut a block yet, TSDB lowest timestamp is math.MaxInt64
+	// but its represented as float and truncated so we need to do this weird comparison.
+	// Since we use this for fan-out pruning we use min timestamp here to include this prometheus.
+	if val == float64(math.MaxInt64) {
+		return math.MinInt64, nil
+	}
+	return int64(val), nil
+}
+
 func formatTime(t time.Time) string {
 	return strconv.FormatFloat(float64(t.Unix())+float64(t.Nanosecond())/1e9, 'f', -1, 64)
 }
 
-func (c *Client) get2xxResultWithGRPCErrors(ctx context.Context, spanName string, u *url.URL, data interface{}) error {
+func (c *Client) get2xxResultWithGRPCErrors(ctx context.Context, spanName string, u *url.URL, data any) error {
 	span, ctx := tracing.StartSpan(ctx, spanName)
 	defer span.Finish()
 
-	body, code, err := c.req2xx(ctx, u, http.MethodGet)
+	body, code, err := c.req2xx(ctx, u, http.MethodGet, nil)
 	if err != nil {
 		if code, exists := statusToCode[code]; exists && code != 0 {
 			return status.Error(code, err.Error())
@@ -668,9 +757,9 @@ func (c *Client) get2xxResultWithGRPCErrors(ctx context.Context, spanName string
 	}
 
 	var m struct {
-		Data   interface{} `json:"data"`
-		Status string      `json:"status"`
-		Error  string      `json:"error"`
+		Data   any    `json:"data"`
+		Status string `json:"status"`
+		Error  string `json:"error"`
 	}
 
 	if err = json.Unmarshal(body, &m); err != nil {
@@ -694,7 +783,7 @@ func (c *Client) get2xxResultWithGRPCErrors(ctx context.Context, spanName string
 
 // SeriesInGRPC returns the labels from Prometheus series API. It uses gRPC errors.
 // NOTE: This method is tested in pkg/store/prometheus_test.go against Prometheus.
-func (c *Client) SeriesInGRPC(ctx context.Context, base *url.URL, matchers []*labels.Matcher, startTime, endTime int64) ([]map[string]string, error) {
+func (c *Client) SeriesInGRPC(ctx context.Context, base *url.URL, matchers []*labels.Matcher, startTime, endTime int64, limit int) ([]map[string]string, error) {
 	u := *base
 	u.Path = path.Join(u.Path, "/api/v1/series")
 	q := u.Query()
@@ -702,6 +791,9 @@ func (c *Client) SeriesInGRPC(ctx context.Context, base *url.URL, matchers []*la
 	q.Add("match[]", storepb.PromMatchersToString(matchers...))
 	q.Add("start", formatTime(timestamp.Time(startTime)))
 	q.Add("end", formatTime(timestamp.Time(endTime)))
+	if limit > 0 {
+		q.Add("limit", strconv.Itoa(limit))
+	}
 	u.RawQuery = q.Encode()
 
 	var m struct {
@@ -713,7 +805,7 @@ func (c *Client) SeriesInGRPC(ctx context.Context, base *url.URL, matchers []*la
 
 // LabelNamesInGRPC returns all known label names constrained by the given matchers. It uses gRPC errors.
 // NOTE: This method is tested in pkg/store/prometheus_test.go against Prometheus.
-func (c *Client) LabelNamesInGRPC(ctx context.Context, base *url.URL, matchers []*labels.Matcher, startTime, endTime int64) ([]string, error) {
+func (c *Client) LabelNamesInGRPC(ctx context.Context, base *url.URL, matchers []*labels.Matcher, startTime, endTime int64, limit int) ([]string, error) {
 	u := *base
 	u.Path = path.Join(u.Path, "/api/v1/labels")
 	q := u.Query()
@@ -723,6 +815,9 @@ func (c *Client) LabelNamesInGRPC(ctx context.Context, base *url.URL, matchers [
 	}
 	q.Add("start", formatTime(timestamp.Time(startTime)))
 	q.Add("end", formatTime(timestamp.Time(endTime)))
+	if limit > 0 {
+		q.Add("limit", strconv.Itoa(limit))
+	}
 	u.RawQuery = q.Encode()
 
 	var m struct {
@@ -733,7 +828,7 @@ func (c *Client) LabelNamesInGRPC(ctx context.Context, base *url.URL, matchers [
 
 // LabelValuesInGRPC returns all known label values for a given label name. It uses gRPC errors.
 // NOTE: This method is tested in pkg/store/prometheus_test.go against Prometheus.
-func (c *Client) LabelValuesInGRPC(ctx context.Context, base *url.URL, label string, matchers []*labels.Matcher, startTime, endTime int64) ([]string, error) {
+func (c *Client) LabelValuesInGRPC(ctx context.Context, base *url.URL, label string, matchers []*labels.Matcher, startTime, endTime int64, limit int) ([]string, error) {
 	u := *base
 	u.Path = path.Join(u.Path, "/api/v1/label/", label, "/values")
 	q := u.Query()
@@ -743,6 +838,9 @@ func (c *Client) LabelValuesInGRPC(ctx context.Context, base *url.URL, label str
 	}
 	q.Add("start", formatTime(timestamp.Time(startTime)))
 	q.Add("end", formatTime(timestamp.Time(endTime)))
+	if limit > 0 {
+		q.Add("limit", strconv.Itoa(limit))
+	}
 	u.RawQuery = q.Encode()
 
 	var m struct {
@@ -778,6 +876,29 @@ func (c *Client) RulesInGRPC(ctx context.Context, base *url.URL, typeRules strin
 	return m.Data.Groups, nil
 }
 
+// AlertsInGRPC returns the rules from Prometheus alerts API. It uses gRPC errors.
+// NOTE: This method is tested in pkg/store/prometheus_test.go against Prometheus.
+func (c *Client) AlertsInGRPC(ctx context.Context, base *url.URL) ([]*rulespb.AlertInstance, error) {
+	u := *base
+	u.Path = path.Join(u.Path, "/api/v1/alerts")
+
+	var m struct {
+		Data struct {
+			Alerts []*rulespb.AlertInstance `json:"alerts"`
+		} `json:"data"`
+	}
+
+	if err := c.get2xxResultWithGRPCErrors(ctx, "/prom_alerts HTTP[client]", &u, &m); err != nil {
+		return nil, err
+	}
+
+	// Prometheus does not support PartialResponseStrategy, and probably would never do. Make it Abort by default.
+	for _, g := range m.Data.Alerts {
+		g.PartialResponseStrategy = storepb.PartialResponseStrategy_ABORT
+	}
+	return m.Data.Alerts, nil
+}
+
 // MetricMetadataInGRPC returns the metadata from Prometheus metric metadata API. It uses gRPC errors.
 func (c *Client) MetricMetadataInGRPC(ctx context.Context, base *url.URL, metric string, limit int) (map[string][]metadatapb.Meta, error) {
 	u := *base
@@ -787,7 +908,6 @@ func (c *Client) MetricMetadataInGRPC(ctx context.Context, base *url.URL, metric
 	if metric != "" {
 		q.Add("metric", metric)
 	}
-	// We only set limit when it is >= 0.
 	if limit >= 0 {
 		q.Add("limit", strconv.Itoa(limit))
 	}
@@ -837,4 +957,30 @@ func (c *Client) TargetsInGRPC(ctx context.Context, base *url.URL, stateTargets 
 		Data *targetspb.TargetDiscovery `json:"data"`
 	}
 	return v.Data, c.get2xxResultWithGRPCErrors(ctx, "/prom_targets HTTP[client]", &u, &v)
+}
+
+func (c *Client) TSDBStatusInGRPC(ctx context.Context, base *url.URL, limit int, matchers ...*labels.Matcher) (*statuspb.TSDBStatisticsEntry, error) {
+	u := *base
+	u.Path = path.Join(u.Path, "/api/v1/status/tsdb")
+
+	q := u.Query()
+	if len(matchers) > 0 {
+		q.Add("match[]", storepb.PromMatchersToString(matchers...))
+	}
+	if limit > 0 {
+		q.Add("limit", strconv.Itoa(limit))
+	}
+	u.RawQuery = q.Encode()
+
+	var v struct {
+		Data *statuspb.TSDBStatisticsEntry `json:"data"`
+	}
+	if err := c.get2xxResultWithGRPCErrors(ctx, "/prom_status_tsdb HTTP[client]", &u, &v); err != nil {
+		return nil, err
+	}
+
+	if v.Data == nil {
+		return nil, errors.New("empty data field in TSDB status response")
+	}
+	return v.Data, nil
 }

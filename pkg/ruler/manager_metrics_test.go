@@ -10,6 +10,9 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 func TestManagerMetricsWithRuleGroupLabel(t *testing.T) {
@@ -34,6 +37,53 @@ cortex_prometheus_last_evaluation_samples{rule_group="group_one",user="user3"} 1
 cortex_prometheus_last_evaluation_samples{rule_group="group_two",user="user1"} 1000
 cortex_prometheus_last_evaluation_samples{rule_group="group_two",user="user2"} 10000
 cortex_prometheus_last_evaluation_samples{rule_group="group_two",user="user3"} 100000
+# HELP cortex_prometheus_notifications_alertmanagers_discovered The number of alertmanagers discovered and active.
+# TYPE cortex_prometheus_notifications_alertmanagers_discovered gauge
+cortex_prometheus_notifications_alertmanagers_discovered{user="user1"} 1
+cortex_prometheus_notifications_alertmanagers_discovered{user="user2"} 10
+cortex_prometheus_notifications_alertmanagers_discovered{user="user3"} 100
+# HELP cortex_prometheus_notifications_dropped_total Total number of alerts dropped due to errors when sending to Alertmanager.
+# TYPE cortex_prometheus_notifications_dropped_total counter
+cortex_prometheus_notifications_dropped_total{user="user1"} 1
+cortex_prometheus_notifications_dropped_total{user="user2"} 10
+cortex_prometheus_notifications_dropped_total{user="user3"} 100
+# HELP cortex_prometheus_notifications_errors_total Total number of errors sending alert notifications.
+# TYPE cortex_prometheus_notifications_errors_total counter
+cortex_prometheus_notifications_errors_total{alertmanager="alertmanager_1",user="user1"} 1
+cortex_prometheus_notifications_errors_total{alertmanager="alertmanager_1",user="user2"} 10
+cortex_prometheus_notifications_errors_total{alertmanager="alertmanager_1",user="user3"} 100
+# HELP cortex_prometheus_notifications_latency_seconds Latency quantiles for sending alert notifications.
+# TYPE cortex_prometheus_notifications_latency_seconds summary
+cortex_prometheus_notifications_latency_seconds{user="user1",quantile="0.5"} 1
+cortex_prometheus_notifications_latency_seconds{user="user1",quantile="0.9"} 1
+cortex_prometheus_notifications_latency_seconds{user="user1",quantile="0.99"} 1
+cortex_prometheus_notifications_latency_seconds_sum{user="user1"} 1
+cortex_prometheus_notifications_latency_seconds_count{user="user1"} 1
+cortex_prometheus_notifications_latency_seconds{user="user2",quantile="0.5"} 10
+cortex_prometheus_notifications_latency_seconds{user="user2",quantile="0.9"} 10
+cortex_prometheus_notifications_latency_seconds{user="user2",quantile="0.99"} 10
+cortex_prometheus_notifications_latency_seconds_sum{user="user2"} 10
+cortex_prometheus_notifications_latency_seconds_count{user="user2"} 1
+cortex_prometheus_notifications_latency_seconds{user="user3",quantile="0.5"} 100
+cortex_prometheus_notifications_latency_seconds{user="user3",quantile="0.9"} 100
+cortex_prometheus_notifications_latency_seconds{user="user3",quantile="0.99"} 100
+cortex_prometheus_notifications_latency_seconds_sum{user="user3"} 100
+cortex_prometheus_notifications_latency_seconds_count{user="user3"} 1
+# HELP cortex_prometheus_notifications_queue_capacity The capacity of the alert notifications queue.
+# TYPE cortex_prometheus_notifications_queue_capacity gauge
+cortex_prometheus_notifications_queue_capacity{user="user1"} 1
+cortex_prometheus_notifications_queue_capacity{user="user2"} 10
+cortex_prometheus_notifications_queue_capacity{user="user3"} 100
+# HELP cortex_prometheus_notifications_queue_length The number of alert notifications in the queue.
+# TYPE cortex_prometheus_notifications_queue_length gauge
+cortex_prometheus_notifications_queue_length{user="user1"} 1
+cortex_prometheus_notifications_queue_length{user="user2"} 10
+cortex_prometheus_notifications_queue_length{user="user3"} 100
+# HELP cortex_prometheus_notifications_sent_total Total number of alerts sent.
+# TYPE cortex_prometheus_notifications_sent_total counter
+cortex_prometheus_notifications_sent_total{alertmanager="alertmanager_1",user="user1"} 1
+cortex_prometheus_notifications_sent_total{alertmanager="alertmanager_1",user="user2"} 10
+cortex_prometheus_notifications_sent_total{alertmanager="alertmanager_1",user="user3"} 100
 # HELP cortex_prometheus_rule_evaluation_duration_seconds The duration for a rule to execute.
 # TYPE cortex_prometheus_rule_evaluation_duration_seconds summary
 cortex_prometheus_rule_evaluation_duration_seconds{user="user1",quantile="0.5"} 1
@@ -153,6 +203,53 @@ func TestManagerMetricsWithoutRuleGroupLabel(t *testing.T) {
 cortex_prometheus_last_evaluation_samples{user="user1"} 2000
 cortex_prometheus_last_evaluation_samples{user="user2"} 20000
 cortex_prometheus_last_evaluation_samples{user="user3"} 200000
+# HELP cortex_prometheus_notifications_alertmanagers_discovered The number of alertmanagers discovered and active.
+# TYPE cortex_prometheus_notifications_alertmanagers_discovered gauge
+cortex_prometheus_notifications_alertmanagers_discovered{user="user1"} 1
+cortex_prometheus_notifications_alertmanagers_discovered{user="user2"} 10
+cortex_prometheus_notifications_alertmanagers_discovered{user="user3"} 100
+# HELP cortex_prometheus_notifications_dropped_total Total number of alerts dropped due to errors when sending to Alertmanager.
+# TYPE cortex_prometheus_notifications_dropped_total counter
+cortex_prometheus_notifications_dropped_total{user="user1"} 1
+cortex_prometheus_notifications_dropped_total{user="user2"} 10
+cortex_prometheus_notifications_dropped_total{user="user3"} 100
+# HELP cortex_prometheus_notifications_errors_total Total number of errors sending alert notifications.
+# TYPE cortex_prometheus_notifications_errors_total counter
+cortex_prometheus_notifications_errors_total{alertmanager="alertmanager_1",user="user1"} 1
+cortex_prometheus_notifications_errors_total{alertmanager="alertmanager_1",user="user2"} 10
+cortex_prometheus_notifications_errors_total{alertmanager="alertmanager_1",user="user3"} 100
+# HELP cortex_prometheus_notifications_latency_seconds Latency quantiles for sending alert notifications.
+# TYPE cortex_prometheus_notifications_latency_seconds summary
+cortex_prometheus_notifications_latency_seconds{user="user1",quantile="0.5"} 1
+cortex_prometheus_notifications_latency_seconds{user="user1",quantile="0.9"} 1
+cortex_prometheus_notifications_latency_seconds{user="user1",quantile="0.99"} 1
+cortex_prometheus_notifications_latency_seconds_sum{user="user1"} 1
+cortex_prometheus_notifications_latency_seconds_count{user="user1"} 1
+cortex_prometheus_notifications_latency_seconds{user="user2",quantile="0.5"} 10
+cortex_prometheus_notifications_latency_seconds{user="user2",quantile="0.9"} 10
+cortex_prometheus_notifications_latency_seconds{user="user2",quantile="0.99"} 10
+cortex_prometheus_notifications_latency_seconds_sum{user="user2"} 10
+cortex_prometheus_notifications_latency_seconds_count{user="user2"} 1
+cortex_prometheus_notifications_latency_seconds{user="user3",quantile="0.5"} 100
+cortex_prometheus_notifications_latency_seconds{user="user3",quantile="0.9"} 100
+cortex_prometheus_notifications_latency_seconds{user="user3",quantile="0.99"} 100
+cortex_prometheus_notifications_latency_seconds_sum{user="user3"} 100
+cortex_prometheus_notifications_latency_seconds_count{user="user3"} 1
+# HELP cortex_prometheus_notifications_queue_capacity The capacity of the alert notifications queue.
+# TYPE cortex_prometheus_notifications_queue_capacity gauge
+cortex_prometheus_notifications_queue_capacity{user="user1"} 1
+cortex_prometheus_notifications_queue_capacity{user="user2"} 10
+cortex_prometheus_notifications_queue_capacity{user="user3"} 100
+# HELP cortex_prometheus_notifications_queue_length The number of alert notifications in the queue.
+# TYPE cortex_prometheus_notifications_queue_length gauge
+cortex_prometheus_notifications_queue_length{user="user1"} 1
+cortex_prometheus_notifications_queue_length{user="user2"} 10
+cortex_prometheus_notifications_queue_length{user="user3"} 100
+# HELP cortex_prometheus_notifications_sent_total Total number of alerts sent.
+# TYPE cortex_prometheus_notifications_sent_total counter
+cortex_prometheus_notifications_sent_total{alertmanager="alertmanager_1",user="user1"} 1
+cortex_prometheus_notifications_sent_total{alertmanager="alertmanager_1",user="user2"} 10
+cortex_prometheus_notifications_sent_total{alertmanager="alertmanager_1",user="user3"} 100
 # HELP cortex_prometheus_rule_evaluation_duration_seconds The duration for a rule to execute.
 # TYPE cortex_prometheus_rule_evaluation_duration_seconds summary
 cortex_prometheus_rule_evaluation_duration_seconds{user="user1",quantile="0.5"} 1
@@ -261,22 +358,37 @@ func populateManager(base float64) *prometheus.Registry {
 	metrics.groupLastEvalSamples.WithLabelValues("group_one").Add(base * 1000)
 	metrics.groupLastEvalSamples.WithLabelValues("group_two").Add(base * 1000)
 
+	metrics.notificationsLatency.WithLabelValues("alertmanager_1").Observe(base)
+	metrics.notificationsErrors.WithLabelValues("alertmanager_1").Add(base)
+	metrics.notificationsSent.WithLabelValues("alertmanager_1").Add(base)
+	metrics.notificationsDropped.Add(base)
+	metrics.notificationsQueueLength.Set(base)
+	metrics.notificationsQueueCapacity.Set(base)
+	metrics.notificationsAlertmanagersDiscovered.Set(base)
 	return r
 }
 
 // Copied from github.com/prometheus/rules/manager.go
+// and github.com/prometheus/notifier/notifier.go
 type groupMetrics struct {
-	evalDuration         prometheus.Summary
-	iterationDuration    prometheus.Summary
-	iterationsMissed     *prometheus.CounterVec
-	iterationsScheduled  *prometheus.CounterVec
-	evalTotal            *prometheus.CounterVec
-	evalFailures         *prometheus.CounterVec
-	groupInterval        *prometheus.GaugeVec
-	groupLastEvalTime    *prometheus.GaugeVec
-	groupLastDuration    *prometheus.GaugeVec
-	groupRules           *prometheus.GaugeVec
-	groupLastEvalSamples *prometheus.GaugeVec
+	evalDuration                         prometheus.Summary
+	iterationDuration                    prometheus.Summary
+	iterationsMissed                     *prometheus.CounterVec
+	iterationsScheduled                  *prometheus.CounterVec
+	evalTotal                            *prometheus.CounterVec
+	evalFailures                         *prometheus.CounterVec
+	groupInterval                        *prometheus.GaugeVec
+	groupLastEvalTime                    *prometheus.GaugeVec
+	groupLastDuration                    *prometheus.GaugeVec
+	groupRules                           *prometheus.GaugeVec
+	groupLastEvalSamples                 *prometheus.GaugeVec
+	notificationsLatency                 *prometheus.SummaryVec
+	notificationsErrors                  *prometheus.CounterVec
+	notificationsSent                    *prometheus.CounterVec
+	notificationsDropped                 prometheus.Counter
+	notificationsQueueLength             prometheus.Gauge
+	notificationsQueueCapacity           prometheus.Gauge
+	notificationsAlertmanagersDiscovered prometheus.Gauge
 }
 
 func newGroupMetrics(r prometheus.Registerer) *groupMetrics {
@@ -355,8 +467,53 @@ func newGroupMetrics(r prometheus.Registerer) *groupMetrics {
 			},
 			[]string{"rule_group"},
 		),
+		notificationsLatency: promauto.With(r).NewSummaryVec(
+			prometheus.SummaryOpts{
+				Name:       "prometheus_notifications_latency_seconds",
+				Help:       "Latency quantiles for sending alert notifications.",
+				Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
+			},
+			[]string{"alertmanager"},
+		),
+		notificationsErrors: promauto.With(r).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "prometheus_notifications_errors_total",
+				Help: "Latency quantiles for sending alert notifications.",
+			},
+			[]string{"alertmanager"},
+		),
+		notificationsSent: promauto.With(r).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "prometheus_notifications_sent_total",
+				Help: "Total number of errors sending alert notifications",
+			},
+			[]string{"alertmanager"},
+		),
+		notificationsDropped: promauto.With(r).NewCounter(
+			prometheus.CounterOpts{
+				Name: "prometheus_notifications_dropped_total",
+				Help: "Total number of alerts dropped due to errors when sending to Alertmanager.",
+			},
+		),
+		notificationsQueueLength: promauto.With(r).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "prometheus_notifications_queue_length",
+				Help: "The number of alert notifications in the queue.",
+			},
+		),
+		notificationsQueueCapacity: promauto.With(r).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "prometheus_notifications_queue_capacity",
+				Help: "The capacity of the alert notifications queue.",
+			},
+		),
+		notificationsAlertmanagersDiscovered: promauto.With(r).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "prometheus_notifications_alertmanagers_discovered",
+				Help: "The number of alertmanagers discovered and active.",
+			},
+		),
 	}
-
 	return m
 }
 
@@ -401,4 +558,87 @@ func TestMetricsArePerUser(t *testing.T) {
 
 		assert.True(t, foundUserLabel, "user label not found for metric %s", desc.String())
 	}
+}
+
+func TestRuleEvalMetricsDeletePerUserMetrics(t *testing.T) {
+	dir := t.TempDir()
+	reg := prometheus.NewPedanticRegistry()
+
+	m := NewRuleEvalMetrics(Config{RulePath: dir, EnableQueryStats: true}, reg)
+	m.TotalWritesVec.WithLabelValues("fake1").Add(10)
+	m.TotalWritesVec.WithLabelValues("fake2").Add(10)
+	m.FailedWritesVec.WithLabelValues("fake1").Add(10)
+	m.FailedWritesVec.WithLabelValues("fake2").Add(10)
+	m.TotalQueriesVec.WithLabelValues("fake1").Add(10)
+	m.TotalQueriesVec.WithLabelValues("fake2").Add(10)
+	m.FailedQueriesVec.WithLabelValues("fake1").Add(10)
+	m.FailedQueriesVec.WithLabelValues("fake2").Add(10)
+	m.RulerQuerySeconds.WithLabelValues("fake1").Add(10)
+	m.RulerQuerySeconds.WithLabelValues("fake2").Add(10)
+	m.RulerQuerySeries.WithLabelValues("fake1").Add(10)
+	m.RulerQuerySeries.WithLabelValues("fake2").Add(10)
+	m.RulerQuerySamples.WithLabelValues("fake1").Add(10)
+	m.RulerQuerySamples.WithLabelValues("fake2").Add(10)
+	m.RulerQueryChunkBytes.WithLabelValues("fake1").Add(10)
+	m.RulerQueryChunkBytes.WithLabelValues("fake2").Add(10)
+	m.RulerQueryDataBytes.WithLabelValues("fake1").Add(10)
+	m.RulerQueryDataBytes.WithLabelValues("fake2").Add(10)
+
+	metricNames := []string{"cortex_ruler_write_requests_total", "cortex_ruler_write_requests_failed_total", "cortex_ruler_queries_total", "cortex_ruler_queries_failed_total", "cortex_ruler_query_seconds_total", "cortex_ruler_fetched_series_total", "cortex_ruler_samples_total", "cortex_ruler_fetched_chunks_bytes_total", "cortex_ruler_fetched_data_bytes_total"}
+	gm, err := reg.Gather()
+	require.NoError(t, err)
+	mfm, err := util.NewMetricFamilyMap(gm)
+	require.NoError(t, err)
+	for _, name := range metricNames {
+		require.Contains(t, mfm[name].String(), "value:\"fake1\"")
+		require.Contains(t, mfm[name].String(), "value:\"fake2\"")
+	}
+
+	m.deletePerUserMetrics("fake1")
+	gm, err = reg.Gather()
+	require.NoError(t, err)
+	mfm, err = util.NewMetricFamilyMap(gm)
+	require.NoError(t, err)
+	for _, name := range metricNames {
+		require.NotContains(t, mfm[name].String(), "value:\"fake1\"")
+		require.Contains(t, mfm[name].String(), "value:\"fake2\"")
+	}
+}
+
+func TestRuleGroupMetrics(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := NewRuleGroupMetrics(reg, users.NewAllowedTenants(nil, []string{"fake3"}))
+	m.UpdateRuleGroupsInStore(map[string]int{
+		"fake1": 10,
+		"fake2": 20,
+		"fake3": 30,
+	})
+	gm, err := reg.Gather()
+	require.NoError(t, err)
+	mfm, err := util.NewMetricFamilyMap(gm)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(mfm["cortex_ruler_rule_groups_in_store"].Metric))
+	requireMetricEqual(t, mfm["cortex_ruler_rule_groups_in_store"].Metric[0], map[string]string{
+		"user": "fake1",
+	}, float64(10))
+	requireMetricEqual(t, mfm["cortex_ruler_rule_groups_in_store"].Metric[1], map[string]string{
+		"user": "fake2",
+	}, float64(20))
+	m.UpdateRuleGroupsInStore(map[string]int{
+		"fake2": 30,
+	})
+	gm, err = reg.Gather()
+	require.NoError(t, err)
+	mfm, err = util.NewMetricFamilyMap(gm)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(mfm["cortex_ruler_rule_groups_in_store"].Metric))
+	requireMetricEqual(t, mfm["cortex_ruler_rule_groups_in_store"].Metric[0], map[string]string{
+		"user": "fake2",
+	}, float64(30))
+	m.UpdateRuleGroupsInStore(make(map[string]int))
+	gm, err = reg.Gather()
+	require.NoError(t, err)
+	mfm, err = util.NewMetricFamilyMap(gm)
+	require.NoError(t, err)
+	require.Nil(t, mfm["cortex_ruler_rule_groups_in_store"])
 }

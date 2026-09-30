@@ -1,4 +1,4 @@
-// +build requires_docker
+//go:build integration_memberlist
 
 package integration
 
@@ -11,7 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/backoff"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/cortexproject/cortex/integration/e2e"
 	e2edb "github.com/cortexproject/cortex/integration/e2e/db"
 	"github.com/cortexproject/cortex/integration/e2ecortex"
+	"github.com/cortexproject/cortex/pkg/util/backoff"
 )
 
 func TestSingleBinaryWithMemberlist(t *testing.T) {
@@ -37,17 +39,109 @@ func TestSingleBinaryWithMemberlist(t *testing.T) {
 	})
 }
 
+func TestSingleBinaryWithMemberlistClusterLabelIsolation(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
+
+	minio := e2edb.NewMinio(9000, bucketName)
+	require.NoError(t, s.StartAndWaitReady(minio))
+
+	clusterA1 := newSingleBinary("cluster-a-1", "", "", map[string]string{
+		"-memberlist.cluster-label":       "cluster-a",
+		"-memberlist.abort-if-join-fails": "false",
+	})
+	clusterA2 := newSingleBinary("cluster-a-2", "", networkName+"-cluster-a-1:8000", map[string]string{
+		"-memberlist.cluster-label":       "cluster-a",
+		"-memberlist.abort-if-join-fails": "false",
+	})
+	clusterB1 := newSingleBinary("cluster-b-1", "", networkName+"-cluster-a-1:8000", map[string]string{
+		"-memberlist.cluster-label":       "cluster-b",
+		"-memberlist.abort-if-join-fails": "false",
+	})
+	clusterB2 := newSingleBinary("cluster-b-2", "", networkName+"-cluster-b-1:8000", map[string]string{
+		"-memberlist.cluster-label":       "cluster-b",
+		"-memberlist.abort-if-join-fails": "false",
+	})
+
+	require.NoError(t, s.StartAndWaitReady(clusterA1))
+	require.NoError(t, s.StartAndWaitReady(clusterB1))
+	require.NoError(t, s.StartAndWaitReady(clusterA2, clusterB2))
+
+	requireMemberlistClusterState(t, 2, 2*512, clusterA1, clusterA2)
+	requireMemberlistClusterState(t, 2, 2*512, clusterB1, clusterB2)
+
+	// Verify cross-cluster isolation: sleep for an observation window to confirm
+	// member counts remain stable and no cross-cluster leakage occurs over time.
+	// A fixed sleep is intentional here — we are asserting that nothing changes,
+	// which cannot be verified with polling.
+	time.Sleep(5 * time.Second)
+	requireMemberlistClusterState(t, 2, 2*512, clusterA1, clusterA2)
+	requireMemberlistClusterState(t, 2, 2*512, clusterB1, clusterB2)
+}
+
+func TestSingleBinaryWithMemberlistClusterLabelRollingMigration(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
+
+	minio := e2edb.NewMinio(9000, bucketName)
+	require.NoError(t, s.StartAndWaitReady(minio))
+
+	const clusterLabel = "migration-cluster"
+
+	configs := []struct {
+		name string
+		join string
+	}{
+		{name: "migration-cortex-1", join: networkName + "-migration-cortex-2:8000"},
+		{name: "migration-cortex-2", join: networkName + "-migration-cortex-1:8000"},
+		{name: "migration-cortex-3", join: networkName + "-migration-cortex-1:8000"},
+	}
+
+	cortexServices := make([]*e2ecortex.CortexService, 0, len(configs))
+	for _, cfg := range configs {
+		cortexServices = append(cortexServices, newMigrationSingleBinary(cfg.name, cfg.join, "", true))
+	}
+
+	require.NoError(t, s.StartAndWaitReady(cortexServices[0]))
+	require.NoError(t, s.StartAndWaitReady(cortexServices[1], cortexServices[2]))
+	requireMemberlistClusterState(t, 3, 3*512, cortexServices...)
+
+	for i, cfg := range configs {
+		replacement := newMigrationSingleBinary(cfg.name, cfg.join, clusterLabel, true)
+		require.NoError(t, s.Stop(cortexServices[i]))
+		require.NoError(t, s.StartAndWaitReady(replacement))
+		cortexServices[i] = replacement
+		requireMemberlistClusterState(t, 3, 3*512, cortexServices...)
+	}
+
+	for i, cfg := range configs {
+		replacement := newMigrationSingleBinary(cfg.name, cfg.join, clusterLabel, false)
+		require.NoError(t, s.Stop(cortexServices[i]))
+		require.NoError(t, s.StartAndWaitReady(replacement))
+		cortexServices[i] = replacement
+		requireMemberlistClusterState(t, 3, 3*512, cortexServices...)
+	}
+}
+
 func testSingleBinaryEnv(t *testing.T, tlsEnabled bool, flags map[string]string) {
 	s, err := e2e.NewScenario(networkName)
 	require.NoError(t, err)
 	defer s.Close()
 
-	// Start dependencies
-	dynamo := e2edb.NewDynamoDB()
-	// Look ma, no Consul!
-	require.NoError(t, s.StartAndWaitReady(dynamo))
+	// make alert manager config dir
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
 
-	require.NoError(t, writeFileToSharedDir(s, cortexSchemaConfigFile, []byte(cortexSchemaConfigYaml)))
+	// Start dependencies
+	minio := e2edb.NewMinio(9000, bucketName)
+	// Look ma, no Consul!
+	require.NoError(t, s.StartAndWaitReady(minio))
+
 	var cortex1, cortex2, cortex3 *e2ecortex.CortexService
 	if tlsEnabled {
 		var (
@@ -116,18 +210,21 @@ func testSingleBinaryEnv(t *testing.T, tlsEnabled bool, flags map[string]string)
 }
 
 func newSingleBinary(name string, servername string, join string, testFlags map[string]string) *e2ecortex.CortexService {
-	flags := map[string]string{
-		"-ingester.final-sleep":              "0s",
-		"-ingester.join-after":               "0s", // join quickly
-		"-ingester.min-ready-duration":       "0s",
-		"-ingester.concurrent-flushes":       "10",
-		"-ingester.max-transfer-retries":     "0", // disable
-		"-ingester.num-tokens":               "512",
-		"-ingester.observe-period":           "5s", // to avoid conflicts in tokens
-		"-ring.store":                        "memberlist",
-		"-memberlist.bind-port":              "8000",
-		"-memberlist.left-ingesters-timeout": "600s", // effectively disable
-	}
+	flags := mergeFlags(
+		AlertmanagerLocalFlags(),
+		map[string]string{
+			"-ingester.final-sleep":              "0s",
+			"-ingester.join-after":               "0s", // join quickly
+			"-ingester.min-ready-duration":       "0s",
+			"-ingester.num-tokens":               "512",
+			"-ingester.observe-period":           "5s", // to avoid conflicts in tokens
+			"-ring.store":                        "memberlist",
+			"-memberlist.bind-port":              "8000",
+			"-memberlist.left-ingesters-timeout": "600s", // effectively disable
+			// alert manager
+			"-alertmanager.web.external-url": "http://localhost/alertmanager",
+		},
+	)
 
 	if join != "" {
 		flags["-memberlist.join"] = join
@@ -136,7 +233,7 @@ func newSingleBinary(name string, servername string, join string, testFlags map[
 	serv := e2ecortex.NewSingleBinary(
 		name,
 		mergeFlags(
-			ChunksStorageFlags(),
+			BlocksStorageFlags(),
 			flags,
 			testFlags,
 			getTLSFlagsWithPrefix("memberlist", servername, servername == ""),
@@ -155,23 +252,47 @@ func newSingleBinary(name string, servername string, join string, testFlags map[
 	return serv
 }
 
+func newMigrationSingleBinary(name string, join string, clusterLabel string, verificationDisabled bool) *e2ecortex.CortexService {
+	flags := map[string]string{
+		"-memberlist.abort-if-join-fails":                 "false",
+		"-memberlist.cluster-label-verification-disabled": fmt.Sprintf("%t", verificationDisabled),
+	}
+
+	if clusterLabel != "" {
+		flags["-memberlist.cluster-label"] = clusterLabel
+	}
+
+	return newSingleBinary(name, "", join, flags)
+}
+
+func requireMemberlistClusterState(t *testing.T, expectedMembers, expectedTokens int, services ...*e2ecortex.CortexService) {
+	t.Helper()
+
+	for _, service := range services {
+		require.NoError(t, service.WaitSumMetrics(e2e.Equals(float64(expectedMembers)), "memberlist_client_cluster_members_count"))
+		require.NoError(t, service.WaitSumMetrics(e2e.Equals(float64(expectedTokens)), "cortex_ring_tokens_total"))
+	}
+}
+
 func TestSingleBinaryWithMemberlistScaling(t *testing.T) {
 	s, err := e2e.NewScenario(networkName)
 	require.NoError(t, err)
 	defer s.Close()
 
-	dynamo := e2edb.NewDynamoDB()
-	require.NoError(t, s.StartAndWaitReady(dynamo))
-	require.NoError(t, writeFileToSharedDir(s, cortexSchemaConfigFile, []byte(cortexSchemaConfigYaml)))
+	// make alert manager config dir
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
+
+	minio := e2edb.NewMinio(9000, bucketName)
+	require.NoError(t, s.StartAndWaitReady(minio))
 
 	// Scale up instances. These numbers seem enough to reliably reproduce some unwanted
 	// consequences of slow propagation, such as missing tombstones.
 
-	maxCortex := 20
+	maxCortex := 30
 	minCortex := 3
 	instances := make([]*e2ecortex.CortexService, 0)
 
-	for i := 0; i < maxCortex; i++ {
+	for i := range maxCortex {
 		name := fmt.Sprintf("cortex-%d", i+1)
 		join := ""
 		if i > 0 {
@@ -187,6 +308,7 @@ func TestSingleBinaryWithMemberlistScaling(t *testing.T) {
 	for _, c := range instances {
 		require.NoError(t, c.WaitSumMetrics(e2e.Equals(float64(maxCortex)), "cortex_ring_members"))
 		require.NoError(t, c.WaitSumMetrics(e2e.Equals(0), "memberlist_client_kv_store_value_tombstones"))
+		require.NoError(t, c.WaitSumMetrics(e2e.Equals(0), "memberlist_client_received_broadcasts_invalid_total"))
 	}
 
 	// Scale down as fast as possible but cleanly, in order to send out tombstones.
@@ -201,9 +323,7 @@ func TestSingleBinaryWithMemberlistScaling(t *testing.T) {
 		// TODO(#4360): Remove this when issue is resolved.
 		//   Wait until memberlist for all nodes has recognised the instance left.
 		//   This means that we will not gossip tombstones to leaving nodes.
-		for _, c := range instances {
-			require.NoError(t, c.WaitSumMetrics(e2e.Equals(float64(len(instances))), "memberlist_client_cluster_members_count"))
-		}
+		requireMemberlistMembersCount(t, instances, len(instances))
 	}
 	require.NoError(t, stop.Wait())
 
@@ -237,4 +357,306 @@ func TestSingleBinaryWithMemberlistScaling(t *testing.T) {
 	}, 30*time.Second, 2*time.Second,
 		"expected all instances to have %f ring members and %f tombstones",
 		expectedRingMembers, expectedTombstones)
+}
+
+// memberlistConvergenceTimeout bounds how long we wait for every surviving instance to
+// notice that a stopped instance left the memberlist cluster.
+//
+// An instance learns about a departure in one of three ways, in increasing order of cost:
+//
+//  1. The "leave" message the departing instance gossips on shutdown. This usually arrives
+//     within a second, but it is best effort: it has a finite retransmit budget
+//     (RetransmitMult * ceil(log10(N+1)), 8 transmissions at 22 nodes) and during an
+//     aggressive scale down much of that budget is spent on peers that are already gone.
+//     Memberlist keeps gossiping to nodes that died less than GossipToTheDeadTime (30s)
+//     ago, and each such send blocks the single gossip goroutine for
+//     -memberlist.packet-dial-timeout (5s), because a removed container's address is
+//     blackholed and the dial ends in "i/o timeout" rather than "connection refused".
+//  2. The next push/pull full state sync (memberlist.PushPullInterval, 30s). This reliably
+//     repairs a missed leave, since a remote StateLeft is applied directly, but a sync can
+//     pick the departed instance itself and fail, costing another interval.
+//  3. Failure detection, which is far slower than either: with the ProbeInterval Cortex
+//     configures (5s) a given peer is probed roughly once every len(members) * 5s, and the
+//     suspicion timer then runs for SuspicionMult * log10(N+1) * ProbeInterval, starting at
+//     SuspicionMaxTimeoutMult (6x) that value and only shrinking as other nodes confirm the
+//     suspicion. No confirmation ever arrives here, because every other node already
+//     recorded the leave and ignores suspect messages for non-alive nodes. At 22 nodes that
+//     is ~160s of suspicion on top of the probe delay.
+//
+// So the budget has to cover several push/pull intervals. It used to be whatever the
+// per-service retry backoff gave (100 retries of up to 500ms, see newSingleBinary), which is
+// ~50s: one marginal sync window, and the test failed whenever a single leave message was
+// lost. See #7801.
+const memberlistConvergenceTimeout = 2 * time.Minute
+
+// requireMemberlistMembersCount waits until every instance reports exactly expectedMembers
+// in memberlist_client_cluster_members_count.
+func requireMemberlistMembersCount(t *testing.T, instances []*e2ecortex.CortexService, expectedMembers int) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		converged := true
+
+		for _, c := range instances {
+			metrics, err := c.SumMetrics([]string{"memberlist_client_cluster_members_count"})
+			if err != nil {
+				// Scraping can fail transiently while the cluster is churning, so retry
+				// instead of failing the test.
+				converged = false
+				t.Logf("%s: failed to fetch memberlist_client_cluster_members_count: %s\n", c.Name(), err)
+				continue
+			}
+
+			// Don't short circuit the check, so we log every instance which is behind.
+			if metrics[0] != float64(expectedMembers) {
+				converged = false
+				t.Logf("%s: memberlist_client_cluster_members_count=%f, expected %d\n", c.Name(), metrics[0], expectedMembers)
+			}
+		}
+
+		return converged
+	}, memberlistConvergenceTimeout, time.Second,
+		"expected all instances to see %d memberlist cluster members", expectedMembers)
+}
+
+func TestHATrackerWithMemberlistClusterSync(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// make alert manager config dir
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
+
+	minio := e2edb.NewMinio(9000, bucketName)
+	require.NoError(t, s.StartAndWaitReady(minio))
+
+	flags := mergeFlags(BlocksStorageFlags(), map[string]string{
+		"-distributor.ha-tracker.enable":               "true",
+		"-distributor.ha-tracker.enable-for-all-users": "true",
+		"-distributor.ha-tracker.cluster":              "cluster",
+		"-distributor.ha-tracker.replica":              "__replica__",
+		// Use memberlist as the KV store for the HA Tracker
+		"-distributor.ha-tracker.store": "memberlist",
+
+		// To fast failover
+		"-distributor.ha-tracker.update-timeout":            "1s",
+		"-distributor.ha-tracker.update-timeout-jitter-max": "0s",
+		"-distributor.ha-tracker.failover-timeout":          "2s",
+
+		// memberlist config
+		"-ring.store":           "memberlist",
+		"-memberlist.bind-port": "8000",
+	})
+
+	cortex1 := newSingleBinary("cortex-1", "", "", flags)
+	cortex2 := newSingleBinary("cortex-2", "", networkName+"-cortex-1:8000", flags)
+	cortex3 := newSingleBinary("cortex-3", "", networkName+"-cortex-1:8000", flags)
+
+	require.NoError(t, s.StartAndWaitReady(cortex1))
+	require.NoError(t, s.StartAndWaitReady(cortex2, cortex3))
+
+	// Ensure both Cortex instances have successfully discovered each other in the memberlist cluster.
+	require.NoError(t, cortex1.WaitSumMetrics(e2e.Equals(3), "memberlist_client_cluster_members_count"))
+	require.NoError(t, cortex2.WaitSumMetrics(e2e.Equals(3), "memberlist_client_cluster_members_count"))
+	require.NoError(t, cortex3.WaitSumMetrics(e2e.Equals(3), "memberlist_client_cluster_members_count"))
+
+	// All Cortex servers should have 512 tokens, altogether 3 * 512.
+	require.NoError(t, cortex1.WaitSumMetrics(e2e.Equals(3*512), "cortex_ring_tokens_total"))
+	require.NoError(t, cortex2.WaitSumMetrics(e2e.Equals(3*512), "cortex_ring_tokens_total"))
+	require.NoError(t, cortex3.WaitSumMetrics(e2e.Equals(3*512), "cortex_ring_tokens_total"))
+
+	now := time.Now()
+	userID := "user-1"
+
+	client1, err := e2ecortex.NewClient(cortex1.HTTPEndpoint(), "", "", "", userID)
+	require.NoError(t, err)
+
+	series, _ := generateSeries("foo", now, prompb.Label{Name: "__replica__", Value: "replica0"}, prompb.Label{Name: "cluster", Value: "cluster0"})
+	// send to cortex1
+	res, err := client1.Push([]prompb.TimeSeries{series[0]})
+	require.NoError(t, err)
+	require.Equal(t, 200, res.StatusCode)
+
+	require.NoError(t, cortex1.WaitSumMetrics(e2e.Equals(1), "cortex_ha_tracker_elected_replica_changes_total"))
+	// cortex-2 should be noticed HA reader via memberlist gossip
+	require.NoError(t, cortex2.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_ha_tracker_elected_replica_changes_total"}, e2e.WaitMissingMetrics))
+	// cortex-3 should be noticed HA reader via memberlist gossip
+	require.NoError(t, cortex3.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_ha_tracker_elected_replica_changes_total"}, e2e.WaitMissingMetrics))
+
+	// Wait 5 seconds to ensure the FailoverTimeout (2s) has comfortably passed.
+	time.Sleep(5 * time.Second)
+
+	client2, err := e2ecortex.NewClient(cortex2.HTTPEndpoint(), "", "", "", userID)
+	require.NoError(t, err)
+
+	series2, _ := generateSeries("foo", now.Add(time.Second*30), prompb.Label{Name: "__replica__", Value: "replica1"}, prompb.Label{Name: "cluster", Value: "cluster0"})
+	// send to cortex2
+	res2, err := client2.Push([]prompb.TimeSeries{series2[0]})
+	require.NoError(t, err)
+	require.Equal(t, 200, res2.StatusCode)
+
+	// cortex2 failover to replica1
+	require.NoError(t, cortex2.WaitSumMetrics(e2e.Equals(2), "cortex_ha_tracker_elected_replica_changes_total"))
+	// cortex-1 should be noticed changed HA reader via memberlist gossip
+	require.NoError(t, cortex1.WaitSumMetrics(e2e.Equals(2), "cortex_ha_tracker_elected_replica_changes_total"))
+	// cortex-3 should be noticed changed HA reader via memberlist gossip
+	require.NoError(t, cortex3.WaitSumMetrics(e2e.Equals(2), "cortex_ha_tracker_elected_replica_changes_total"))
+}
+
+func TestHATrackerWithMemberlist(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// make alert manager config dir
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
+
+	minio := e2edb.NewMinio(9000, bucketName)
+	require.NoError(t, s.StartAndWaitReady(minio))
+
+	flags := mergeFlags(BlocksStorageFlags(), map[string]string{
+		"-distributor.ha-tracker.enable":               "true",
+		"-distributor.ha-tracker.enable-for-all-users": "true",
+		"-distributor.ha-tracker.cluster":              "cluster",
+		"-distributor.ha-tracker.replica":              "__replica__",
+		// Use memberlist as the KV store for the HA Tracker
+		"-distributor.ha-tracker.store": "memberlist",
+
+		// To fast failover
+		"-distributor.ha-tracker.update-timeout":            "1s",
+		"-distributor.ha-tracker.update-timeout-jitter-max": "0s",
+		"-distributor.ha-tracker.failover-timeout":          "2s",
+
+		// memberlist config
+		"-ring.store":           "memberlist",
+		"-memberlist.bind-port": "8000",
+	})
+
+	cortex := newSingleBinary("cortex", "", "", flags)
+	require.NoError(t, s.StartAndWaitReady(cortex))
+
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(1), "memberlist_client_cluster_members_count"))
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
+
+	now := time.Now()
+	numUsers := 100
+
+	for i := 1; i <= numUsers; i++ {
+		userID := fmt.Sprintf("user-%d", i)
+		client, err := e2ecortex.NewClient(cortex.HTTPEndpoint(), "", "", "", userID)
+		require.NoError(t, err)
+
+		series, _ := generateSeries("foo", now, prompb.Label{Name: "__replica__", Value: "replica0"}, prompb.Label{Name: "cluster", Value: "cluster0"})
+		res, err := client.Push([]prompb.TimeSeries{series[0]})
+		require.NoError(t, err)
+		require.Equal(t, 200, res.StatusCode)
+	}
+
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(float64(numUsers)), "cortex_ha_tracker_elected_replica_changes_total"))
+
+	// Wait 5 seconds to ensure the FailoverTimeout (2s) has comfortably passed.
+	time.Sleep(5 * time.Second)
+
+	for i := 1; i <= numUsers; i++ {
+		userID := fmt.Sprintf("user-%d", i)
+		client, err := e2ecortex.NewClient(cortex.HTTPEndpoint(), "", "", "", userID)
+		require.NoError(t, err)
+
+		// This time, we send data from replica1 instead of replica0.
+		series, _ := generateSeries("foo", now.Add(time.Second*30), prompb.Label{Name: "__replica__", Value: "replica1"}, prompb.Label{Name: "cluster", Value: "cluster0"})
+		res, err := client.Push([]prompb.TimeSeries{series[0]})
+		require.NoError(t, err)
+		require.Equal(t, 200, res.StatusCode)
+	}
+
+	// Since the leader successfully failed over to replica1, the change count increments by 1 per user
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(float64(numUsers*2)), "cortex_ha_tracker_elected_replica_changes_total"))
+}
+
+func TestHATrackerWithMultiKV(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// make alert manager config dir
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
+
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, bucketName)
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	flags := mergeFlags(BlocksStorageFlags(), map[string]string{
+		"-distributor.ha-tracker.enable":               "true",
+		"-distributor.ha-tracker.enable-for-all-users": "true",
+		"-distributor.ha-tracker.cluster":              "cluster",
+		"-distributor.ha-tracker.replica":              "__replica__",
+		// Use memberlist as the KV store for the HA Tracker
+		"-distributor.ha-tracker.store": "multi",
+
+		// To fast failover
+		"-distributor.ha-tracker.update-timeout":            "1s",
+		"-distributor.ha-tracker.update-timeout-jitter-max": "0s",
+		"-distributor.ha-tracker.failover-timeout":          "2s",
+
+		// multi KV config
+		"-distributor.ha-tracker.multi.primary":   "consul",
+		"-distributor.ha-tracker.multi.secondary": "memberlist",
+		"-distributor.ha-tracker.consul.hostname": consul.NetworkHTTPEndpoint(),
+
+		// Enable data mirroring
+		"-distributor.ha-tracker.multi.mirror-enabled": "true",
+
+		// memberlist config
+		"-ring.store":           "memberlist",
+		"-memberlist.bind-port": "8000",
+	})
+
+	cortex := newSingleBinary("cortex", "", "", flags)
+	require.NoError(t, s.StartAndWaitReady(cortex))
+
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(1), "memberlist_client_cluster_members_count"))
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
+
+	// mirror enabled
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(float64(1)), "cortex_multikv_mirror_enabled"))
+	// consul as primary KV Store
+	require.NoError(t, cortex.WaitSumMetricsWithOptions(e2e.Equals(float64(1)), []string{"cortex_multikv_primary_store"}, e2e.WaitMissingMetrics,
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "store", "consul"))),
+	)
+
+	now := time.Now()
+	numUsers := 100
+
+	for i := 1; i <= numUsers; i++ {
+		userID := fmt.Sprintf("user-%d", i)
+		client, err := e2ecortex.NewClient(cortex.HTTPEndpoint(), "", "", "", userID)
+		require.NoError(t, err)
+
+		series, _ := generateSeries("foo", now, prompb.Label{Name: "__replica__", Value: "replica0"}, prompb.Label{Name: "cluster", Value: "cluster0"})
+		res, err := client.Push([]prompb.TimeSeries{series[0]})
+		require.NoError(t, err)
+		require.Equal(t, 200, res.StatusCode)
+	}
+
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(float64(numUsers)), "cortex_ha_tracker_elected_replica_changes_total"))
+
+	// Wait 5 seconds to ensure the FailoverTimeout (2s) has comfortably passed.
+	time.Sleep(5 * time.Second)
+
+	for i := 1; i <= numUsers; i++ {
+		userID := fmt.Sprintf("user-%d", i)
+		client, err := e2ecortex.NewClient(cortex.HTTPEndpoint(), "", "", "", userID)
+		require.NoError(t, err)
+
+		// This time, we send data from replica1 instead of replica0.
+		series, _ := generateSeries("foo", now.Add(time.Second*30), prompb.Label{Name: "__replica__", Value: "replica1"}, prompb.Label{Name: "cluster", Value: "cluster0"})
+		res, err := client.Push([]prompb.TimeSeries{series[0]})
+		require.NoError(t, err)
+		require.Equal(t, 200, res.StatusCode)
+	}
+
+	// Since the leader successfully failed over to replica1, the change count increments by 1 per user
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(float64(numUsers*2)), "cortex_ha_tracker_elected_replica_changes_total"))
+	// Two keys (1 cluster with 2 replicas) per user should be written to the memberlist (secondary store)
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(float64(numUsers*2)), "cortex_multikv_mirror_writes_total"))
 }

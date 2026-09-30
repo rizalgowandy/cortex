@@ -1,6 +1,7 @@
 package alertmanager
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
@@ -8,16 +9,88 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/prometheus/alertmanager/alert"
 	"github.com/prometheus/alertmanager/config"
-	"github.com/prometheus/alertmanager/types"
+	"github.com/prometheus/alertmanager/silence/silencepb"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/cortexproject/cortex/pkg/util/test"
 )
+
+func TestSilencesLimits(t *testing.T) {
+	user := "test"
+
+	reg := prometheus.NewPedanticRegistry()
+	maxSilencesCount := 3
+	maxSilencesSizeBytes := 500
+	am, err := New(&Config{
+		UserID:          user,
+		Logger:          log.NewNopLogger(),
+		Limits:          &mockAlertManagerLimits{maxSilencesCount: maxSilencesCount, maxSilencesSizeBytes: maxSilencesSizeBytes},
+		TenantDataDir:   t.TempDir(),
+		ExternalURL:     &url.URL{Path: "/am"},
+		ShardingEnabled: false,
+		GCInterval:      30 * time.Minute,
+	}, reg)
+	require.NoError(t, err)
+	defer am.StopAndWait()
+
+	t.Run("Test maxSilencesCount", func(t *testing.T) {
+		createSilences := func() *silencepb.Silence {
+			return &silencepb.Silence{
+				Matchers: []*silencepb.Matcher{{Name: "name", Pattern: "pattern"}},
+				StartsAt: timestamppb.New(time.Now()),
+				EndsAt:   timestamppb.New(time.Now().Add(time.Minute * 30)),
+			}
+		}
+		ctx := context.Background()
+
+		// create silences up to maxSilencesCount
+		for range maxSilencesCount {
+			err := am.silences.Set(ctx, createSilences())
+			require.NoError(t, err)
+		}
+
+		// exceeds limit
+		err = am.silences.Set(ctx, createSilences())
+		require.Error(t, err)
+		require.Equal(t, fmt.Sprintf("exceeded maximum number of silences: %d (limit: %d)", maxSilencesCount, maxSilencesCount), err.Error())
+
+		// expire whole silences
+		silences, _, err := am.silences.Query(ctx)
+		require.NoError(t, err)
+		for _, s := range silences {
+			err := am.silences.Expire(ctx, s.Id)
+			require.NoError(t, err)
+		}
+
+		// check maxSilencesCount includes expired silences
+		err = am.silences.Set(ctx, createSilences())
+		require.Error(t, err)
+		require.Equal(t, fmt.Sprintf("exceeded maximum number of silences: %d (limit: %d)", maxSilencesCount, maxSilencesCount), err.Error())
+
+		// GC
+		n, err := am.silences.GC()
+		require.NoError(t, err)
+		require.Equal(t, maxSilencesCount, n)
+	})
+	t.Run("Test maxSilencesSizeBytes", func(t *testing.T) {
+		bigSilences := &silencepb.Silence{
+			Matchers: []*silencepb.Matcher{{Name: strings.Repeat("a", maxSilencesSizeBytes/2+1), Pattern: strings.Repeat("b", maxSilencesSizeBytes/2+1)}},
+			StartsAt: timestamppb.New(time.Now()),
+			EndsAt:   timestamppb.New(time.Now().Add(time.Minute * 30)),
+		}
+
+		err = am.silences.Set(context.Background(), bigSilences)
+		require.Error(t, err)
+		require.True(t, strings.Contains(err.Error(), "silence exceeded maximum size"))
+	})
+}
 
 func TestDispatcherGroupLimits(t *testing.T) {
 	for name, tc := range map[string]struct {
@@ -46,6 +119,7 @@ func createAlertmanagerAndSendAlerts(t *testing.T, alertGroups, groupsLimit, exp
 		TenantDataDir:   t.TempDir(),
 		ExternalURL:     &url.URL{Path: "/am"},
 		ShardingEnabled: false,
+		GCInterval:      30 * time.Minute,
 	}, reg)
 	require.NoError(t, err)
 	defer am.StopAndWait()
@@ -61,49 +135,53 @@ route:
 
 	cfg, err := config.Load(cfgRaw)
 	require.NoError(t, err)
-	require.NoError(t, am.ApplyConfig(user, cfg, cfgRaw))
 
 	now := time.Now()
 
-	for i := 0; i < alertGroups; i++ {
+	for i := range alertGroups {
 		alertName := model.LabelValue(fmt.Sprintf("Alert-%d", i))
 
-		inputAlerts := []*types.Alert{
+		inputAlerts := []*alert.Alert{
 			{
-				Alert: model.Alert{
-					Labels: model.LabelSet{
-						"alertname": alertName,
-						"a":         "b",
-					},
-					Annotations:  model.LabelSet{"foo": "bar"},
-					StartsAt:     now,
-					EndsAt:       now.Add(5 * time.Minute),
-					GeneratorURL: "http://example.com/prometheus",
+				Labels: model.LabelSet{
+					"alertname": alertName,
+					"a":         "b",
 				},
-				UpdatedAt: now,
-				Timeout:   false,
+				Annotations:  model.LabelSet{"foo": "bar"},
+				StartsAt:     now,
+				EndsAt:       now.Add(5 * time.Minute),
+				GeneratorURL: "http://example.com/prometheus",
+				UpdatedAt:    now,
+				Timeout:      false,
 			},
 
 			{
-				Alert: model.Alert{
-					Labels: model.LabelSet{
-						"alertname": alertName,
-						"z":         "y",
-					},
-					Annotations:  model.LabelSet{"foo": "bar"},
-					StartsAt:     now,
-					EndsAt:       now.Add(5 * time.Minute),
-					GeneratorURL: "http://example.com/prometheus",
+				Labels: model.LabelSet{
+					"alertname": alertName,
+					"z":         "y",
 				},
-				UpdatedAt: now,
-				Timeout:   false,
+				Annotations:  model.LabelSet{"foo": "bar"},
+				StartsAt:     now,
+				EndsAt:       now.Add(5 * time.Minute),
+				GeneratorURL: "http://example.com/prometheus",
+				UpdatedAt:    now,
+				Timeout:      false,
 			},
 		}
-		require.NoError(t, am.alerts.Put(inputAlerts...))
+		require.NoError(t, am.alerts.Put(context.Background(), inputAlerts...))
 	}
 
+	// Apply the config after the alerts were put: the dispatcher then routes all
+	// of them synchronously, from its initial slurp (a single goroutine), before
+	// ApplyConfig returns. Routing them through the concurrent post-loading
+	// ingestion workers instead would make the aggregation-group limit
+	// accounting - and so the metric asserted below - nondeterministic, because
+	// the vendored dispatcher's limit check reads the group counter without
+	// synchronization with concurrent group creation.
+	require.NoError(t, am.ApplyConfig(user, cfg, cfgRaw))
+
 	// Give it some time, as alerts are sent to dispatcher asynchronously.
-	test.Poll(t, 3*time.Second, nil, func() interface{} {
+	test.Poll(t, 3*time.Second, nil, func() any {
 		return testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
 		# HELP alertmanager_dispatcher_aggregation_group_limit_reached_total Number of times when dispatcher failed to create new aggregation group due to limit.
 		# TYPE alertmanager_dispatcher_aggregation_group_limit_reached_total counter
@@ -112,9 +190,59 @@ route:
 	})
 }
 
+// TestAlertmanagerStopBeforeDispatcherStart is a regression test for the data
+// race between ApplyConfig and Stop (issue #7603): ApplyConfig used to spawn
+// the dispatcher and inhibitor Run goroutines without waiting for them to
+// start, so a Stop shortly after could run Dispatcher.Stop's finished.Wait()
+// concurrently with the WaitGroup's first Add() inside Dispatcher.Run() - a
+// WaitGroup contract violation reported under -race - and could be silently
+// ignored by an inhibitor whose Run had not yet installed its cancel function.
+// The loop intentionally mirrors the supported, serialized lifecycle contract
+// (callers of ApplyConfig and Stop are serialized by
+// MultitenantAlertmanager.alertmanagersMtx): no concurrency is needed to
+// trigger the race because the racing actor is the spawned Run goroutine
+// itself.
+func TestAlertmanagerStopBeforeDispatcherStart(t *testing.T) {
+	const user = "test"
+
+	cfgRaw := `receivers:
+- name: 'prod'
+
+route:
+  group_by: ['alertname']
+  receiver: 'prod'`
+
+	cfg, err := config.Load(cfgRaw)
+	require.NoError(t, err)
+
+	for i := range 30 {
+		am, err := New(&Config{
+			UserID:          user,
+			Logger:          log.NewNopLogger(),
+			Limits:          &mockAlertManagerLimits{},
+			TenantDataDir:   t.TempDir(),
+			ExternalURL:     &url.URL{Path: "/am"},
+			ShardingEnabled: false,
+			GCInterval:      30 * time.Minute,
+		}, prometheus.NewPedanticRegistry())
+		require.NoError(t, err)
+
+		require.NoError(t, am.ApplyConfig(user, cfg, cfgRaw))
+
+		// One iteration also exercises the reload path: a second ApplyConfig
+		// stops the previous generation's dispatcher and inhibitor right after
+		// their Run goroutines were spawned.
+		if i == 0 {
+			require.NoError(t, am.ApplyConfig(user, cfg, cfgRaw))
+		}
+
+		am.StopAndWait()
+	}
+}
+
 var (
 	alert1 = model.Alert{
-		Labels:       model.LabelSet{"alert": "first"},
+		Labels:       model.LabelSet{"alert": "first", "alertname": "alert1"},
 		Annotations:  model.LabelSet{"job": "test"},
 		StartsAt:     time.Now(),
 		EndsAt:       time.Now(),
@@ -123,7 +251,7 @@ var (
 	alert1Size = alertSize(alert1)
 
 	alert2 = model.Alert{
-		Labels:       model.LabelSet{"alert": "second"},
+		Labels:       model.LabelSet{"alert": "second", "alertname": "alert2"},
 		Annotations:  model.LabelSet{"job": "test", "cluster": "prod"},
 		StartsAt:     time.Now(),
 		EndsAt:       time.Now(),
@@ -133,7 +261,7 @@ var (
 )
 
 type callbackOp struct {
-	alert               *types.Alert
+	alert               *alert.Alert
 	existing            bool
 	delete              bool // true=delete, false=insert.
 	expectedInsertError error
@@ -145,10 +273,10 @@ type callbackOp struct {
 
 func TestAlertsLimiterWithNoLimits(t *testing.T) {
 	ops := []callbackOp{
-		{alert: &types.Alert{Alert: alert1}, existing: false, expectedCount: 1, expectedTotalSize: alert1Size},
-		{alert: &types.Alert{Alert: alert2}, existing: false, expectedCount: 2, expectedTotalSize: alert1Size + alert2Size},
-		{alert: &types.Alert{Alert: alert2}, delete: true, expectedCount: 1, expectedTotalSize: alert1Size},
-		{alert: &types.Alert{Alert: alert1}, delete: true, expectedCount: 0, expectedTotalSize: 0},
+		{alert: &alert.Alert{Alert: alert1}, existing: false, expectedCount: 1, expectedTotalSize: alert1Size},
+		{alert: &alert.Alert{Alert: alert2}, existing: false, expectedCount: 2, expectedTotalSize: alert1Size + alert2Size},
+		{alert: &alert.Alert{Alert: alert2}, delete: true, expectedCount: 1, expectedTotalSize: alert1Size},
+		{alert: &alert.Alert{Alert: alert1}, delete: true, expectedCount: 0, expectedTotalSize: 0},
 	}
 
 	testLimiter(t, &mockAlertManagerLimits{}, ops)
@@ -160,14 +288,14 @@ func TestAlertsLimiterWithCountLimit(t *testing.T) {
 	alert2WithMoreAnnotationsSize := alertSize(alert2WithMoreAnnotations)
 
 	ops := []callbackOp{
-		{alert: &types.Alert{Alert: alert1}, existing: false, expectedCount: 1, expectedTotalSize: alert1Size},
-		{alert: &types.Alert{Alert: alert2}, existing: false, expectedInsertError: fmt.Errorf(errTooManyAlerts, 1), expectedCount: 1, expectedTotalSize: alert1Size},
-		{alert: &types.Alert{Alert: alert1}, delete: true, expectedCount: 0, expectedTotalSize: 0},
+		{alert: &alert.Alert{Alert: alert1}, existing: false, expectedCount: 1, expectedTotalSize: alert1Size},
+		{alert: &alert.Alert{Alert: alert2}, existing: false, expectedInsertError: fmt.Errorf(errTooManyAlerts, 1, alert2.Name()), expectedCount: 1, expectedTotalSize: alert1Size},
+		{alert: &alert.Alert{Alert: alert1}, delete: true, expectedCount: 0, expectedTotalSize: 0},
 
-		{alert: &types.Alert{Alert: alert2}, existing: false, expectedCount: 1, expectedTotalSize: alert2Size},
+		{alert: &alert.Alert{Alert: alert2}, existing: false, expectedCount: 1, expectedTotalSize: alert2Size},
 		// Update of existing alert works -- doesn't change count.
-		{alert: &types.Alert{Alert: alert2WithMoreAnnotations}, existing: true, expectedCount: 1, expectedTotalSize: alert2WithMoreAnnotationsSize},
-		{alert: &types.Alert{Alert: alert2}, delete: true, expectedCount: 0, expectedTotalSize: 0},
+		{alert: &alert.Alert{Alert: alert2WithMoreAnnotations}, existing: true, expectedCount: 1, expectedTotalSize: alert2WithMoreAnnotationsSize},
+		{alert: &alert.Alert{Alert: alert2}, delete: true, expectedCount: 0, expectedTotalSize: 0},
 	}
 
 	testLimiter(t, &mockAlertManagerLimits{maxAlertsCount: 1}, ops)
@@ -178,13 +306,13 @@ func TestAlertsLimiterWithSizeLimit(t *testing.T) {
 	alert2WithMoreAnnotations.Annotations = model.LabelSet{"job": "test", "cluster": "prod", "new": "super-long-annotation"}
 
 	ops := []callbackOp{
-		{alert: &types.Alert{Alert: alert1}, existing: false, expectedCount: 1, expectedTotalSize: alert1Size},
-		{alert: &types.Alert{Alert: alert2}, existing: false, expectedInsertError: fmt.Errorf(errAlertsTooBig, alert2Size), expectedCount: 1, expectedTotalSize: alert1Size},
-		{alert: &types.Alert{Alert: alert2WithMoreAnnotations}, existing: false, expectedInsertError: fmt.Errorf(errAlertsTooBig, alert2Size), expectedCount: 1, expectedTotalSize: alert1Size},
-		{alert: &types.Alert{Alert: alert1}, delete: true, expectedCount: 0, expectedTotalSize: 0},
+		{alert: &alert.Alert{Alert: alert1}, existing: false, expectedCount: 1, expectedTotalSize: alert1Size},
+		{alert: &alert.Alert{Alert: alert2}, existing: false, expectedInsertError: fmt.Errorf(errAlertsTooBig, alert2Size), expectedCount: 1, expectedTotalSize: alert1Size},
+		{alert: &alert.Alert{Alert: alert2WithMoreAnnotations}, existing: false, expectedInsertError: fmt.Errorf(errAlertsTooBig, alert2Size), expectedCount: 1, expectedTotalSize: alert1Size},
+		{alert: &alert.Alert{Alert: alert1}, delete: true, expectedCount: 0, expectedTotalSize: 0},
 
-		{alert: &types.Alert{Alert: alert2}, existing: false, expectedCount: 1, expectedTotalSize: alert2Size},
-		{alert: &types.Alert{Alert: alert2}, delete: true, expectedCount: 0, expectedTotalSize: 0},
+		{alert: &alert.Alert{Alert: alert2}, existing: false, expectedCount: 1, expectedTotalSize: alert2Size},
+		{alert: &alert.Alert{Alert: alert2}, delete: true, expectedCount: 0, expectedTotalSize: 0},
 	}
 
 	// Prerequisite for this test. We set size limit to alert2Size, but inserting alert1 first will prevent insertion of alert2.
@@ -200,15 +328,15 @@ func TestAlertsLimiterWithSizeLimitAndAnnotationUpdate(t *testing.T) {
 
 	// Updating alert with larger annotation that goes over the size limit fails.
 	testLimiter(t, &mockAlertManagerLimits{maxAlertsSizeBytes: alert2Size}, []callbackOp{
-		{alert: &types.Alert{Alert: alert2}, existing: false, expectedCount: 1, expectedTotalSize: alert2Size},
-		{alert: &types.Alert{Alert: alert2WithMoreAnnotations}, existing: true, expectedInsertError: fmt.Errorf(errAlertsTooBig, alert2Size), expectedCount: 1, expectedTotalSize: alert2Size},
+		{alert: &alert.Alert{Alert: alert2}, existing: false, expectedCount: 1, expectedTotalSize: alert2Size},
+		{alert: &alert.Alert{Alert: alert2WithMoreAnnotations}, existing: true, expectedInsertError: fmt.Errorf(errAlertsTooBig, alert2Size), expectedCount: 1, expectedTotalSize: alert2Size},
 	})
 
 	// Updating alert with larger annotations in the limit works fine.
 	testLimiter(t, &mockAlertManagerLimits{maxAlertsSizeBytes: alert2WithMoreAnnotationsSize}, []callbackOp{
-		{alert: &types.Alert{Alert: alert2}, existing: false, expectedCount: 1, expectedTotalSize: alert2Size},
-		{alert: &types.Alert{Alert: alert2WithMoreAnnotations}, existing: true, expectedCount: 1, expectedTotalSize: alert2WithMoreAnnotationsSize},
-		{alert: &types.Alert{Alert: alert2}, existing: true, expectedCount: 1, expectedTotalSize: alert2Size},
+		{alert: &alert.Alert{Alert: alert2}, existing: false, expectedCount: 1, expectedTotalSize: alert2Size},
+		{alert: &alert.Alert{Alert: alert2WithMoreAnnotations}, existing: true, expectedCount: 1, expectedTotalSize: alert2WithMoreAnnotationsSize},
+		{alert: &alert.Alert{Alert: alert2}, existing: true, expectedCount: 1, expectedTotalSize: alert2Size},
 	})
 }
 

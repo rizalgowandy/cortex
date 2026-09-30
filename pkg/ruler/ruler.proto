@@ -5,7 +5,7 @@
 syntax = "proto3";
 package ruler;
 
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "gogoproto/gogo.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "github.com/cortexproject/cortex/pkg/cortexpb/cortex.proto";
@@ -17,12 +17,31 @@ option (gogoproto.unmarshaler_all) = true;
 
 service Ruler {
   rpc Rules(RulesRequest) returns (RulesResponse) {};
+  rpc LivenessCheck(LivenessCheckRequest) returns (LivenessCheckResponse){};
 }
 
-message RulesRequest {}
+message RulesRequest {
+  repeated string ruleNames = 1;
+  repeated string ruleGroupNames = 2;
+  repeated string files = 3;
+  string type = 4;
+  string state = 5;
+  string health = 6;
+  repeated string matchers = 7;
+  bool excludeAlerts = 8;
+  int32 maxRuleGroups = 9;
+  string nextToken = 10;
+}
+
+message LivenessCheckRequest{}
+
+message LivenessCheckResponse{
+  int32 state = 1;
+}
 
 message RulesResponse {
   repeated GroupStateDesc groups = 1;
+  string nextToken = 2;
 }
 
 // GroupStateDesc is a proto representation of a cortex rule group
@@ -64,5 +83,7 @@ message AlertStateDesc {
   google.protobuf.Timestamp last_sent_at = 8
       [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
   google.protobuf.Timestamp valid_until = 9
+      [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+  google.protobuf.Timestamp keep_firing_since = 10
       [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
 }

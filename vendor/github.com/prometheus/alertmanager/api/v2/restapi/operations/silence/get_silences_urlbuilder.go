@@ -29,7 +29,10 @@ import (
 
 // GetSilencesURL generates an URL for the get silences operation
 type GetSilencesURL struct {
-	Filter []string
+	Active  *bool
+	Expired *bool
+	Filter  []string
+	Pending *bool
 
 	_basePath string
 	// avoid unkeyed usage
@@ -58,9 +61,28 @@ func (o *GetSilencesURL) Build() (*url.URL, error) {
 	var _path = "/silences"
 
 	_basePath := o._basePath
+	if _basePath == "" {
+		_basePath = "/api/v2/"
+	}
 	_result.Path = golangswaggerpaths.Join(_basePath, _path)
 
 	qs := make(url.Values)
+
+	var activeQ string
+	if o.Active != nil {
+		activeQ = swag.FormatBool(*o.Active)
+	}
+	if activeQ != "" {
+		qs.Set("active", activeQ)
+	}
+
+	var expiredQ string
+	if o.Expired != nil {
+		expiredQ = swag.FormatBool(*o.Expired)
+	}
+	if expiredQ != "" {
+		qs.Set("expired", expiredQ)
+	}
 
 	var filterIR []string
 	for _, filterI := range o.Filter {
@@ -74,6 +96,14 @@ func (o *GetSilencesURL) Build() (*url.URL, error) {
 
 	for _, qsv := range filter {
 		qs.Add("filter", qsv)
+	}
+
+	var pendingQ string
+	if o.Pending != nil {
+		pendingQ = swag.FormatBool(*o.Pending)
+	}
+	if pendingQ != "" {
+		qs.Set("pending", pendingQ)
 	}
 
 	_result.RawQuery = qs.Encode()

@@ -10,16 +10,18 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/cortexproject/cortex/pkg/util/test"
 )
 
 func TestRecvFailDoesntCancelProcess(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// We use random port here, hopefully without any gRPC server.
-	cc, err := grpc.DialContext(ctx, "localhost:999", grpc.WithInsecure())
+	cc, err := grpc.NewClient("localhost:999", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 
 	cfg := Config{}
@@ -32,7 +34,7 @@ func TestRecvFailDoesntCancelProcess(t *testing.T) {
 		mgr.processQueriesOnSingleStream(ctx, cc, "test:12345")
 	}()
 
-	test.Poll(t, time.Second, true, func() interface{} {
+	test.Poll(t, time.Second, true, func() any {
 		return running.Load()
 	})
 
@@ -42,34 +44,35 @@ func TestRecvFailDoesntCancelProcess(t *testing.T) {
 	assert.Equal(t, true, running.Load())
 
 	cancel()
-	test.Poll(t, time.Second, false, func() interface{} {
+	test.Poll(t, time.Second, false, func() any {
 		return running.Load()
 	})
 }
 
 func TestContextCancelStopsProcess(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// We use random port here, hopefully without any gRPC server.
-	cc, err := grpc.DialContext(ctx, "localhost:999", grpc.WithInsecure())
+	cc, err := grpc.NewClient("localhost:999", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 
 	pm := newProcessorManager(ctx, &mockProcessor{}, cc, "test")
 	pm.concurrency(1)
 
-	test.Poll(t, time.Second, 1, func() interface{} {
+	test.Poll(t, time.Second, 1, func() any {
 		return int(pm.currentProcessors.Load())
 	})
 
 	cancel()
 
-	test.Poll(t, time.Second, 0, func() interface{} {
+	test.Poll(t, time.Second, 0, func() any {
 		return int(pm.currentProcessors.Load())
 	})
 
 	pm.stop()
-	test.Poll(t, time.Second, 0, func() interface{} {
+	test.Poll(t, time.Second, 0, func() any {
 		return int(pm.currentProcessors.Load())
 	})
 }

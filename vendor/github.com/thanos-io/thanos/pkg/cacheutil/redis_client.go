@@ -5,21 +5,24 @@ package cacheutil
 
 import (
 	"context"
-	"fmt"
-	"sync"
+	"crypto/tls"
+	"net"
+	"strings"
 	"time"
 	"unsafe"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/redis/rueidis"
+	"gopkg.in/yaml.v3"
+
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/gate"
-	"golang.org/x/sync/errgroup"
-	"gopkg.in/yaml.v3"
+	"github.com/thanos-io/thanos/pkg/model"
+	thanos_tls "github.com/thanos-io/thanos/pkg/tls"
 )
 
 var (
@@ -28,20 +31,42 @@ var (
 		DialTimeout:            time.Second * 5,
 		ReadTimeout:            time.Second * 3,
 		WriteTimeout:           time.Second * 3,
-		PoolSize:               100,
-		MinIdleConns:           10,
-		IdleTimeout:            time.Minute * 5,
 		MaxGetMultiConcurrency: 100,
 		GetMultiBatchSize:      100,
 		MaxSetMultiConcurrency: 100,
 		SetMultiBatchSize:      100,
+		TLSEnabled:             false,
+		TLSConfig:              TLSConfig{},
+		MaxAsyncConcurrency:    20,
+		MaxAsyncBufferSize:     10000,
+
+		SetAsyncCircuitBreaker: defaultCircuitBreakerConfig,
 	}
 )
+
+// TLSConfig configures TLS connections.
+type TLSConfig struct {
+	// The CA cert to use for the targets.
+	CAFile string `yaml:"ca_file"`
+	// The client cert file for the targets.
+	CertFile string `yaml:"cert_file"`
+	// The client key file for the targets.
+	KeyFile string `yaml:"key_file"`
+	// Used to verify the hostname for the targets. See https://tools.ietf.org/html/rfc4366#section-3.1
+	ServerName string `yaml:"server_name"`
+	// Disable target certificate validation.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	// Minimum TLS version to use when connecting to the targets. Supported values are "1.0", "1.1", "1.2", "1.3".
+	MinVersion string `yaml:"min_version"`
+}
 
 // RedisClientConfig is the config accepted by RedisClient.
 type RedisClientConfig struct {
 	// Addr specifies the addresses of redis server.
 	Addr string `yaml:"addr"`
+
+	// Prefix used for all redis keys (optional).
+	Prefix string `yaml:"prefix"`
 
 	// Use the specified Username to authenticate the current connection
 	// with one of the connections defined in the ACL list when connecting
@@ -65,22 +90,6 @@ type RedisClientConfig struct {
 	// WriteTimeout specifies the client write timeout.
 	WriteTimeout time.Duration `yaml:"write_timeout"`
 
-	// Maximum number of socket connections.
-	PoolSize int `yaml:"pool_size"`
-
-	// MinIdleConns specifies the minimum number of idle connections which is useful when establishing
-	// new connection is slow.
-	MinIdleConns int `yaml:"min_idle_conns"`
-
-	// Amount of time after which client closes idle connections.
-	// Should be less than server's timeout.
-	// -1 disables idle timeout check.
-	IdleTimeout time.Duration `yaml:"idle_timeout"`
-
-	// Connection age at which client retires (closes) the connection.
-	// Default 0 is to not close aged connections.
-	MaxConnAge time.Duration `yaml:"max_conn_age"`
-
 	// MaxGetMultiConcurrency specifies the maximum number of concurrent GetMulti() operations.
 	// If set to 0, concurrency is unlimited.
 	MaxGetMultiConcurrency int `yaml:"max_get_multi_concurrency"`
@@ -94,18 +103,59 @@ type RedisClientConfig struct {
 
 	// SetMultiBatchSize specifies the maximum size per batch for pipeline set.
 	SetMultiBatchSize int `yaml:"set_multi_batch_size"`
+
+	// TLSEnabled enable tls for redis connection.
+	TLSEnabled bool `yaml:"tls_enabled"`
+
+	// TLSConfig to use to connect to the redis server.
+	TLSConfig TLSConfig `yaml:"tls_config"`
+
+	// If not zero then client-side caching is enabled.
+	// Client-side caching is when data is stored in memory
+	// instead of fetching data each time.
+	// See https://redis.io/docs/manual/client-side-caching/ for info.
+	CacheSize model.Bytes `yaml:"cache_size"`
+
+	// MasterName specifies the master's name. Must be not empty
+	// for Redis Sentinel.
+	MasterName string `yaml:"master_name"`
+
+	// MaxAsyncBufferSize specifies the queue buffer size for SetAsync operations.
+	MaxAsyncBufferSize int `yaml:"max_async_buffer_size"`
+
+	// MaxAsyncConcurrency specifies the maximum number of SetAsync goroutines.
+	MaxAsyncConcurrency int `yaml:"max_async_concurrency"`
+
+	// SetAsyncCircuitBreaker configures the circuit breaker for SetAsync operations.
+	SetAsyncCircuitBreaker CircuitBreakerConfig `yaml:"set_async_circuit_breaker_config"`
 }
 
 func (c *RedisClientConfig) validate() error {
 	if c.Addr == "" {
 		return errors.New("no redis addr provided")
 	}
+
+	if c.TLSEnabled {
+		if (c.TLSConfig.CertFile != "") != (c.TLSConfig.KeyFile != "") {
+			return errors.New("both client key and certificate must be provided")
+		}
+
+		if c.TLSConfig.MinVersion != "" {
+			if _, err := thanos_tls.GetTlsVersion(c.TLSConfig.MinVersion); err != nil {
+				return errors.Wrapf(err, "tls_config.min_version invalid")
+			}
+		}
+	}
+
+	if err := c.SetAsyncCircuitBreaker.validate(); err != nil {
+		return err
+	}
 	return nil
 }
 
-// RedisClient is a wrap of redis.Client.
 type RedisClient struct {
-	*redis.Client
+	client rueidis.Client
+
 	config RedisClientConfig
 
 	// getMultiGate used to enforce the max number of concurrent GetMulti() operations.
@@ -117,6 +167,10 @@ type RedisClient struct {
 	durationSet      prometheus.Observer
 	durationSetMulti prometheus.Observer
 	durationGetMulti prometheus.Observer
+
+	p *AsyncOperationProcessor
+
+	setAsyncCircuitBreaker CircuitBreaker
 }
 
 // NewRedisClient makes a new RedisClient.
@@ -136,87 +190,115 @@ func NewRedisClientWithConfig(logger log.Logger, name string, config RedisClient
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:         config.Addr,
-		Username:     config.Username,
-		Password:     config.Password,
-		DB:           config.DB,
-		DialTimeout:  config.DialTimeout,
-		ReadTimeout:  config.ReadTimeout,
-		WriteTimeout: config.WriteTimeout,
-		MinIdleConns: config.MinIdleConns,
-		MaxConnAge:   config.MaxConnAge,
-		IdleTimeout:  config.IdleTimeout,
-	})
 
 	if reg != nil {
 		reg = prometheus.WrapRegistererWith(prometheus.Labels{"name": name}, reg)
 	}
 
+	var tlsConfig *tls.Config
+	if config.TLSEnabled {
+		userTLSConfig := config.TLSConfig
+		tlsClientConfig, err := thanos_tls.NewClientConfig(logger, userTLSConfig.CertFile, userTLSConfig.KeyFile,
+			userTLSConfig.CAFile, userTLSConfig.ServerName, userTLSConfig.InsecureSkipVerify, userTLSConfig.MinVersion)
+
+		if err != nil {
+			return nil, err
+		}
+
+		tlsConfig = tlsClientConfig
+	}
+
+	clientSideCacheDisabled := config.CacheSize == 0
+
+	clientOpts := rueidis.ClientOption{
+		InitAddress:       strings.Split(config.Addr, ","),
+		ShuffleInit:       true,
+		Username:          config.Username,
+		Password:          config.Password,
+		SelectDB:          config.DB,
+		CacheSizeEachConn: int(config.CacheSize),
+		Dialer:            net.Dialer{Timeout: config.DialTimeout},
+		ConnWriteTimeout:  config.WriteTimeout,
+		DisableCache:      clientSideCacheDisabled,
+		TLSConfig:         tlsConfig,
+		SendToReplicas: func(cmd rueidis.Completed) bool {
+			return cmd.IsReadOnly()
+		},
+	}
+
+	if config.MasterName != "" {
+		clientOpts.Sentinel = rueidis.SentinelOption{
+			MasterSet: config.MasterName,
+		}
+	}
+
+	client, err := rueidis.NewClient(clientOpts)
+	if err != nil {
+		return nil, err
+	}
+
 	c := &RedisClient{
-		Client: redisClient,
+		client: client,
 		config: config,
 		logger: logger,
+		p:      NewAsyncOperationProcessor(config.MaxAsyncBufferSize, config.MaxAsyncConcurrency),
 		getMultiGate: gate.New(
 			extprom.WrapRegistererWithPrefix("thanos_redis_getmulti_", reg),
 			config.MaxGetMultiConcurrency,
+			gate.Gets,
 		),
 		setMultiGate: gate.New(
 			extprom.WrapRegistererWithPrefix("thanos_redis_setmulti_", reg),
 			config.MaxSetMultiConcurrency,
+			gate.Sets,
 		),
+		setAsyncCircuitBreaker: newCircuitBreaker("redis-set-async", config.SetAsyncCircuitBreaker),
 	}
+
 	duration := promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "thanos_redis_operation_duration_seconds",
-		Help:    "Duration of operations against memcached.",
+		Help:    "Duration of operations against redis.",
 		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1, 3, 6, 10},
 	}, []string{"operation"})
 	c.durationSet = duration.WithLabelValues(opSet)
 	c.durationSetMulti = duration.WithLabelValues(opSetMulti)
 	c.durationGetMulti = duration.WithLabelValues(opGetMulti)
+
 	return c, nil
 }
 
 // SetAsync implement RemoteCacheClient.
-func (c *RedisClient) SetAsync(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	start := time.Now()
-	if _, err := c.Set(ctx, key, value, ttl).Result(); err != nil {
-		level.Warn(c.logger).Log("msg", "failed to set item into redis", "err", err, "key", key,
-			"value_size", len(value))
-		return nil
-	}
-	c.durationSet.Observe(time.Since(start).Seconds())
-	return nil
+func (c *RedisClient) SetAsync(key string, value []byte, ttl time.Duration) error {
+	key = c.addPrefix(key)
+	return c.p.EnqueueAsync(func() {
+		start := time.Now()
+		err := c.setAsyncCircuitBreaker.Execute(func() error {
+			return c.client.Do(context.Background(), c.client.B().Set().Key(key).Value(rueidis.BinaryString(value)).ExSeconds(int64(ttl.Seconds())).Build()).Error()
+		})
+		if err != nil {
+			level.Warn(c.logger).Log("msg", "failed to set item into redis", "err", err, "key", key, "value_size", len(value))
+			return
+		}
+		c.durationSet.Observe(time.Since(start).Seconds())
+	})
 }
 
 // SetMulti set multiple keys and value.
-func (c *RedisClient) SetMulti(ctx context.Context, data map[string][]byte, ttl time.Duration) {
+func (c *RedisClient) SetMulti(data map[string][]byte, ttl time.Duration) {
 	if len(data) == 0 {
 		return
 	}
 	start := time.Now()
-	keys := make([]string, 0, len(data))
-	for k := range data {
-		keys = append(keys, k)
+	sets := make(rueidis.Commands, 0, len(data))
+	ittl := int64(ttl.Seconds())
+	for k, v := range data {
+		sets = append(sets, c.client.B().Setex().Key(c.addPrefix(k)).Seconds(ittl).Value(rueidis.BinaryString(v)).Build())
 	}
-	err := doWithBatch(ctx, len(data), c.config.SetMultiBatchSize, c.setMultiGate, func(startIndex, endIndex int) error {
-		_, err := c.Pipelined(ctx, func(p redis.Pipeliner) error {
-			for _, key := range keys {
-				p.SetEX(ctx, key, data[key], ttl)
-			}
-			return nil
-		})
-		if err != nil {
-			level.Warn(c.logger).Log("msg", "failed to set multi items from redis",
-				"err", err, "items", len(data))
-			return nil
+	for _, resp := range c.client.DoMulti(context.Background(), sets...) {
+		if err := resp.Error(); err != nil {
+			level.Warn(c.logger).Log("msg", "failed to set multi items from redis", "err", err, "items", len(data))
+			return
 		}
-		return nil
-	})
-	if err != nil {
-		level.Warn(c.logger).Log("msg", "failed to set multi items from redis", "err", err,
-			"items", len(data))
-		return
 	}
 	c.durationSetMulti.Observe(time.Since(start).Seconds())
 }
@@ -227,43 +309,65 @@ func (c *RedisClient) GetMulti(ctx context.Context, keys []string) map[string][]
 		return nil
 	}
 	start := time.Now()
-	results := make(map[string][]byte, len(keys))
-	var mu sync.Mutex
-	err := doWithBatch(ctx, len(keys), c.config.GetMultiBatchSize, c.getMultiGate, func(startIndex, endIndex int) error {
-		currentKeys := keys[startIndex:endIndex]
-		resp, err := c.MGet(ctx, currentKeys...).Result()
-		if err != nil {
-			level.Warn(c.logger).Log("msg", "failed to mget items from redis", "err", err, "items", len(resp))
-			return nil
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		for i := 0; i < len(resp); i++ {
-			key := currentKeys[i]
-			switch val := resp[i].(type) {
-			case string:
-				results[key] = stringToBytes(val)
-			case nil: // miss
-			default:
-				level.Warn(c.logger).Log("msg",
-					fmt.Sprintf("unexpected redis mget result type:%T %v", resp[i], resp[i]))
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		level.Warn(c.logger).Log("msg", "failed to mget items from redis", "err", err, "items", len(keys))
-		return nil
+
+	if c.config.ReadTimeout > 0 {
+		timeoutCtx, cancel := context.WithTimeout(ctx, c.config.ReadTimeout)
+		defer cancel()
+		ctx = timeoutCtx
 	}
+
+	var results map[string][]byte
+	if c.config.Prefix == "" {
+		results = c.getMulti(ctx, keys)
+	} else {
+		results = c.getMultiPrefixed(ctx, keys)
+	}
+
 	c.durationGetMulti.Observe(time.Since(start).Seconds())
+	return results
+}
+
+// getMulti fetches keys as-is.
+func (c *RedisClient) getMulti(ctx context.Context, keys []string) map[string][]byte {
+	results := make(map[string][]byte, len(keys))
+	// NOTE(GiedriusS): TTL is the default one in case PTTL fails. 8 hours should be good enough IMHO.
+	resps, err := rueidis.MGetCache(c.client, ctx, 8*time.Hour, keys)
+	if err != nil {
+		level.Warn(c.logger).Log("msg", "failed to mget items from redis", "err", err, "items", len(resps))
+	}
+	for key, resp := range resps {
+		if val, err := resp.ToString(); err == nil {
+			results[key] = stringToBytes(val)
+		}
+	}
+	return results
+}
+
+// getMultiPrefixed fetches keys with the configured prefix, mapping results back to the original keys.
+func (c *RedisClient) getMultiPrefixed(ctx context.Context, keys []string) map[string][]byte {
+	prefixedKeys := make([]string, len(keys))
+	for i, k := range keys {
+		prefixedKeys[i] = c.config.Prefix + k
+	}
+	prefixed := c.getMulti(ctx, prefixedKeys)
+	results := make(map[string][]byte, len(prefixed))
+	for k, v := range prefixed {
+		results[strings.TrimPrefix(k, c.config.Prefix)] = v
+	}
 	return results
 }
 
 // Stop implement RemoteCacheClient.
 func (c *RedisClient) Stop() {
-	if err := c.Close(); err != nil {
-		level.Error(c.logger).Log("msg", "redis close err")
+	c.p.Stop()
+	c.client.Close()
+}
+
+func (c *RedisClient) addPrefix(key string) string {
+	if c.config.Prefix == "" {
+		return key
 	}
+	return c.config.Prefix + key
 }
 
 // stringToBytes converts string to byte slice (copied from vendor/github.com/go-redis/redis/v8/internal/util/unsafe.go).
@@ -274,36 +378,6 @@ func stringToBytes(s string) []byte {
 			Cap int
 		}{s, len(s)},
 	))
-}
-
-// doWithBatch do func with batch and gate. batchSize==0 means one batch. gate==nil means no gate.
-func doWithBatch(ctx context.Context, totalSize int, batchSize int, ga gate.Gate, f func(startIndex, endIndex int) error) error {
-	if totalSize == 0 {
-		return nil
-	}
-	if batchSize <= 0 {
-		return f(0, totalSize)
-	}
-	g, ctx := errgroup.WithContext(ctx)
-	for i := 0; i < totalSize; i += batchSize {
-		j := i + batchSize
-		if j > totalSize {
-			j = totalSize
-		}
-		if ga != nil {
-			if err := ga.Start(ctx); err != nil {
-				return nil
-			}
-		}
-		startIndex, endIndex := i, j
-		g.Go(func() error {
-			if ga != nil {
-				defer ga.Done()
-			}
-			return f(startIndex, endIndex)
-		})
-	}
-	return g.Wait()
 }
 
 // parseRedisClientConfig unmarshals a buffer into a RedisClientConfig with default values.

@@ -1,4 +1,4 @@
-// +build requires_docker
+//go:build requires_docker
 
 package integration
 
@@ -26,15 +26,27 @@ func TestIngesterSharding(t *testing.T) {
 		tenantShardSize             int
 		expectedIngestersWithSeries int
 	}{
-		"default sharding strategy should spread series across all ingesters": {
+		//Default Sharding Strategy
+		"default sharding strategy should be ignored and spread across all ingesters": {
 			shardingStrategy:            "default",
 			tenantShardSize:             2, // Ignored by default strategy.
 			expectedIngestersWithSeries: 3,
 		},
+		"default sharding strategy should spread series across all ingesters": {
+			shardingStrategy:            "default",
+			tenantShardSize:             0, // Ignored by default strategy.
+			expectedIngestersWithSeries: 3,
+		},
+		//Shuffle Sharding Strategy
 		"shuffle-sharding strategy should spread series across the configured shard size number of ingesters": {
 			shardingStrategy:            "shuffle-sharding",
 			tenantShardSize:             2,
 			expectedIngestersWithSeries: 2,
+		},
+		"Tenant Shard Size of 0 should leverage all ingesters": {
+			shardingStrategy:            "shuffle-sharding",
+			tenantShardSize:             0,
+			expectedIngestersWithSeries: 3,
 		},
 	}
 
@@ -52,7 +64,7 @@ func TestIngesterSharding(t *testing.T) {
 			if testData.shardingStrategy == "shuffle-sharding" {
 				// Enable shuffle sharding on read path but not lookback, otherwise all ingesters would be
 				// queried being just registered.
-				flags["-querier.shuffle-sharding-ingesters-lookback-period"] = "1ns"
+				flags["-limits.shuffle-sharding-ingesters-lookback-period"] = "1ms"
 			}
 
 			// Start dependencies.
@@ -61,12 +73,12 @@ func TestIngesterSharding(t *testing.T) {
 			require.NoError(t, s.StartAndWaitReady(consul, minio))
 
 			// Start Cortex components.
-			distributor := e2ecortex.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags, "")
-			ingester1 := e2ecortex.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), flags, "")
-			ingester2 := e2ecortex.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), flags, "")
-			ingester3 := e2ecortex.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), flags, "")
+			distributor := e2ecortex.NewDistributor("distributor", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
+			ingester1 := e2ecortex.NewIngester("ingester-1", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
+			ingester2 := e2ecortex.NewIngester("ingester-2", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
+			ingester3 := e2ecortex.NewIngester("ingester-3", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
 			ingesters := e2ecortex.NewCompositeCortexService(ingester1, ingester2, ingester3)
-			querier := e2ecortex.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags, "")
+			querier := e2ecortex.NewQuerier("querier", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
 			require.NoError(t, s.StartAndWaitReady(distributor, ingester1, ingester2, ingester3, querier))
 
 			// Wait until distributor and queriers have updated the ring.
@@ -124,7 +136,7 @@ func TestIngesterSharding(t *testing.T) {
 			// We expect that only ingesters belonging to tenant's shard have been queried if
 			// shuffle sharding is enabled.
 			expectedIngesters := ingesters.NumInstances()
-			if testData.shardingStrategy == "shuffle-sharding" {
+			if testData.shardingStrategy == "shuffle-sharding" && testData.tenantShardSize > 0 {
 				expectedIngesters = testData.tenantShardSize
 			}
 

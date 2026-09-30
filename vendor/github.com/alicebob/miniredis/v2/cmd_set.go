@@ -3,6 +3,7 @@
 package miniredis
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -12,33 +13,27 @@ import (
 // commandsSet handles all set value operations.
 func commandsSet(m *Miniredis) {
 	m.srv.Register("SADD", m.cmdSadd)
-	m.srv.Register("SCARD", m.cmdScard)
-	m.srv.Register("SDIFF", m.cmdSdiff)
+	m.srv.Register("SCARD", m.cmdScard, server.ReadOnlyOption())
+	m.srv.Register("SDIFF", m.cmdSdiff, server.ReadOnlyOption())
 	m.srv.Register("SDIFFSTORE", m.cmdSdiffstore)
-	m.srv.Register("SINTER", m.cmdSinter)
+	m.srv.Register("SINTERCARD", m.cmdSintercard, server.ReadOnlyOption())
+	m.srv.Register("SINTER", m.cmdSinter, server.ReadOnlyOption())
 	m.srv.Register("SINTERSTORE", m.cmdSinterstore)
-	m.srv.Register("SISMEMBER", m.cmdSismember)
-	m.srv.Register("SMEMBERS", m.cmdSmembers)
+	m.srv.Register("SISMEMBER", m.cmdSismember, server.ReadOnlyOption())
+	m.srv.Register("SMEMBERS", m.cmdSmembers, server.ReadOnlyOption())
+	m.srv.Register("SMISMEMBER", m.cmdSmismember, server.ReadOnlyOption())
 	m.srv.Register("SMOVE", m.cmdSmove)
 	m.srv.Register("SPOP", m.cmdSpop)
-	m.srv.Register("SRANDMEMBER", m.cmdSrandmember)
+	m.srv.Register("SRANDMEMBER", m.cmdSrandmember, server.ReadOnlyOption())
 	m.srv.Register("SREM", m.cmdSrem)
-	m.srv.Register("SUNION", m.cmdSunion)
+	m.srv.Register("SUNION", m.cmdSunion, server.ReadOnlyOption())
 	m.srv.Register("SUNIONSTORE", m.cmdSunionstore)
-	m.srv.Register("SSCAN", m.cmdSscan)
+	m.srv.Register("SSCAN", m.cmdSscan, server.ReadOnlyOption())
 }
 
 // SADD
 func (m *Miniredis) cmdSadd(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
@@ -47,7 +42,7 @@ func (m *Miniredis) cmdSadd(c *server.Peer, cmd string, args []string) {
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 
-		if db.exists(key) && db.t(key) != "set" {
+		if db.exists(key) && db.t(key) != keyTypeSet {
 			c.WriteError(ErrWrongType.Error())
 			return
 		}
@@ -59,15 +54,7 @@ func (m *Miniredis) cmdSadd(c *server.Peer, cmd string, args []string) {
 
 // SCARD
 func (m *Miniredis) cmdScard(c *server.Peer, cmd string, args []string) {
-	if len(args) != 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(1)) {
 		return
 	}
 
@@ -93,15 +80,7 @@ func (m *Miniredis) cmdScard(c *server.Peer, cmd string, args []string) {
 
 // SDIFF
 func (m *Miniredis) cmdSdiff(c *server.Peer, cmd string, args []string) {
-	if len(args) < 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(1)) {
 		return
 	}
 
@@ -125,15 +104,7 @@ func (m *Miniredis) cmdSdiff(c *server.Peer, cmd string, args []string) {
 
 // SDIFFSTORE
 func (m *Miniredis) cmdSdiffstore(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
@@ -156,15 +127,7 @@ func (m *Miniredis) cmdSdiffstore(c *server.Peer, cmd string, args []string) {
 
 // SINTER
 func (m *Miniredis) cmdSinter(c *server.Peer, cmd string, args []string) {
-	if len(args) < 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(1)) {
 		return
 	}
 
@@ -188,15 +151,7 @@ func (m *Miniredis) cmdSinter(c *server.Peer, cmd string, args []string) {
 
 // SINTERSTORE
 func (m *Miniredis) cmdSinterstore(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
@@ -217,17 +172,72 @@ func (m *Miniredis) cmdSinterstore(c *server.Peer, cmd string, args []string) {
 	})
 }
 
+// SINTERCARD
+func (m *Miniredis) cmdSintercard(c *server.Peer, cmd string, args []string) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
+		return
+	}
+
+	opts := struct {
+		keys  []string
+		limit int
+	}{}
+
+	numKeys, err := strconv.Atoi(args[0])
+	if err != nil {
+		setDirty(c)
+		c.WriteError("ERR numkeys should be greater than 0")
+		return
+	}
+	if numKeys < 1 {
+		setDirty(c)
+		c.WriteError("ERR numkeys should be greater than 0")
+		return
+	}
+
+	args = args[1:]
+	if len(args) < numKeys {
+		setDirty(c)
+		c.WriteError("ERR Number of keys can't be greater than number of args")
+		return
+	}
+	opts.keys = args[:numKeys]
+
+	args = args[numKeys:]
+	if len(args) == 2 && strings.ToLower(args[0]) == "limit" {
+		l, err := strconv.Atoi(args[1])
+		if err != nil {
+			setDirty(c)
+			c.WriteError(msgInvalidInt)
+			return
+		}
+		if l < 0 {
+			setDirty(c)
+			c.WriteError(msgLimitIsNegative)
+			return
+		}
+		opts.limit = l
+	} else if len(args) > 0 {
+		setDirty(c)
+		c.WriteError(msgSyntaxError)
+		return
+	}
+
+	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
+		db := m.db(ctx.selectedDB)
+
+		count, err := db.setIntercard(opts.keys, opts.limit)
+		if err != nil {
+			c.WriteError(err.Error())
+			return
+		}
+		c.WriteInt(count)
+	})
+}
+
 // SISMEMBER
 func (m *Miniredis) cmdSismember(c *server.Peer, cmd string, args []string) {
-	if len(args) != 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(2)) {
 		return
 	}
 
@@ -256,15 +266,7 @@ func (m *Miniredis) cmdSismember(c *server.Peer, cmd string, args []string) {
 
 // SMEMBERS
 func (m *Miniredis) cmdSmembers(c *server.Peer, cmd string, args []string) {
-	if len(args) != 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(1)) {
 		return
 	}
 
@@ -292,17 +294,45 @@ func (m *Miniredis) cmdSmembers(c *server.Peer, cmd string, args []string) {
 	})
 }
 
+// SMISMEMBER
+func (m *Miniredis) cmdSmismember(c *server.Peer, cmd string, args []string) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
+		return
+	}
+
+	key, values := args[0], args[1:]
+
+	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
+		db := m.db(ctx.selectedDB)
+
+		if !db.exists(key) {
+			c.WriteLen(len(values))
+			for range values {
+				c.WriteInt(0)
+			}
+			return
+		}
+
+		if db.t(key) != "set" {
+			c.WriteError(ErrWrongType.Error())
+			return
+		}
+
+		c.WriteLen(len(values))
+		for _, value := range values {
+			if db.setIsMember(key, value) {
+				c.WriteInt(1)
+			} else {
+				c.WriteInt(0)
+			}
+		}
+		return
+	})
+}
+
 // SMOVE
 func (m *Miniredis) cmdSmove(c *server.Peer, cmd string, args []string) {
-	if len(args) != 3 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, exactly(3)) {
 		return
 	}
 
@@ -338,49 +368,46 @@ func (m *Miniredis) cmdSmove(c *server.Peer, cmd string, args []string) {
 
 // SPOP
 func (m *Miniredis) cmdSpop(c *server.Peer, cmd string, args []string) {
-	if len(args) == 0 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(1)) {
 		return
 	}
 
-	key, args := args[0], args[1:]
+	opts := struct {
+		key       string
+		withCount bool
+		count     int
+	}{
+		count: 1,
+	}
+	opts.key, args = args[0], args[1:]
 
-	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
-		db := m.db(ctx.selectedDB)
-
-		withCount := false
-		count := 1
-		if len(args) > 0 {
-			v, err := strconv.Atoi(args[0])
-			if err != nil {
-				setDirty(c)
-				c.WriteError(msgInvalidInt)
-				return
-			}
-			if v < 0 {
-				setDirty(c)
-				c.WriteError(msgOutOfRange)
-				return
-			}
-			count = v
-			withCount = true
-			args = args[1:]
-		}
-		if len(args) > 0 {
+	if len(args) > 0 {
+		v, err := strconv.Atoi(args[0])
+		if err != nil {
 			setDirty(c)
 			c.WriteError(msgInvalidInt)
 			return
 		}
+		if v < 0 {
+			setDirty(c)
+			c.WriteError(msgOutOfRange)
+			return
+		}
+		opts.count = v
+		opts.withCount = true
+		args = args[1:]
+	}
+	if len(args) > 0 {
+		setDirty(c)
+		c.WriteError(msgInvalidInt)
+		return
+	}
 
-		if !db.exists(key) {
-			if !withCount {
+	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
+		db := m.db(ctx.selectedDB)
+
+		if !db.exists(opts.key) {
+			if !opts.withCount {
 				c.WriteNull()
 				return
 			}
@@ -388,23 +415,25 @@ func (m *Miniredis) cmdSpop(c *server.Peer, cmd string, args []string) {
 			return
 		}
 
-		if db.t(key) != "set" {
+		if db.t(opts.key) != "set" {
 			c.WriteError(ErrWrongType.Error())
 			return
 		}
 
 		var deleted []string
-		for i := 0; i < count; i++ {
-			members := db.setMembers(key)
+		members := db.setMembers(opts.key)
+		for i := 0; i < opts.count; i++ {
 			if len(members) == 0 {
 				break
 			}
-			member := members[m.randIntn(len(members))]
-			db.setRem(key, member)
+			i := m.randIntn(len(members))
+			member := members[i]
+			members = delElem(members, i)
+			db.setRem(opts.key, member)
 			deleted = append(deleted, member)
 		}
-		// without `count` return a single value...
-		if !withCount {
+		// without `count` return a single value
+		if !opts.withCount {
 			if len(deleted) == 0 {
 				c.WriteNull()
 				return
@@ -412,7 +441,7 @@ func (m *Miniredis) cmdSpop(c *server.Peer, cmd string, args []string) {
 			c.WriteBulk(deleted[0])
 			return
 		}
-		// ... with `count` return a list
+		// with `count` return a list
 		c.WriteLen(len(deleted))
 		for _, v := range deleted {
 			c.WriteBulk(v)
@@ -422,20 +451,13 @@ func (m *Miniredis) cmdSpop(c *server.Peer, cmd string, args []string) {
 
 // SRANDMEMBER
 func (m *Miniredis) cmdSrandmember(c *server.Peer, cmd string, args []string) {
-	if len(args) < 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
+	if !m.isValidCMD(c, cmd, args, atLeast(1)) {
 		return
 	}
+
 	if len(args) > 2 {
 		setDirty(c)
 		c.WriteError(msgSyntaxError)
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
 		return
 	}
 
@@ -457,6 +479,10 @@ func (m *Miniredis) cmdSrandmember(c *server.Peer, cmd string, args []string) {
 		db := m.db(ctx.selectedDB)
 
 		if !db.exists(key) {
+			if withCount {
+				c.WriteLen(0)
+				return
+			}
 			c.WriteNull()
 			return
 		}
@@ -487,7 +513,7 @@ func (m *Miniredis) cmdSrandmember(c *server.Peer, cmd string, args []string) {
 			c.WriteBulk(members[0])
 			return
 		}
-		c.WriteSetLen(count)
+		c.WriteLen(count)
 		for i := range make([]struct{}, count) {
 			c.WriteBulk(members[i])
 		}
@@ -496,15 +522,7 @@ func (m *Miniredis) cmdSrandmember(c *server.Peer, cmd string, args []string) {
 
 // SREM
 func (m *Miniredis) cmdSrem(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
@@ -529,15 +547,7 @@ func (m *Miniredis) cmdSrem(c *server.Peer, cmd string, args []string) {
 
 // SUNION
 func (m *Miniredis) cmdSunion(c *server.Peer, cmd string, args []string) {
-	if len(args) < 1 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(1)) {
 		return
 	}
 
@@ -561,15 +571,7 @@ func (m *Miniredis) cmdSunion(c *server.Peer, cmd string, args []string) {
 
 // SUNIONSTORE
 func (m *Miniredis) cmdSunionstore(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
@@ -592,29 +594,26 @@ func (m *Miniredis) cmdSunionstore(c *server.Peer, cmd string, args []string) {
 
 // SSCAN
 func (m *Miniredis) cmdSscan(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
-	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
-	key := args[0]
-	cursor, err := strconv.Atoi(args[1])
-	if err != nil {
-		setDirty(c)
-		c.WriteError(msgInvalidCursor)
+	var opts struct {
+		key       string
+		value     int
+		cursor    int
+		count     int
+		withMatch bool
+		match     string
+	}
+
+	opts.key = args[0]
+	if ok := optIntErr(c, args[1], &opts.cursor, msgInvalidCursor); !ok {
 		return
 	}
 	args = args[2:]
+
 	// MATCH and COUNT options
-	var withMatch bool
-	var match string
 	for len(args) > 0 {
 		if strings.ToLower(args[0]) == "count" {
 			if len(args) < 2 {
@@ -622,13 +621,18 @@ func (m *Miniredis) cmdSscan(c *server.Peer, cmd string, args []string) {
 				c.WriteError(msgSyntaxError)
 				return
 			}
-			_, err := strconv.Atoi(args[1])
-			if err != nil {
+			count, err := strconv.Atoi(args[1])
+			if err != nil || count < 0 {
 				setDirty(c)
 				c.WriteError(msgInvalidInt)
 				return
 			}
-			// We do nothing with count.
+			if count == 0 {
+				setDirty(c)
+				c.WriteError(msgSyntaxError)
+				return
+			}
+			opts.count = count
 			args = args[2:]
 			continue
 		}
@@ -638,8 +642,8 @@ func (m *Miniredis) cmdSscan(c *server.Peer, cmd string, args []string) {
 				c.WriteError(msgSyntaxError)
 				return
 			}
-			withMatch = true
-			match = args[1]
+			opts.withMatch = true
+			opts.match = args[1]
 			args = args[2:]
 			continue
 		}
@@ -651,29 +655,47 @@ func (m *Miniredis) cmdSscan(c *server.Peer, cmd string, args []string) {
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
 		db := m.db(ctx.selectedDB)
 		// return _all_ (matched) keys every time
-
-		if cursor != 0 {
+		if db.exists(opts.key) && db.t(opts.key) != "set" {
+			c.WriteError(ErrWrongType.Error())
+			return
+		}
+		members := db.setMembers(opts.key)
+		if opts.withMatch {
+			members, _ = matchKeys(members, opts.match)
+		}
+		low := opts.cursor
+		high := low + opts.count
+		// validate high is correct
+		if high > len(members) || high == 0 {
+			high = len(members)
+		}
+		if opts.cursor > high {
 			// invalid cursor
 			c.WriteLen(2)
 			c.WriteBulk("0") // no next cursor
 			c.WriteLen(0)    // no elements
 			return
 		}
-		if db.exists(key) && db.t(key) != "set" {
-			c.WriteError(ErrWrongType.Error())
-			return
+		cursorValue := low + opts.count
+		if cursorValue > len(members) {
+			cursorValue = 0 // no next cursor
 		}
-
-		members := db.setMembers(key)
-		if withMatch {
-			members, _ = matchKeys(members, match)
-		}
-
+		members = members[low:high]
 		c.WriteLen(2)
-		c.WriteBulk("0") // no next cursor
+		c.WriteBulk(fmt.Sprintf("%d", cursorValue))
 		c.WriteLen(len(members))
 		for _, k := range members {
 			c.WriteBulk(k)
 		}
+
 	})
+}
+
+func delElem(ls []string, i int) []string {
+	// this swap+truncate is faster but changes behaviour:
+	// ls[i] = ls[len(ls)-1]
+	// ls = ls[:len(ls)-1]
+	// so we do the dumb thing:
+	ls = append(ls[:i], ls[i+1:]...)
+	return ls
 }

@@ -7,8 +7,10 @@ import (
 	fmt "fmt"
 	_ "github.com/gogo/protobuf/gogoproto"
 	proto "github.com/gogo/protobuf/proto"
+	github_com_gogo_protobuf_sortkeys "github.com/gogo/protobuf/sortkeys"
+	_ "github.com/gogo/protobuf/types"
 	github_com_gogo_protobuf_types "github.com/gogo/protobuf/types"
-	_ "github.com/golang/protobuf/ptypes/duration"
+	_ "google.golang.org/protobuf/types/known/durationpb"
 	io "io"
 	math "math"
 	math_bits "math/bits"
@@ -36,6 +38,39 @@ type Stats struct {
 	FetchedSeriesCount uint64 `protobuf:"varint,2,opt,name=fetched_series_count,json=fetchedSeriesCount,proto3" json:"fetched_series_count,omitempty"`
 	// The number of bytes of the chunks fetched for the query
 	FetchedChunkBytes uint64 `protobuf:"varint,3,opt,name=fetched_chunk_bytes,json=fetchedChunkBytes,proto3" json:"fetched_chunk_bytes,omitempty"`
+	// The number of bytes of data fetched for the query
+	FetchedDataBytes uint64 `protobuf:"varint,4,opt,name=fetched_data_bytes,json=fetchedDataBytes,proto3" json:"fetched_data_bytes,omitempty"`
+	// Extra fields to be reported on the stats log
+	ExtraFields map[string]string `protobuf:"bytes,5,rep,name=extra_fields,json=extraFields,proto3" json:"extra_fields,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	// The number of chunks fetched for the query
+	FetchedChunksCount uint64 `protobuf:"varint,6,opt,name=fetched_chunks_count,json=fetchedChunksCount,proto3" json:"fetched_chunks_count,omitempty"`
+	// The number of samples fetched for the query
+	FetchedSamplesCount uint64 `protobuf:"varint,7,opt,name=fetched_samples_count,json=fetchedSamplesCount,proto3" json:"fetched_samples_count,omitempty"`
+	// The limit hit when executing the query
+	LimitHit string `protobuf:"bytes,8,opt,name=limit_hit,json=limitHit,proto3" json:"limit_hit,omitempty"`
+	// The total number of split queries sent after going through all the middlewares.
+	// It includes the number of requests that might be discarded by the queue.
+	SplitQueries uint64 `protobuf:"varint,9,opt,name=split_queries,json=splitQueries,proto3" json:"split_queries,omitempty"`
+	// The sum of wall time spent in the querier to fetch and merge data from storage.
+	QueryStorageWallTime time.Duration `protobuf:"bytes,10,opt,name=query_storage_wall_time,json=queryStorageWallTime,proto3,stdduration" json:"query_storage_wall_time"`
+	// The total number of postings touched in store gateway for a specific query.
+	// Only successful requests from querier to store gateway are included.
+	StoreGatewayTouchedPostingsCount uint64 `protobuf:"varint,11,opt,name=store_gateway_touched_postings_count,json=storeGatewayTouchedPostingsCount,proto3" json:"store_gateway_touched_postings_count,omitempty"`
+	// The total size of postings touched in store gateway for a specific query, in bytes.
+	// Only successful requests from querier to store gateway are included.
+	StoreGatewayTouchedPostingBytes uint64 `protobuf:"varint,12,opt,name=store_gateway_touched_posting_bytes,json=storeGatewayTouchedPostingBytes,proto3" json:"store_gateway_touched_posting_bytes,omitempty"`
+	// The total number of samples scanned while evaluating a query.
+	// Equal to TotalSamples in https://github.com/prometheus/prometheus/blob/main/util/stats/query_stats.go
+	ScannedSamples uint64 `protobuf:"varint,13,opt,name=scanned_samples,json=scannedSamples,proto3" json:"scanned_samples,omitempty"`
+	// The highest count of samples considered while evaluating a query.
+	// Equal to PeakSamples in https://github.com/prometheus/prometheus/blob/main/util/stats/query_stats.go
+	PeakSamples uint64 `protobuf:"varint,14,opt,name=peak_samples,json=peakSamples,proto3" json:"peak_samples,omitempty"`
+	// Max timing breakdown across sub-queries for timeout classification.
+	// These use max() semantics during Merge rather than sum.
+	MaxFetchTime     time.Duration `protobuf:"bytes,15,opt,name=max_fetch_time,json=maxFetchTime,proto3,stdduration" json:"max_fetch_time"`
+	MaxEvalTime      time.Duration `protobuf:"bytes,16,opt,name=max_eval_time,json=maxEvalTime,proto3,stdduration" json:"max_eval_time"`
+	MaxQueueWaitTime time.Duration `protobuf:"bytes,17,opt,name=max_queue_wait_time,json=maxQueueWaitTime,proto3,stdduration" json:"max_queue_wait_time"`
+	MaxTotalTime     time.Duration `protobuf:"bytes,18,opt,name=max_total_time,json=maxTotalTime,proto3,stdduration" json:"max_total_time"`
 }
 
 func (m *Stats) Reset()      { *m = Stats{} }
@@ -91,32 +126,161 @@ func (m *Stats) GetFetchedChunkBytes() uint64 {
 	return 0
 }
 
+func (m *Stats) GetFetchedDataBytes() uint64 {
+	if m != nil {
+		return m.FetchedDataBytes
+	}
+	return 0
+}
+
+func (m *Stats) GetExtraFields() map[string]string {
+	if m != nil {
+		return m.ExtraFields
+	}
+	return nil
+}
+
+func (m *Stats) GetFetchedChunksCount() uint64 {
+	if m != nil {
+		return m.FetchedChunksCount
+	}
+	return 0
+}
+
+func (m *Stats) GetFetchedSamplesCount() uint64 {
+	if m != nil {
+		return m.FetchedSamplesCount
+	}
+	return 0
+}
+
+func (m *Stats) GetLimitHit() string {
+	if m != nil {
+		return m.LimitHit
+	}
+	return ""
+}
+
+func (m *Stats) GetSplitQueries() uint64 {
+	if m != nil {
+		return m.SplitQueries
+	}
+	return 0
+}
+
+func (m *Stats) GetQueryStorageWallTime() time.Duration {
+	if m != nil {
+		return m.QueryStorageWallTime
+	}
+	return 0
+}
+
+func (m *Stats) GetStoreGatewayTouchedPostingsCount() uint64 {
+	if m != nil {
+		return m.StoreGatewayTouchedPostingsCount
+	}
+	return 0
+}
+
+func (m *Stats) GetStoreGatewayTouchedPostingBytes() uint64 {
+	if m != nil {
+		return m.StoreGatewayTouchedPostingBytes
+	}
+	return 0
+}
+
+func (m *Stats) GetScannedSamples() uint64 {
+	if m != nil {
+		return m.ScannedSamples
+	}
+	return 0
+}
+
+func (m *Stats) GetPeakSamples() uint64 {
+	if m != nil {
+		return m.PeakSamples
+	}
+	return 0
+}
+
+func (m *Stats) GetMaxFetchTime() time.Duration {
+	if m != nil {
+		return m.MaxFetchTime
+	}
+	return 0
+}
+
+func (m *Stats) GetMaxEvalTime() time.Duration {
+	if m != nil {
+		return m.MaxEvalTime
+	}
+	return 0
+}
+
+func (m *Stats) GetMaxQueueWaitTime() time.Duration {
+	if m != nil {
+		return m.MaxQueueWaitTime
+	}
+	return 0
+}
+
+func (m *Stats) GetMaxTotalTime() time.Duration {
+	if m != nil {
+		return m.MaxTotalTime
+	}
+	return 0
+}
+
 func init() {
 	proto.RegisterType((*Stats)(nil), "stats.Stats")
+	proto.RegisterMapType((map[string]string)(nil), "stats.Stats.ExtraFieldsEntry")
 }
 
 func init() { proto.RegisterFile("stats.proto", fileDescriptor_b4756a0aec8b9d44) }
 
 var fileDescriptor_b4756a0aec8b9d44 = []byte{
-	// 281 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x44, 0xd0, 0xb1, 0x4e, 0x83, 0x40,
-	0x1c, 0xc7, 0xf1, 0xfb, 0xab, 0x35, 0x95, 0x4e, 0xa2, 0x03, 0x76, 0xf8, 0xb7, 0x71, 0xea, 0xe2,
-	0xd5, 0xe8, 0xe8, 0x62, 0xa8, 0x4f, 0xd0, 0x3a, 0xb9, 0x10, 0xa0, 0x57, 0x20, 0x02, 0x67, 0xe0,
-	0x2e, 0xc6, 0xcd, 0x47, 0x70, 0xf4, 0x11, 0x4c, 0x7c, 0x91, 0x8e, 0x8c, 0x9d, 0x54, 0x8e, 0xc5,
-	0xb1, 0x8f, 0x60, 0xee, 0xa0, 0x71, 0xe3, 0x97, 0x0f, 0xdf, 0x4b, 0xee, 0xac, 0x41, 0x29, 0x7c,
-	0x51, 0xd2, 0xa7, 0x82, 0x0b, 0x6e, 0xf7, 0xcc, 0x18, 0x5e, 0x44, 0x89, 0x88, 0x65, 0x40, 0x43,
-	0x9e, 0x4d, 0x23, 0x1e, 0xf1, 0xa9, 0xd1, 0x40, 0xae, 0xcc, 0x32, 0xc3, 0x7c, 0xb5, 0xd5, 0x10,
-	0x23, 0xce, 0xa3, 0x94, 0xfd, 0xff, 0xb5, 0x94, 0x85, 0x2f, 0x12, 0x9e, 0xb7, 0x7e, 0xfe, 0x09,
-	0x56, 0x6f, 0xa1, 0x0f, 0xb6, 0x6f, 0xad, 0xa3, 0x67, 0x3f, 0x4d, 0x3d, 0x91, 0x64, 0xcc, 0x81,
-	0x31, 0x4c, 0x06, 0x57, 0x67, 0xb4, 0xad, 0xe9, 0xae, 0xa6, 0x77, 0x5d, 0xed, 0xf6, 0xd7, 0x5f,
-	0x23, 0xf2, 0xfe, 0x3d, 0x82, 0x79, 0x5f, 0x57, 0xf7, 0x49, 0xc6, 0xec, 0x4b, 0xeb, 0x74, 0xc5,
-	0x44, 0x18, 0xb3, 0xa5, 0x57, 0xb2, 0x22, 0x61, 0xa5, 0x17, 0x72, 0x99, 0x0b, 0x67, 0x6f, 0x0c,
-	0x93, 0x83, 0xb9, 0xdd, 0xd9, 0xc2, 0xd0, 0x4c, 0x8b, 0x4d, 0xad, 0x93, 0x5d, 0x11, 0xc6, 0x32,
-	0x7f, 0xf4, 0x82, 0x17, 0xc1, 0x4a, 0x67, 0xdf, 0x04, 0xc7, 0x1d, 0xcd, 0xb4, 0xb8, 0x1a, 0xdc,
-	0x9b, 0xaa, 0x46, 0xb2, 0xa9, 0x91, 0x6c, 0x6b, 0x84, 0x57, 0x85, 0xf0, 0xa1, 0x10, 0xd6, 0x0a,
-	0xa1, 0x52, 0x08, 0x3f, 0x0a, 0xe1, 0x57, 0x21, 0xd9, 0x2a, 0x84, 0xb7, 0x06, 0x49, 0xd5, 0x20,
-	0xd9, 0x34, 0x48, 0x1e, 0xda, 0x97, 0x0b, 0x0e, 0xcd, 0x2d, 0xae, 0xff, 0x02, 0x00, 0x00, 0xff,
-	0xff, 0x9d, 0xf1, 0x86, 0xb8, 0x56, 0x01, 0x00, 0x00,
+	// 653 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x94, 0x54, 0x4d, 0x4f, 0x13, 0x4f,
+	0x18, 0xdf, 0x01, 0xca, 0x9f, 0x9d, 0x2d, 0x50, 0x96, 0xfe, 0xe3, 0x42, 0xe2, 0x50, 0xc4, 0xc4,
+	0x1e, 0xcc, 0x62, 0xf0, 0x62, 0x34, 0x31, 0xa4, 0xbc, 0x69, 0x62, 0x8c, 0xb4, 0x24, 0x24, 0x5c,
+	0x26, 0x43, 0x3b, 0x2c, 0x13, 0xf6, 0xa5, 0x74, 0x67, 0xa1, 0xbd, 0x19, 0x3f, 0x81, 0x47, 0x3f,
+	0x82, 0x1f, 0x85, 0x23, 0x47, 0x4e, 0x28, 0xcb, 0xc5, 0x23, 0x1f, 0xc1, 0xcc, 0x33, 0xb3, 0xa0,
+	0x24, 0x9a, 0x7a, 0xdb, 0x79, 0x7e, 0x2f, 0x99, 0xdf, 0xef, 0xc9, 0x0e, 0x76, 0x52, 0xc9, 0x64,
+	0xea, 0x77, 0x7b, 0x89, 0x4c, 0xdc, 0x12, 0x1c, 0xe6, 0xab, 0x41, 0x12, 0x24, 0x30, 0x59, 0x56,
+	0x5f, 0x1a, 0x9c, 0x27, 0x41, 0x92, 0x04, 0x21, 0x5f, 0x86, 0xd3, 0x7e, 0x76, 0xb0, 0xdc, 0xc9,
+	0x7a, 0x4c, 0x8a, 0x24, 0x36, 0xf8, 0xdc, 0x7d, 0x9c, 0xc5, 0x03, 0x0d, 0x3d, 0xfa, 0x64, 0xe3,
+	0x52, 0x4b, 0x59, 0xbb, 0xab, 0xd8, 0x3e, 0x65, 0x61, 0x48, 0xa5, 0x88, 0xb8, 0x87, 0x6a, 0xa8,
+	0xee, 0xac, 0xcc, 0xf9, 0x5a, 0xe8, 0x17, 0x42, 0x7f, 0xdd, 0x18, 0x37, 0x26, 0xce, 0x2e, 0x17,
+	0xac, 0x2f, 0xdf, 0x16, 0x50, 0x73, 0x42, 0xa9, 0x76, 0x44, 0xc4, 0xdd, 0x67, 0xb8, 0x7a, 0xc0,
+	0x65, 0xfb, 0x90, 0x77, 0x68, 0xca, 0x7b, 0x82, 0xa7, 0xb4, 0x9d, 0x64, 0xb1, 0xf4, 0x46, 0x6a,
+	0xa8, 0x3e, 0xd6, 0x74, 0x0d, 0xd6, 0x02, 0x68, 0x4d, 0x21, 0xae, 0x8f, 0x67, 0x0b, 0x45, 0xfb,
+	0x30, 0x8b, 0x8f, 0xe8, 0xfe, 0x40, 0xf2, 0xd4, 0x1b, 0x05, 0xc1, 0x8c, 0x81, 0xd6, 0x14, 0xd2,
+	0x50, 0x80, 0xfb, 0x14, 0x17, 0x2e, 0xb4, 0xc3, 0x24, 0x33, 0xf4, 0x31, 0xa0, 0x57, 0x0c, 0xb2,
+	0xce, 0x24, 0xd3, 0xec, 0x55, 0x5c, 0xe6, 0x7d, 0xd9, 0x63, 0xf4, 0x40, 0xf0, 0xb0, 0x93, 0x7a,
+	0xa5, 0xda, 0x68, 0xdd, 0x59, 0x79, 0xe8, 0xeb, 0x5e, 0x21, 0xb5, 0xbf, 0xa1, 0x08, 0x9b, 0x80,
+	0x6f, 0xc4, 0xb2, 0x37, 0x68, 0x3a, 0xfc, 0x6e, 0xf2, 0x6b, 0x22, 0xb8, 0x5f, 0x91, 0x68, 0xfc,
+	0xb7, 0x44, 0x70, 0x41, 0x93, 0x68, 0x05, 0xff, 0x7f, 0xdb, 0x01, 0x8b, 0xba, 0xe1, 0x6d, 0x09,
+	0xff, 0x81, 0xa4, 0x88, 0xdb, 0xd2, 0x98, 0xd6, 0x2c, 0x62, 0x3b, 0x14, 0x91, 0x90, 0xf4, 0x50,
+	0x48, 0x6f, 0xa2, 0x86, 0xea, 0x76, 0x63, 0xec, 0xec, 0x52, 0x55, 0x0b, 0xe3, 0x37, 0x42, 0xba,
+	0x4b, 0x78, 0x32, 0xed, 0x86, 0x42, 0xd2, 0xe3, 0x0c, 0xea, 0xf3, 0x6c, 0xb0, 0x2b, 0xc3, 0x70,
+	0x5b, 0xcf, 0xdc, 0x3d, 0xfc, 0x40, 0xc1, 0x03, 0x9a, 0xca, 0xa4, 0xc7, 0x02, 0x4e, 0xef, 0xf6,
+	0x89, 0x87, 0xdf, 0x67, 0x15, 0x3c, 0x5a, 0xda, 0x62, 0xb7, 0xd8, 0xed, 0x7b, 0xfc, 0x58, 0xb9,
+	0x72, 0x1a, 0x30, 0xc9, 0x4f, 0xd9, 0x80, 0xca, 0x24, 0x83, 0x94, 0xdd, 0x24, 0x95, 0x22, 0x0e,
+	0x8a, 0x98, 0x0e, 0xdc, 0xab, 0x06, 0xdc, 0x2d, 0x4d, 0xdd, 0xd1, 0xcc, 0x0f, 0x86, 0xa8, 0x33,
+	0xbf, 0xc3, 0x4b, 0x7f, 0xf5, 0x33, 0xab, 0x2d, 0x83, 0xdd, 0xc2, 0x9f, 0xed, 0xf4, 0xa6, 0x9f,
+	0xe0, 0xe9, 0xb4, 0xcd, 0xe2, 0xf8, 0xae, 0x75, 0x6f, 0x12, 0x94, 0x53, 0x66, 0x6c, 0xfa, 0x76,
+	0x17, 0x71, 0xb9, 0xcb, 0xd9, 0xd1, 0x2d, 0x6b, 0x0a, 0x58, 0x8e, 0x9a, 0x15, 0x94, 0xb7, 0x78,
+	0x2a, 0x62, 0x7d, 0x0a, 0x8b, 0xd2, 0xe5, 0x4d, 0x0f, 0x5f, 0x5e, 0x39, 0x62, 0xfd, 0x4d, 0xa5,
+	0x84, 0xd2, 0xb6, 0xf0, 0xa4, 0xb2, 0xe2, 0x27, 0xcc, 0xac, 0xa1, 0x32, 0xbc, 0x93, 0x13, 0xb1,
+	0xfe, 0xc6, 0x09, 0xd3, 0xed, 0x37, 0xf1, 0xac, 0x32, 0x3a, 0xce, 0x78, 0xa6, 0xb6, 0x2a, 0xa4,
+	0xb6, 0x9b, 0x19, 0xde, 0xae, 0x12, 0xb1, 0xfe, 0xb6, 0x92, 0xef, 0x32, 0x21, 0xc1, 0xd3, 0xe4,
+	0x94, 0x89, 0x2c, 0x6e, 0xe7, 0xfe, 0x5b, 0xce, 0x1d, 0xa5, 0x54, 0x56, 0xf3, 0xaf, 0x71, 0xe5,
+	0xfe, 0x7f, 0xe4, 0x56, 0xf0, 0xe8, 0x11, 0x1f, 0xc0, 0x43, 0x62, 0x37, 0xd5, 0xa7, 0x5b, 0xc5,
+	0xa5, 0x13, 0x16, 0x66, 0x1c, 0xde, 0x03, 0xbb, 0xa9, 0x0f, 0x2f, 0x47, 0x5e, 0xa0, 0xc6, 0xab,
+	0xf3, 0x2b, 0x62, 0x5d, 0x5c, 0x11, 0xeb, 0xe6, 0x8a, 0xa0, 0x8f, 0x39, 0x41, 0x5f, 0x73, 0x82,
+	0xce, 0x72, 0x82, 0xce, 0x73, 0x82, 0xbe, 0xe7, 0x04, 0xfd, 0xc8, 0x89, 0x75, 0x93, 0x13, 0xf4,
+	0xf9, 0x9a, 0x58, 0xe7, 0xd7, 0xc4, 0xba, 0xb8, 0x26, 0xd6, 0x9e, 0x7e, 0x12, 0xf7, 0xc7, 0xe1,
+	0x9e, 0xcf, 0x7f, 0x0e, 0x00, 0x5b, 0x42, 0x1f, 0xae, 0x2f, 0x05, 0x00, 0x00,
 }
 
 func (this *Stats) Equal(that interface{}) bool {
@@ -147,17 +311,94 @@ func (this *Stats) Equal(that interface{}) bool {
 	if this.FetchedChunkBytes != that1.FetchedChunkBytes {
 		return false
 	}
+	if this.FetchedDataBytes != that1.FetchedDataBytes {
+		return false
+	}
+	if len(this.ExtraFields) != len(that1.ExtraFields) {
+		return false
+	}
+	for i := range this.ExtraFields {
+		if this.ExtraFields[i] != that1.ExtraFields[i] {
+			return false
+		}
+	}
+	if this.FetchedChunksCount != that1.FetchedChunksCount {
+		return false
+	}
+	if this.FetchedSamplesCount != that1.FetchedSamplesCount {
+		return false
+	}
+	if this.LimitHit != that1.LimitHit {
+		return false
+	}
+	if this.SplitQueries != that1.SplitQueries {
+		return false
+	}
+	if this.QueryStorageWallTime != that1.QueryStorageWallTime {
+		return false
+	}
+	if this.StoreGatewayTouchedPostingsCount != that1.StoreGatewayTouchedPostingsCount {
+		return false
+	}
+	if this.StoreGatewayTouchedPostingBytes != that1.StoreGatewayTouchedPostingBytes {
+		return false
+	}
+	if this.ScannedSamples != that1.ScannedSamples {
+		return false
+	}
+	if this.PeakSamples != that1.PeakSamples {
+		return false
+	}
+	if this.MaxFetchTime != that1.MaxFetchTime {
+		return false
+	}
+	if this.MaxEvalTime != that1.MaxEvalTime {
+		return false
+	}
+	if this.MaxQueueWaitTime != that1.MaxQueueWaitTime {
+		return false
+	}
+	if this.MaxTotalTime != that1.MaxTotalTime {
+		return false
+	}
 	return true
 }
 func (this *Stats) GoString() string {
 	if this == nil {
 		return "nil"
 	}
-	s := make([]string, 0, 7)
+	s := make([]string, 0, 22)
 	s = append(s, "&stats.Stats{")
 	s = append(s, "WallTime: "+fmt.Sprintf("%#v", this.WallTime)+",\n")
 	s = append(s, "FetchedSeriesCount: "+fmt.Sprintf("%#v", this.FetchedSeriesCount)+",\n")
 	s = append(s, "FetchedChunkBytes: "+fmt.Sprintf("%#v", this.FetchedChunkBytes)+",\n")
+	s = append(s, "FetchedDataBytes: "+fmt.Sprintf("%#v", this.FetchedDataBytes)+",\n")
+	keysForExtraFields := make([]string, 0, len(this.ExtraFields))
+	for k, _ := range this.ExtraFields {
+		keysForExtraFields = append(keysForExtraFields, k)
+	}
+	github_com_gogo_protobuf_sortkeys.Strings(keysForExtraFields)
+	mapStringForExtraFields := "map[string]string{"
+	for _, k := range keysForExtraFields {
+		mapStringForExtraFields += fmt.Sprintf("%#v: %#v,", k, this.ExtraFields[k])
+	}
+	mapStringForExtraFields += "}"
+	if this.ExtraFields != nil {
+		s = append(s, "ExtraFields: "+mapStringForExtraFields+",\n")
+	}
+	s = append(s, "FetchedChunksCount: "+fmt.Sprintf("%#v", this.FetchedChunksCount)+",\n")
+	s = append(s, "FetchedSamplesCount: "+fmt.Sprintf("%#v", this.FetchedSamplesCount)+",\n")
+	s = append(s, "LimitHit: "+fmt.Sprintf("%#v", this.LimitHit)+",\n")
+	s = append(s, "SplitQueries: "+fmt.Sprintf("%#v", this.SplitQueries)+",\n")
+	s = append(s, "QueryStorageWallTime: "+fmt.Sprintf("%#v", this.QueryStorageWallTime)+",\n")
+	s = append(s, "StoreGatewayTouchedPostingsCount: "+fmt.Sprintf("%#v", this.StoreGatewayTouchedPostingsCount)+",\n")
+	s = append(s, "StoreGatewayTouchedPostingBytes: "+fmt.Sprintf("%#v", this.StoreGatewayTouchedPostingBytes)+",\n")
+	s = append(s, "ScannedSamples: "+fmt.Sprintf("%#v", this.ScannedSamples)+",\n")
+	s = append(s, "PeakSamples: "+fmt.Sprintf("%#v", this.PeakSamples)+",\n")
+	s = append(s, "MaxFetchTime: "+fmt.Sprintf("%#v", this.MaxFetchTime)+",\n")
+	s = append(s, "MaxEvalTime: "+fmt.Sprintf("%#v", this.MaxEvalTime)+",\n")
+	s = append(s, "MaxQueueWaitTime: "+fmt.Sprintf("%#v", this.MaxQueueWaitTime)+",\n")
+	s = append(s, "MaxTotalTime: "+fmt.Sprintf("%#v", this.MaxTotalTime)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -189,6 +430,118 @@ func (m *Stats) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	n1, err1 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.MaxTotalTime, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.MaxTotalTime):])
+	if err1 != nil {
+		return 0, err1
+	}
+	i -= n1
+	i = encodeVarintStats(dAtA, i, uint64(n1))
+	i--
+	dAtA[i] = 0x1
+	i--
+	dAtA[i] = 0x92
+	n2, err2 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.MaxQueueWaitTime, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.MaxQueueWaitTime):])
+	if err2 != nil {
+		return 0, err2
+	}
+	i -= n2
+	i = encodeVarintStats(dAtA, i, uint64(n2))
+	i--
+	dAtA[i] = 0x1
+	i--
+	dAtA[i] = 0x8a
+	n3, err3 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.MaxEvalTime, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.MaxEvalTime):])
+	if err3 != nil {
+		return 0, err3
+	}
+	i -= n3
+	i = encodeVarintStats(dAtA, i, uint64(n3))
+	i--
+	dAtA[i] = 0x1
+	i--
+	dAtA[i] = 0x82
+	n4, err4 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.MaxFetchTime, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.MaxFetchTime):])
+	if err4 != nil {
+		return 0, err4
+	}
+	i -= n4
+	i = encodeVarintStats(dAtA, i, uint64(n4))
+	i--
+	dAtA[i] = 0x7a
+	if m.PeakSamples != 0 {
+		i = encodeVarintStats(dAtA, i, uint64(m.PeakSamples))
+		i--
+		dAtA[i] = 0x70
+	}
+	if m.ScannedSamples != 0 {
+		i = encodeVarintStats(dAtA, i, uint64(m.ScannedSamples))
+		i--
+		dAtA[i] = 0x68
+	}
+	if m.StoreGatewayTouchedPostingBytes != 0 {
+		i = encodeVarintStats(dAtA, i, uint64(m.StoreGatewayTouchedPostingBytes))
+		i--
+		dAtA[i] = 0x60
+	}
+	if m.StoreGatewayTouchedPostingsCount != 0 {
+		i = encodeVarintStats(dAtA, i, uint64(m.StoreGatewayTouchedPostingsCount))
+		i--
+		dAtA[i] = 0x58
+	}
+	n5, err5 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.QueryStorageWallTime, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.QueryStorageWallTime):])
+	if err5 != nil {
+		return 0, err5
+	}
+	i -= n5
+	i = encodeVarintStats(dAtA, i, uint64(n5))
+	i--
+	dAtA[i] = 0x52
+	if m.SplitQueries != 0 {
+		i = encodeVarintStats(dAtA, i, uint64(m.SplitQueries))
+		i--
+		dAtA[i] = 0x48
+	}
+	if len(m.LimitHit) > 0 {
+		i -= len(m.LimitHit)
+		copy(dAtA[i:], m.LimitHit)
+		i = encodeVarintStats(dAtA, i, uint64(len(m.LimitHit)))
+		i--
+		dAtA[i] = 0x42
+	}
+	if m.FetchedSamplesCount != 0 {
+		i = encodeVarintStats(dAtA, i, uint64(m.FetchedSamplesCount))
+		i--
+		dAtA[i] = 0x38
+	}
+	if m.FetchedChunksCount != 0 {
+		i = encodeVarintStats(dAtA, i, uint64(m.FetchedChunksCount))
+		i--
+		dAtA[i] = 0x30
+	}
+	if len(m.ExtraFields) > 0 {
+		for k := range m.ExtraFields {
+			v := m.ExtraFields[k]
+			baseI := i
+			i -= len(v)
+			copy(dAtA[i:], v)
+			i = encodeVarintStats(dAtA, i, uint64(len(v)))
+			i--
+			dAtA[i] = 0x12
+			i -= len(k)
+			copy(dAtA[i:], k)
+			i = encodeVarintStats(dAtA, i, uint64(len(k)))
+			i--
+			dAtA[i] = 0xa
+			i = encodeVarintStats(dAtA, i, uint64(baseI-i))
+			i--
+			dAtA[i] = 0x2a
+		}
+	}
+	if m.FetchedDataBytes != 0 {
+		i = encodeVarintStats(dAtA, i, uint64(m.FetchedDataBytes))
+		i--
+		dAtA[i] = 0x20
+	}
 	if m.FetchedChunkBytes != 0 {
 		i = encodeVarintStats(dAtA, i, uint64(m.FetchedChunkBytes))
 		i--
@@ -199,12 +552,12 @@ func (m *Stats) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x10
 	}
-	n1, err1 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.WallTime, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.WallTime):])
-	if err1 != nil {
-		return 0, err1
+	n6, err6 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.WallTime, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.WallTime):])
+	if err6 != nil {
+		return 0, err6
 	}
-	i -= n1
-	i = encodeVarintStats(dAtA, i, uint64(n1))
+	i -= n6
+	i = encodeVarintStats(dAtA, i, uint64(n6))
 	i--
 	dAtA[i] = 0xa
 	return len(dAtA) - i, nil
@@ -235,6 +588,52 @@ func (m *Stats) Size() (n int) {
 	if m.FetchedChunkBytes != 0 {
 		n += 1 + sovStats(uint64(m.FetchedChunkBytes))
 	}
+	if m.FetchedDataBytes != 0 {
+		n += 1 + sovStats(uint64(m.FetchedDataBytes))
+	}
+	if len(m.ExtraFields) > 0 {
+		for k, v := range m.ExtraFields {
+			_ = k
+			_ = v
+			mapEntrySize := 1 + len(k) + sovStats(uint64(len(k))) + 1 + len(v) + sovStats(uint64(len(v)))
+			n += mapEntrySize + 1 + sovStats(uint64(mapEntrySize))
+		}
+	}
+	if m.FetchedChunksCount != 0 {
+		n += 1 + sovStats(uint64(m.FetchedChunksCount))
+	}
+	if m.FetchedSamplesCount != 0 {
+		n += 1 + sovStats(uint64(m.FetchedSamplesCount))
+	}
+	l = len(m.LimitHit)
+	if l > 0 {
+		n += 1 + l + sovStats(uint64(l))
+	}
+	if m.SplitQueries != 0 {
+		n += 1 + sovStats(uint64(m.SplitQueries))
+	}
+	l = github_com_gogo_protobuf_types.SizeOfStdDuration(m.QueryStorageWallTime)
+	n += 1 + l + sovStats(uint64(l))
+	if m.StoreGatewayTouchedPostingsCount != 0 {
+		n += 1 + sovStats(uint64(m.StoreGatewayTouchedPostingsCount))
+	}
+	if m.StoreGatewayTouchedPostingBytes != 0 {
+		n += 1 + sovStats(uint64(m.StoreGatewayTouchedPostingBytes))
+	}
+	if m.ScannedSamples != 0 {
+		n += 1 + sovStats(uint64(m.ScannedSamples))
+	}
+	if m.PeakSamples != 0 {
+		n += 1 + sovStats(uint64(m.PeakSamples))
+	}
+	l = github_com_gogo_protobuf_types.SizeOfStdDuration(m.MaxFetchTime)
+	n += 1 + l + sovStats(uint64(l))
+	l = github_com_gogo_protobuf_types.SizeOfStdDuration(m.MaxEvalTime)
+	n += 2 + l + sovStats(uint64(l))
+	l = github_com_gogo_protobuf_types.SizeOfStdDuration(m.MaxQueueWaitTime)
+	n += 2 + l + sovStats(uint64(l))
+	l = github_com_gogo_protobuf_types.SizeOfStdDuration(m.MaxTotalTime)
+	n += 2 + l + sovStats(uint64(l))
 	return n
 }
 
@@ -248,10 +647,35 @@ func (this *Stats) String() string {
 	if this == nil {
 		return "nil"
 	}
+	keysForExtraFields := make([]string, 0, len(this.ExtraFields))
+	for k, _ := range this.ExtraFields {
+		keysForExtraFields = append(keysForExtraFields, k)
+	}
+	github_com_gogo_protobuf_sortkeys.Strings(keysForExtraFields)
+	mapStringForExtraFields := "map[string]string{"
+	for _, k := range keysForExtraFields {
+		mapStringForExtraFields += fmt.Sprintf("%v: %v,", k, this.ExtraFields[k])
+	}
+	mapStringForExtraFields += "}"
 	s := strings.Join([]string{`&Stats{`,
-		`WallTime:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.WallTime), "Duration", "duration.Duration", 1), `&`, ``, 1) + `,`,
+		`WallTime:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.WallTime), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
 		`FetchedSeriesCount:` + fmt.Sprintf("%v", this.FetchedSeriesCount) + `,`,
 		`FetchedChunkBytes:` + fmt.Sprintf("%v", this.FetchedChunkBytes) + `,`,
+		`FetchedDataBytes:` + fmt.Sprintf("%v", this.FetchedDataBytes) + `,`,
+		`ExtraFields:` + mapStringForExtraFields + `,`,
+		`FetchedChunksCount:` + fmt.Sprintf("%v", this.FetchedChunksCount) + `,`,
+		`FetchedSamplesCount:` + fmt.Sprintf("%v", this.FetchedSamplesCount) + `,`,
+		`LimitHit:` + fmt.Sprintf("%v", this.LimitHit) + `,`,
+		`SplitQueries:` + fmt.Sprintf("%v", this.SplitQueries) + `,`,
+		`QueryStorageWallTime:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.QueryStorageWallTime), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
+		`StoreGatewayTouchedPostingsCount:` + fmt.Sprintf("%v", this.StoreGatewayTouchedPostingsCount) + `,`,
+		`StoreGatewayTouchedPostingBytes:` + fmt.Sprintf("%v", this.StoreGatewayTouchedPostingBytes) + `,`,
+		`ScannedSamples:` + fmt.Sprintf("%v", this.ScannedSamples) + `,`,
+		`PeakSamples:` + fmt.Sprintf("%v", this.PeakSamples) + `,`,
+		`MaxFetchTime:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.MaxFetchTime), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
+		`MaxEvalTime:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.MaxEvalTime), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
+		`MaxQueueWaitTime:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.MaxQueueWaitTime), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
+		`MaxTotalTime:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.MaxTotalTime), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -364,6 +788,482 @@ func (m *Stats) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FetchedDataBytes", wireType)
+			}
+			m.FetchedDataBytes = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.FetchedDataBytes |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ExtraFields", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStats
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthStats
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.ExtraFields == nil {
+				m.ExtraFields = make(map[string]string)
+			}
+			var mapkey string
+			var mapvalue string
+			for iNdEx < postIndex {
+				entryPreIndex := iNdEx
+				var wire uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowStats
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					wire |= uint64(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				fieldNum := int32(wire >> 3)
+				if fieldNum == 1 {
+					var stringLenmapkey uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowStats
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						stringLenmapkey |= uint64(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					intStringLenmapkey := int(stringLenmapkey)
+					if intStringLenmapkey < 0 {
+						return ErrInvalidLengthStats
+					}
+					postStringIndexmapkey := iNdEx + intStringLenmapkey
+					if postStringIndexmapkey < 0 {
+						return ErrInvalidLengthStats
+					}
+					if postStringIndexmapkey > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapkey = string(dAtA[iNdEx:postStringIndexmapkey])
+					iNdEx = postStringIndexmapkey
+				} else if fieldNum == 2 {
+					var stringLenmapvalue uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowStats
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						stringLenmapvalue |= uint64(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					intStringLenmapvalue := int(stringLenmapvalue)
+					if intStringLenmapvalue < 0 {
+						return ErrInvalidLengthStats
+					}
+					postStringIndexmapvalue := iNdEx + intStringLenmapvalue
+					if postStringIndexmapvalue < 0 {
+						return ErrInvalidLengthStats
+					}
+					if postStringIndexmapvalue > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapvalue = string(dAtA[iNdEx:postStringIndexmapvalue])
+					iNdEx = postStringIndexmapvalue
+				} else {
+					iNdEx = entryPreIndex
+					skippy, err := skipStats(dAtA[iNdEx:])
+					if err != nil {
+						return err
+					}
+					if skippy < 0 {
+						return ErrInvalidLengthStats
+					}
+					if (iNdEx + skippy) > postIndex {
+						return io.ErrUnexpectedEOF
+					}
+					iNdEx += skippy
+				}
+			}
+			m.ExtraFields[mapkey] = mapvalue
+			iNdEx = postIndex
+		case 6:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FetchedChunksCount", wireType)
+			}
+			m.FetchedChunksCount = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.FetchedChunksCount |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FetchedSamplesCount", wireType)
+			}
+			m.FetchedSamplesCount = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.FetchedSamplesCount |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field LimitHit", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthStats
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthStats
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.LimitHit = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 9:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SplitQueries", wireType)
+			}
+			m.SplitQueries = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.SplitQueries |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 10:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field QueryStorageWallTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStats
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthStats
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := github_com_gogo_protobuf_types.StdDurationUnmarshal(&m.QueryStorageWallTime, dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 11:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StoreGatewayTouchedPostingsCount", wireType)
+			}
+			m.StoreGatewayTouchedPostingsCount = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.StoreGatewayTouchedPostingsCount |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 12:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StoreGatewayTouchedPostingBytes", wireType)
+			}
+			m.StoreGatewayTouchedPostingBytes = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.StoreGatewayTouchedPostingBytes |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 13:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ScannedSamples", wireType)
+			}
+			m.ScannedSamples = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ScannedSamples |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 14:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PeakSamples", wireType)
+			}
+			m.PeakSamples = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.PeakSamples |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 15:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MaxFetchTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStats
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthStats
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := github_com_gogo_protobuf_types.StdDurationUnmarshal(&m.MaxFetchTime, dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 16:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MaxEvalTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStats
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthStats
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := github_com_gogo_protobuf_types.StdDurationUnmarshal(&m.MaxEvalTime, dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 17:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MaxQueueWaitTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStats
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthStats
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := github_com_gogo_protobuf_types.StdDurationUnmarshal(&m.MaxQueueWaitTime, dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 18:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MaxTotalTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStats
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStats
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthStats
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := github_com_gogo_protobuf_types.StdDurationUnmarshal(&m.MaxTotalTime, dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipStats(dAtA[iNdEx:])

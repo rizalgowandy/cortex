@@ -1,9 +1,10 @@
-// +build requires_docker
+//go:build requires_docker
 
 package integration
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -37,7 +38,13 @@ func TestGettingStartedSingleProcessConfigWithBlocksStorage(t *testing.T) {
 		"-blocks-storage.s3.bucket-name":       bucketName,
 		"-blocks-storage.s3.endpoint":          fmt.Sprintf("%s-minio-9000:9000", networkName),
 		"-blocks-storage.s3.insecure":          "true",
+		// alert manager
+		"-alertmanager.web.external-url":   "http://localhost/alertmanager",
+		"-alertmanager-storage.backend":    "local",
+		"-alertmanager-storage.local.path": filepath.Join(e2e.ContainerSharedDir, "alertmanager_configs"),
 	}
+	// make alert manager config dir
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
 
 	cortex := e2ecortex.NewSingleBinaryWithConfigFile("cortex-1", cortexConfigFile, flags, "", 9009, 9095)
 	require.NoError(t, s.StartAndWaitReady(cortex))
@@ -65,7 +72,7 @@ func TestGettingStartedSingleProcessConfigWithBlocksStorage(t *testing.T) {
 
 	labelNames, err := c.LabelNames(time.Time{}, time.Time{})
 	require.NoError(t, err)
-	require.Equal(t, []string{"__name__", "foo"}, labelNames)
+	require.Equal(t, model.LabelNames{"__name__", "foo"}, labelNames)
 
 	// Check that a range query does not return an error to sanity check the queryrange tripperware.
 	_, err = c.QueryRange("series_1", now.Add(-15*time.Minute), now, 15*time.Second)

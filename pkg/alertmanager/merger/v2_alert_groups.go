@@ -4,7 +4,7 @@ import (
 	"errors"
 	"sort"
 
-	"github.com/go-openapi/swag"
+	"github.com/go-openapi/swag/jsonutils"
 	v2 "github.com/prometheus/alertmanager/api/v2"
 	v2_models "github.com/prometheus/alertmanager/api/v2/models"
 	prom_model "github.com/prometheus/common/model"
@@ -20,7 +20,7 @@ func (V2AlertGroups) MergeResponses(in [][]byte) ([]byte, error) {
 	groups := make(v2_models.AlertGroups, 0)
 	for _, body := range in {
 		parsed := make(v2_models.AlertGroups, 0)
-		if err := swag.ReadJSON(body, &parsed); err != nil {
+		if err := jsonutils.ReadJSON(body, &parsed); err != nil {
 			return nil, err
 		}
 		groups = append(groups, parsed...)
@@ -31,7 +31,7 @@ func (V2AlertGroups) MergeResponses(in [][]byte) ([]byte, error) {
 		return nil, err
 	}
 
-	return swag.WriteJSON(merged)
+	return jsonutils.WriteJSON(merged)
 }
 
 func mergeV2AlertGroups(in v2_models.AlertGroups) (v2_models.AlertGroups, error) {
@@ -76,16 +76,20 @@ func mergeV2AlertGroups(in v2_models.AlertGroups) (v2_models.AlertGroups, error)
 // getGroupKey returns an identity for a group which can be used to match it against other groups.
 // Only the receiver name is necessary to ensure grouping by receiver, and for the labels, we again
 // use the same method for matching the group labels as used internally, generating the fingerprint.
+// Route labels are part of the key because Alertmanager keeps one group per route: two routes
+// sharing a receiver and group labels but with different route labels must stay separate.
 func getGroupKey(group *v2_models.AlertGroup) groupKey {
 	return groupKey{
-		fingerprint: prom_model.LabelsToSignature(group.Labels),
-		receiver:    *group.Receiver.Name,
+		fingerprint:      prom_model.LabelsToSignature(group.Labels),
+		routeFingerprint: prom_model.LabelsToSignature(group.RouteLabels),
+		receiver:         *group.Receiver.Name,
 	}
 }
 
 type groupKey struct {
-	fingerprint uint64
-	receiver    string
+	fingerprint      uint64
+	routeFingerprint uint64
+	receiver         string
 }
 
 // byGroup implements the ordering of Alertmanager dispatch.AlertGroups on the OpenAPI type.
@@ -97,6 +101,11 @@ func (ag byGroup) Less(i, j int) bool {
 	jLabels := v2.APILabelSetToModelLabelSet(ag[j].Labels)
 
 	if iLabels.Equal(jLabels) {
+		if *ag[i].Receiver.Name == *ag[j].Receiver.Name {
+			iRouteLabels := v2.APILabelSetToModelLabelSet(ag[i].RouteLabels)
+			jRouteLabels := v2.APILabelSetToModelLabelSet(ag[j].RouteLabels)
+			return iRouteLabels.Before(jRouteLabels)
+		}
 		return *ag[i].Receiver.Name < *ag[j].Receiver.Name
 	}
 	return iLabels.Before(jLabels)

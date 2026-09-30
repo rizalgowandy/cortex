@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -42,7 +41,7 @@ func main() {
 	}
 
 	if configFilename != "" {
-		buf, err := ioutil.ReadFile(configFilename)
+		buf, err := os.ReadFile(configFilename)
 		if err != nil {
 			fatal("failed to load config file from %s: %v", configFilename, err)
 		}
@@ -60,7 +59,7 @@ func main() {
 
 	converter, err := thanosconvert.NewThanosBlockConverter(ctx, cfg, dryRun, logger)
 	if err != nil {
-		fatal("couldn't initilize converter: %v", err)
+		fatal("couldn't initialize converter: %v", err)
 	}
 
 	iterCtx := context.Background()
@@ -80,7 +79,7 @@ func main() {
 
 }
 
-func fatal(msg string, args ...interface{}) {
+func fatal(msg string, args ...any) {
 	fmt.Fprintf(os.Stderr, msg+"\n", args...)
 	os.Exit(1)
 }

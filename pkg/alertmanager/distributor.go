@@ -2,8 +2,7 @@ package alertmanager
 
 import (
 	"context"
-	"hash/fnv"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net/http"
 	"path"
@@ -12,9 +11,6 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/ring"
-	"github.com/grafana/dskit/ring/client"
-	"github.com/grafana/dskit/services"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,9 +18,12 @@ import (
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/merger"
-	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/util"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 // Distributor forwards requests to individual alertmanagers.
@@ -37,12 +36,12 @@ type Distributor struct {
 
 	alertmanagerRing        ring.ReadRing
 	alertmanagerClientsPool ClientsPool
-
-	logger log.Logger
+	ringConfig              RingConfig
+	logger                  log.Logger
 }
 
 // NewDistributor constructs a new Distributor
-func NewDistributor(cfg ClientConfig, maxRecvMsgSize int64, alertmanagersRing *ring.Ring, alertmanagerClientsPool ClientsPool, logger log.Logger, reg prometheus.Registerer) (d *Distributor, err error) {
+func NewDistributor(cfg ClientConfig, maxRecvMsgSize int64, alertmanagersRing *ring.Ring, alertmanagerClientsPool ClientsPool, ringConfig RingConfig, logger log.Logger, reg prometheus.Registerer) (d *Distributor, err error) {
 	if alertmanagerClientsPool == nil {
 		alertmanagerClientsPool = newAlertmanagerClientsPool(client.NewRingServiceDiscovery(alertmanagersRing), cfg, logger, reg)
 	}
@@ -53,6 +52,7 @@ func NewDistributor(cfg ClientConfig, maxRecvMsgSize int64, alertmanagersRing *r
 		maxRecvMsgSize:          maxRecvMsgSize,
 		alertmanagerRing:        alertmanagersRing,
 		alertmanagerClientsPool: alertmanagerClientsPool,
+		ringConfig:              ringConfig,
 	}
 
 	d.Service = services.NewBasicService(nil, d.running, nil)
@@ -63,13 +63,6 @@ func (d *Distributor) running(ctx context.Context) error {
 	<-ctx.Done()
 	d.requestsInFlight.Wait()
 	return nil
-}
-
-// IsPathSupported returns true if the given route is currently supported by the Distributor.
-func (d *Distributor) IsPathSupported(p string) bool {
-	// API can be found at https://petstore.swagger.io/?url=https://raw.githubusercontent.com/prometheus/alertmanager/master/api/v2/openapi.yaml.
-	isQuorumReadPath, _ := d.isQuorumReadPath(p)
-	return d.isQuorumWritePath(p) || d.isUnaryWritePath(p) || d.isUnaryDeletePath(p) || d.isUnaryReadPath(p) || isQuorumReadPath
 }
 
 func (d *Distributor) isQuorumWritePath(p string) bool {
@@ -85,20 +78,11 @@ func (d *Distributor) isUnaryDeletePath(p string) bool {
 }
 
 func (d *Distributor) isQuorumReadPath(p string) (bool, merger.Merger) {
-	if strings.HasSuffix(p, "/v1/alerts") {
-		return true, merger.V1Alerts{}
-	}
 	if strings.HasSuffix(p, "/v2/alerts") {
 		return true, merger.V2Alerts{}
 	}
 	if strings.HasSuffix(p, "/v2/alerts/groups") {
 		return true, merger.V2AlertGroups{}
-	}
-	if strings.HasSuffix(p, "/v1/silences") {
-		return true, merger.V1Silences{}
-	}
-	if strings.HasSuffix(path.Dir(p), "/v1/silence") {
-		return true, merger.V1SilenceID{}
 	}
 	if strings.HasSuffix(p, "/v2/silences") {
 		return true, merger.V2Silences{}
@@ -109,22 +93,22 @@ func (d *Distributor) isQuorumReadPath(p string) (bool, merger.Merger) {
 	return false, nil
 }
 
-func (d *Distributor) isUnaryReadPath(p string) bool {
-	return strings.HasSuffix(p, "/status") ||
-		strings.HasSuffix(p, "/receivers")
-}
-
 // DistributeRequest shards the writes and returns as soon as the quorum is satisfied.
 // In case of reads, it proxies the request to one of the alertmanagers.
 // DistributeRequest assumes that the caller has verified IsPathSupported returns
 // true for the route.
-func (d *Distributor) DistributeRequest(w http.ResponseWriter, r *http.Request) {
+func (d *Distributor) DistributeRequest(w http.ResponseWriter, r *http.Request, allowedTenants *users.AllowedTenants) {
 	d.requestsInFlight.Add(1)
 	defer d.requestsInFlight.Done()
 
-	userID, err := tenant.TenantID(r.Context())
+	userID, err := users.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if !allowedTenants.IsAllowed(userID) {
+		http.Error(w, "Tenant is not allowed", http.StatusUnauthorized)
 		return
 	}
 
@@ -151,10 +135,8 @@ func (d *Distributor) DistributeRequest(w http.ResponseWriter, r *http.Request) 
 			d.doQuorum(userID, w, r, logger, m)
 			return
 		}
-		if d.isUnaryReadPath(r.URL.Path) {
-			d.doUnary(userID, w, r, logger)
-			return
-		}
+		d.doUnary(userID, w, r, logger)
+		return
 	}
 
 	http.Error(w, "route not supported by distributor", http.StatusNotFound)
@@ -164,7 +146,7 @@ func (d *Distributor) doQuorum(userID string, w http.ResponseWriter, r *http.Req
 	var body []byte
 	var err error
 	if r.Body != nil {
-		body, err = ioutil.ReadAll(http.MaxBytesReader(w, r.Body, d.maxRecvMsgSize))
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, d.maxRecvMsgSize))
 		if err != nil {
 			if util.IsRequestBodyTooLarge(err) {
 				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
@@ -179,9 +161,9 @@ func (d *Distributor) doQuorum(userID string, w http.ResponseWriter, r *http.Req
 	var responses []*httpgrpc.HTTPResponse
 	var responsesMtx sync.Mutex
 	grpcHeaders := httpToHttpgrpcHeaders(r.Header)
-	err = ring.DoBatch(r.Context(), RingOp, d.alertmanagerRing, []uint32{shardByUser(userID)}, func(am ring.InstanceDesc, _ []int) error {
+	err = ring.DoBatch(r.Context(), getRingOp(d.ringConfig.DisableReplicaSetExtension), d.alertmanagerRing, nil, []uint32{users.ShardByUser(userID)}, func(am ring.InstanceDesc, _ []int) error {
 		// Use a background context to make sure all alertmanagers get the request even if we return early.
-		localCtx := user.InjectOrgID(context.Background(), userID)
+		localCtx := opentracing.ContextWithSpan(user.InjectOrgID(context.Background(), userID), opentracing.SpanFromContext(r.Context()))
 		sp, localCtx := opentracing.StartSpanFromContext(localCtx, "Distributor.doQuorum")
 		defer sp.Finish()
 
@@ -225,15 +207,15 @@ func (d *Distributor) doQuorum(userID string, w http.ResponseWriter, r *http.Req
 }
 
 func (d *Distributor) doUnary(userID string, w http.ResponseWriter, r *http.Request, logger log.Logger) {
-	key := shardByUser(userID)
-	replicationSet, err := d.alertmanagerRing.Get(key, RingOp, nil, nil, nil)
+	key := users.ShardByUser(userID)
+	replicationSet, err := d.alertmanagerRing.Get(key, getRingOp(d.ringConfig.DisableReplicaSetExtension), nil, nil, nil)
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to get replication set from the ring", "err", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	body, err := ioutil.ReadAll(http.MaxBytesReader(w, r.Body, d.maxRecvMsgSize))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, d.maxRecvMsgSize))
 	if err != nil {
 		if util.IsRequestBodyTooLarge(err) {
 			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
@@ -254,14 +236,36 @@ func (d *Distributor) doUnary(userID string, w http.ResponseWriter, r *http.Requ
 	defer sp.Finish()
 	// Until we have a mechanism to combine the results from multiple alertmanagers,
 	// we forward the request to only only of the alertmanagers.
-	amDesc := replicationSet.Instances[rand.Intn(len(replicationSet.Instances))]
-	resp, err := d.doRequest(ctx, amDesc, req)
-	if err != nil {
-		respondFromError(err, w, logger)
-		return
+
+	var instances []ring.InstanceDesc
+	if req.GetMethod() == "GET" || req.GetMethod() == "DELETE" {
+		instances = replicationSet.Instances
+		// Randomize the list of instances to not always query the same one.
+		rand.Shuffle(len(instances), func(i, j int) {
+			instances[i], instances[j] = instances[j], instances[i]
+		})
+	} else {
+		//Picking 1 instance at Random for Non-Get and Non-Delete Unary Read requests, as shuffling through large number of instances might increase complexity
+		randN := rand.Intn(len(replicationSet.Instances))
+		instances = replicationSet.Instances[randN : randN+1]
 	}
 
-	respondFromHTTPGRPCResponse(w, resp)
+	var lastErr error
+	for _, instance := range instances {
+		resp, err := d.doRequest(ctx, instance, req)
+		// storing the last error message
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// Return on the first succeeded request
+		respondFromHTTPGRPCResponse(w, resp)
+		return
+	}
+	// throwing the last error if the for loop finish without succeeding
+	if lastErr != nil {
+		respondFromError(lastErr, w, logger)
+	}
 }
 
 func respondFromError(err error, w http.ResponseWriter, logger log.Logger) {
@@ -293,13 +297,6 @@ func (d *Distributor) doRequest(ctx context.Context, am ring.InstanceDesc, req *
 	}
 
 	return amClient.HandleRequest(ctx, req)
-}
-
-func shardByUser(userID string) uint32 {
-	ringHasher := fnv.New32a()
-	// Hasher never returns err.
-	_, _ = ringHasher.Write([]byte(userID))
-	return ringHasher.Sum32()
 }
 
 func httpToHttpgrpcHeaders(hs http.Header) []*httpgrpc.Header {

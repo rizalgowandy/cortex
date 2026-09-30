@@ -17,15 +17,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	commoncfg "github.com/prometheus/common/config"
 
 	"github.com/prometheus/alertmanager/config"
@@ -38,7 +39,7 @@ import (
 type Notifier struct {
 	conf   *config.WechatConfig
 	tmpl   *template.Template
-	logger log.Logger
+	logger *slog.Logger
 	client *http.Client
 
 	accessToken   string
@@ -66,13 +67,13 @@ type weChatMessageContent struct {
 }
 
 type weChatResponse struct {
-	Code  int    `json:"code"`
-	Error string `json:"error"`
+	Code  int    `json:"errcode"`
+	Error string `json:"errmsg"`
 }
 
 // New returns a new Wechat notifier.
-func New(c *config.WechatConfig, t *template.Template, l log.Logger, httpOpts ...commoncfg.HTTPClientOption) (*Notifier, error) {
-	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "wechat", append(httpOpts, commoncfg.WithHTTP2Disabled())...)
+func New(c *config.WechatConfig, t *template.Template, l *slog.Logger, httpOpts ...commoncfg.HTTPClientOption) (*Notifier, error) {
+	client, err := notify.NewClientWithTracing(*c.HTTPConfig, "wechat", httpOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -87,8 +88,10 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		return false, err
 	}
 
-	level.Debug(n.logger).Log("incident", key)
-	data := notify.GetTemplateData(ctx, n.tmpl, as, n.logger)
+	logger := n.logger.With("group_key", key)
+	logger.Debug("extracted group key")
+
+	data := notify.GetTemplateData(ctx, n.tmpl, as, logger)
 
 	tmpl := notify.TmplText(n.tmpl, data, &err)
 	if err != nil {
@@ -98,24 +101,21 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	// Refresh AccessToken over 2 hours
 	if n.accessToken == "" || time.Since(n.accessTokenAt) > 2*time.Hour {
 		parameters := url.Values{}
-		parameters.Add("corpsecret", tmpl(string(n.conf.APISecret)))
+		apiSecret, err := n.getApiSecret()
+		if err != nil {
+			return false, err
+		}
+		parameters.Add("corpsecret", tmpl(apiSecret))
 		parameters.Add("corpid", tmpl(string(n.conf.CorpID)))
 		if err != nil {
-			return false, fmt.Errorf("templating error: %s", err)
+			return false, fmt.Errorf("templating error: %w", err)
 		}
 
 		u := n.conf.APIURL.Copy()
 		u.Path += "gettoken"
 		u.RawQuery = parameters.Encode()
 
-		req, err := http.NewRequest(http.MethodGet, u.String(), nil)
-		if err != nil {
-			return true, err
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := n.client.Do(req.WithContext(ctx))
+		resp, err := notify.Get(ctx, n.client, u.String())
 		if err != nil {
 			return true, notify.RedactURL(err)
 		}
@@ -154,7 +154,7 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		}
 	}
 	if err != nil {
-		return false, fmt.Errorf("templating error: %s", err)
+		return false, fmt.Errorf("templating error: %w", err)
 	}
 
 	var buf bytes.Buffer
@@ -168,26 +168,21 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	q.Set("access_token", n.accessToken)
 	postMessageURL.RawQuery = q.Encode()
 
-	req, err := http.NewRequest(http.MethodPost, postMessageURL.String(), &buf)
-	if err != nil {
-		return true, err
-	}
-
-	resp, err := n.client.Do(req.WithContext(ctx))
+	resp, err := notify.PostJSON(ctx, n.client, postMessageURL.String(), &buf)
 	if err != nil {
 		return true, notify.RedactURL(err)
 	}
 	defer notify.Drain(resp)
 
 	if resp.StatusCode != 200 {
-		return true, fmt.Errorf("unexpected status code %v", resp.StatusCode)
+		return true, notify.NewErrorWithReason(notify.GetFailureReasonFromStatusCode(resp.StatusCode), fmt.Errorf("unexpected status code %v", resp.StatusCode))
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return true, err
 	}
-	level.Debug(n.logger).Log("response", string(body), "incident", key)
+	logger.Debug(string(body))
 
 	var weResp weChatResponse
 	if err := json.Unmarshal(body, &weResp); err != nil {
@@ -206,4 +201,15 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	}
 
 	return false, errors.New(weResp.Error)
+}
+
+func (n *Notifier) getApiSecret() (string, error) {
+	if len(n.conf.APISecretFile) > 0 {
+		content, err := os.ReadFile(n.conf.APISecretFile)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(content)), nil
+	}
+	return string(n.conf.APISecret), nil
 }

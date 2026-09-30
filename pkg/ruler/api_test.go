@@ -4,29 +4,259 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
-	"github.com/grafana/dskit/services"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
+	util_api "github.com/cortexproject/cortex/pkg/util/api"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
-func TestRuler_rules(t *testing.T) {
-	cfg, cleanup := defaultRulerConfig(t, newMockRuleStore(mockRules))
-	defer cleanup()
+func TestAPIResponseSerialization(t *testing.T) {
+	lastEvalTime := time.Now()
+	responseTime := lastEvalTime.Format(time.RFC3339Nano)
+	testCases := map[string]struct {
+		rules        RuleDiscovery
+		expectedJSON string
+	}{
+		"No rules": {
+			rules: RuleDiscovery{
+				RuleGroups: make([]*RuleGroup, 0),
+			},
+			expectedJSON: `{
+				"groups":[]
+			}`,
+		},
+		"Rules with no next token": {
+			rules: RuleDiscovery{
+				RuleGroups: []*RuleGroup{
+					{
+						Name:           "Test",
+						File:           "/rules/Test",
+						Rules:          make([]rule, 0),
+						Interval:       60,
+						LastEvaluation: lastEvalTime,
+						EvaluationTime: 10,
+						Limit:          0,
+					},
+				},
+			},
+			expectedJSON: fmt.Sprintf(`{
+				"groups": [
+					{
+						"evaluationTime": 10,
+						"limit": 0,
+						"name": "Test",
+						"file": "/rules/Test",
+						"interval": 60,
+						"rules": [],
+						"lastEvaluation": "%s"
+					}
+				]
+			}`, responseTime),
+		},
+		"Rules with next token": {
+			rules: RuleDiscovery{
+				RuleGroups: []*RuleGroup{
+					{
+						Name:           "Test",
+						File:           "/rules/Test",
+						Rules:          make([]rule, 0),
+						Interval:       60,
+						LastEvaluation: lastEvalTime,
+						EvaluationTime: 10,
+						Limit:          0,
+					},
+				},
+				GroupNextToken: "abcdef",
+			},
+			expectedJSON: fmt.Sprintf(`{
+				"groups": [
+					{
+						"evaluationTime": 10,
+						"limit": 0,
+						"name": "Test",
+						"file": "/rules/Test",
+						"interval": 60,
+						"rules": [],
+						"lastEvaluation": "%s"
+					}
+				],
+				"groupNextToken": "abcdef"
+			}`, responseTime),
+		},
+	}
 
-	r, rcleanup := newTestRuler(t, cfg, nil)
-	defer rcleanup()
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			data, err := json.Marshal(&tc.rules)
+			require.NoError(t, err)
+			require.JSONEq(t, tc.expectedJSON, string(data))
+		})
+	}
+}
+
+func Test_stripEvaluationFields(t *testing.T) {
+	input := `
+{
+    "data": {
+        "groups": [
+            {
+                "evaluationTime": 0.00119525,
+                "file": ")(_+?/|namespace1+/?",
+                "interval": 10,
+                "lastEvaluation": "2025-01-24T12:04:26.440399-08:00",
+                "limit": 0,
+                "name": ")(_+?/|group1+/?",
+                "rules": [
+                    {
+                        "evaluationTime": 0.000976083,
+                        "health": "ok",
+                        "labels": {},
+                        "lastError": "",
+                        "lastEvaluation": "2025-01-24T12:04:26.440437-08:00",
+                        "name": "UP_RULE",
+                        "query": "up",
+                        "type": "recording"
+                    },
+                    {
+                        "alerts": [],
+                        "annotations": {},
+                        "duration": 0,
+                        "evaluationTime": 0.000172375,
+                        "health": "ok",
+                        "keepFiringFor": 0,
+                        "labels": {},
+                        "lastError": "",
+                        "lastEvaluation": "2025-01-24T12:04:26.441418-08:00",
+                        "name": "UP_ALERT",
+                        "query": "up < 1",
+                        "state": "unknown",
+                        "type": "alerting"
+                    }
+                ]
+            }
+        ]
+    },
+    "status": "success"
+}`
+	inputResponse := util_api.Response{}
+	err := json.Unmarshal([]byte(input), &inputResponse)
+	require.NoError(t, err)
+	stripEvaluationFields(t, inputResponse)
+	output, err := json.Marshal(inputResponse)
+	require.NoError(t, err)
+
+	expected := `
+{
+    "data": {
+        "groups": [
+            {
+                "evaluationTime": 0,
+                "file": ")(_+?/|namespace1+/?",
+                "interval": 10,
+                "lastEvaluation": "0001-01-01T00:00:00Z",
+                "limit": 0,
+                "name": ")(_+?/|group1+/?",
+                "rules": [
+                    {
+                        "evaluationTime": 0,
+                        "health": "unknown",
+                        "labels": {},
+                        "lastError": "",
+                        "lastEvaluation": "0001-01-01T00:00:00Z",
+                        "name": "UP_RULE",
+                        "query": "up",
+                        "type": "recording"
+                    },
+                    {
+                        "alerts": [],
+                        "annotations": {},
+                        "duration": 0,
+                        "evaluationTime": 0,
+                        "health": "unknown",
+                        "keepFiringFor": 0,
+                        "labels": {},
+                        "lastError": "",
+                        "lastEvaluation": "0001-01-01T00:00:00Z",
+                        "name": "UP_ALERT",
+                        "query": "up < 1",
+                        "state": "unknown",
+                        "type": "alerting"
+                    }
+                ]
+            }
+        ]
+    },
+    "status": "success"
+}`
+
+	require.JSONEq(t, expected, string(output))
+}
+
+// stripEvaluationFields sets evaluation-related fields of a rules API response to zero values.
+func stripEvaluationFields(t *testing.T, r util_api.Response) {
+	dataMap, ok := r.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map[string]interface{} got %T", r.Data)
+	}
+
+	groups, ok := dataMap["groups"].([]any)
+	if !ok {
+		t.Fatalf("expected []interface{} got %T", dataMap["groups"])
+	}
+
+	for i := range groups {
+		group, ok := groups[i].(map[string]any)
+		if !ok {
+			t.Fatalf("expected map[string]interface{} got %T", groups[i])
+		}
+		group["evaluationTime"] = 0
+		group["lastEvaluation"] = "0001-01-01T00:00:00Z"
+
+		rules, ok := group["rules"].([]any)
+		if !ok {
+			t.Fatalf("expected []interface{} got %T", group["rules"])
+		}
+
+		for i := range rules {
+			rule, ok := rules[i].(map[string]any)
+			if !ok {
+				t.Fatalf("expected map[string]interface{} got %T", rules[i])
+			}
+			rule["health"] = "unknown"
+			rule["evaluationTime"] = 0
+			rule["lastEvaluation"] = "0001-01-01T00:00:00Z"
+			// Normalize alert state to avoid flakiness due to evaluation timing.
+			if rule["type"] == "alerting" {
+				rule["state"] = "unknown"
+			}
+			rules[i] = rule
+		}
+		group["rules"] = rules
+		groups[i] = group
+	}
+
+	dataMap["groups"] = groups
+	r.Data = dataMap
+}
+
+func TestRuler_rules(t *testing.T) {
+	store := newMockRuleStore(mockRules, nil)
+	cfg := defaultRulerConfig(t)
+
+	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
 
 	a := NewAPI(r, r.store, log.NewNopLogger())
@@ -36,17 +266,20 @@ func TestRuler_rules(t *testing.T) {
 	a.PrometheusRules(w, req)
 
 	resp := w.Result()
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 
 	// Check status code and status response
-	responseJSON := response{}
+	responseJSON := util_api.Response{}
 	err := json.Unmarshal(body, &responseJSON)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, responseJSON.Status, "success")
+	stripEvaluationFields(t, responseJSON)
+	actual, err := json.Marshal(responseJSON)
+	require.NoError(t, err)
 
 	// Testing the running rules for user1 in the mock store
-	expectedResponse, _ := json.Marshal(response{
+	expectedResponse, _ := json.Marshal(util_api.Response{
 		Status: "success",
 		Data: &RuleDiscovery{
 			RuleGroups: []*RuleGroup{
@@ -63,27 +296,26 @@ func TestRuler_rules(t *testing.T) {
 						&alertingRule{
 							Name:   "UP_ALERT",
 							Query:  "up < 1",
-							State:  "inactive",
+							State:  "unknown",
 							Health: "unknown",
 							Type:   "alerting",
 							Alerts: []*Alert{},
 						},
 					},
-					Interval: 60,
+					Interval: 10,
 				},
 			},
 		},
 	})
 
-	require.Equal(t, string(expectedResponse), string(body))
+	require.JSONEq(t, string(expectedResponse), string(actual))
 }
 
 func TestRuler_rules_special_characters(t *testing.T) {
-	cfg, cleanup := defaultRulerConfig(t, newMockRuleStore(mockSpecialCharRules))
-	defer cleanup()
+	store := newMockRuleStore(mockSpecialCharRules, nil)
+	cfg := defaultRulerConfig(t)
 
-	r, rcleanup := newTestRuler(t, cfg, nil)
-	defer rcleanup()
+	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
 
 	a := NewAPI(r, r.store, log.NewNopLogger())
@@ -93,17 +325,20 @@ func TestRuler_rules_special_characters(t *testing.T) {
 	a.PrometheusRules(w, req)
 
 	resp := w.Result()
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 
 	// Check status code and status response
-	responseJSON := response{}
+	responseJSON := util_api.Response{}
 	err := json.Unmarshal(body, &responseJSON)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, responseJSON.Status, "success")
+	stripEvaluationFields(t, responseJSON)
+	actual, err := json.Marshal(responseJSON)
+	require.NoError(t, err)
 
 	// Testing the running rules for user1 in the mock store
-	expectedResponse, _ := json.Marshal(response{
+	expectedResponse, _ := json.Marshal(util_api.Response{
 		Status: "success",
 		Data: &RuleDiscovery{
 			RuleGroups: []*RuleGroup{
@@ -120,27 +355,212 @@ func TestRuler_rules_special_characters(t *testing.T) {
 						&alertingRule{
 							Name:   "UP_ALERT",
 							Query:  "up < 1",
-							State:  "inactive",
+							State:  "unknown",
 							Health: "unknown",
 							Type:   "alerting",
 							Alerts: []*Alert{},
 						},
 					},
-					Interval: 60,
+					Interval: 10,
 				},
 			},
 		},
 	})
+	require.JSONEq(t, string(expectedResponse), string(actual))
+}
 
-	require.Equal(t, string(expectedResponse), string(body))
+func TestRuler_rules_limit(t *testing.T) {
+	store := newMockRuleStore(mockRulesLimit, nil)
+	cfg := defaultRulerConfig(t)
+
+	r := newTestRuler(t, cfg, store, nil)
+	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+	a := NewAPI(r, r.store, log.NewNopLogger())
+
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/api/prom/api/v1/rules", nil, "user1")
+	w := httptest.NewRecorder()
+	a.PrometheusRules(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+	// Check status code and status response
+	responseJSON := util_api.Response{}
+	err := json.Unmarshal(body, &responseJSON)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, responseJSON.Status, "success")
+	stripEvaluationFields(t, responseJSON)
+	actual, err := json.Marshal(responseJSON)
+	require.NoError(t, err)
+
+	// Testing the running rules for user1 in the mock store
+	expectedResponse, _ := json.Marshal(util_api.Response{
+		Status: "success",
+		Data: &RuleDiscovery{
+			RuleGroups: []*RuleGroup{
+				{
+					Name:  "group1",
+					File:  "namespace1",
+					Limit: 5,
+					Rules: []rule{
+						&recordingRule{
+							Name:   "UP_RULE",
+							Query:  "up",
+							Health: "unknown",
+							Type:   "recording",
+						},
+						&alertingRule{
+							Name:   "UP_ALERT",
+							Query:  "up < 1",
+							State:  "unknown",
+							Health: "unknown",
+							Type:   "alerting",
+							Alerts: []*Alert{},
+						},
+					},
+					Interval: 10,
+				},
+			},
+		},
+	})
+	require.JSONEq(t, string(expectedResponse), string(actual))
+}
+
+func TestRuler_rules_max_rules(t *testing.T) {
+	// mockRulesNamespaces gives user1 two groups of two rules each: namespace2/fail
+	// sorts before namespace1/group1 in rule group token order, so it is the group
+	// that survives truncation. Filters and pagination vary how many rules a single
+	// request returns.
+	for _, tc := range []struct {
+		name              string
+		rules             map[string]rulespb.RuleGroupList
+		userID            string
+		maxRules          uint
+		queryParams       string
+		expectedGroups    int
+		expectedRules     int
+		expectedNextToken string
+	}{
+		{
+			name:           "limit disabled returns every rule",
+			rules:          mockRulesNamespaces,
+			userID:         "user1",
+			maxRules:       0,
+			expectedGroups: 2,
+			expectedRules:  4,
+		},
+		{
+			name:           "count below the limit",
+			rules:          mockRulesNamespaces,
+			userID:         "user1",
+			maxRules:       10,
+			expectedGroups: 2,
+			expectedRules:  4,
+		},
+		{
+			name:           "count exactly at the limit",
+			rules:          mockRulesNamespaces,
+			userID:         "user1",
+			maxRules:       4,
+			expectedGroups: 2,
+			expectedRules:  4,
+		},
+		{
+			name:              "count over the limit is truncated, summed across groups",
+			rules:             mockRulesNamespaces,
+			userID:            "user1",
+			maxRules:          3,
+			expectedGroups:    1,
+			expectedRules:     2,
+			expectedNextToken: GetRuleGroupNextToken("namespace2", "fail"),
+		},
+		{
+			name:           "only the rules matching the filters are counted",
+			rules:          mockRulesNamespaces,
+			userID:         "user1",
+			maxRules:       3,
+			queryParams:    "?type=alert",
+			expectedGroups: 2,
+			expectedRules:  2,
+		},
+		{
+			name:              "paginating below the limit succeeds",
+			rules:             mockRulesNamespaces,
+			userID:            "user1",
+			maxRules:          3,
+			queryParams:       "?group_limit=1",
+			expectedGroups:    1,
+			expectedRules:     2,
+			expectedNextToken: GetRuleGroupNextToken("namespace2", "fail"),
+		},
+		{
+			// A rule group is indivisible, so the response is allowed to exceed the
+			// limit rather than return an unusable empty page. It is the only group, so
+			// there is nothing left to page to and no token is returned.
+			name:           "a lone rule group over the limit is returned whole",
+			rules:          mockRules,
+			userID:         "user1",
+			maxRules:       1,
+			expectedGroups: 1,
+			expectedRules:  2,
+		},
+		{
+			name:           "limit applies per request: tenant under the limit",
+			rules:          mockRules,
+			userID:         "user2",
+			maxRules:       1,
+			expectedGroups: 1,
+			expectedRules:  1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultRulerConfig(t)
+			cfg.ListRulesMaxRules = tc.maxRules
+
+			r := newTestRuler(t, cfg, newMockRuleStore(tc.rules, nil), nil)
+			defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+			a := NewAPI(r, r.store, log.NewNopLogger())
+
+			req := requestFor(t, http.MethodGet, "https://localhost:8080/api/prom/api/v1/rules"+tc.queryParams, nil, tc.userID)
+			w := httptest.NewRecorder()
+			a.PrometheusRules(w, req)
+
+			resp := w.Result()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			// util_api.Response holds Data as an any, so decode into a shape that
+			// exposes the rule groups directly.
+			parsed := struct {
+				Status    string        `json:"status"`
+				Data      RuleDiscovery `json:"data"`
+				ErrorType v1.ErrorType  `json:"errorType"`
+				Error     string        `json:"error"`
+			}{}
+			require.NoError(t, json.Unmarshal(body, &parsed))
+
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, "success", parsed.Status)
+			require.Empty(t, parsed.Error)
+			require.Len(t, parsed.Data.RuleGroups, tc.expectedGroups)
+
+			rulesCount := 0
+			for _, g := range parsed.Data.RuleGroups {
+				rulesCount += len(g.Rules)
+			}
+			require.Equal(t, tc.expectedRules, rulesCount)
+			require.Equal(t, tc.expectedNextToken, parsed.Data.GroupNextToken)
+		})
+	}
 }
 
 func TestRuler_alerts(t *testing.T) {
-	cfg, cleanup := defaultRulerConfig(t, newMockRuleStore(mockRules))
-	defer cleanup()
+	store := newMockRuleStore(mockRules, nil)
+	cfg := defaultRulerConfig(t)
 
-	r, rcleanup := newTestRuler(t, cfg, nil)
-	defer rcleanup()
+	r := newTestRuler(t, cfg, store, nil)
 	defer r.StopAsync()
 
 	a := NewAPI(r, r.store, log.NewNopLogger())
@@ -150,10 +570,10 @@ func TestRuler_alerts(t *testing.T) {
 	a.PrometheusAlerts(w, req)
 
 	resp := w.Result()
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 
 	// Check status code and status response
-	responseJSON := response{}
+	responseJSON := util_api.Response{}
 	err := json.Unmarshal(body, &responseJSON)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -161,7 +581,7 @@ func TestRuler_alerts(t *testing.T) {
 
 	// Currently there is not an easy way to mock firing alerts. The empty
 	// response case is tested instead.
-	expectedResponse, _ := json.Marshal(response{
+	expectedResponse, _ := json.Marshal(util_api.Response{
 		Status: "success",
 		Data: &AlertDiscovery{
 			Alerts: []*Alert{},
@@ -172,11 +592,10 @@ func TestRuler_alerts(t *testing.T) {
 }
 
 func TestRuler_Create(t *testing.T) {
-	cfg, cleanup := defaultRulerConfig(t, newMockRuleStore(make(map[string]rulespb.RuleGroupList)))
-	defer cleanup()
+	store := newMockRuleStore(make(map[string]rulespb.RuleGroupList), nil)
+	cfg := defaultRulerConfig(t)
 
-	r, rcleanup := newTestRuler(t, cfg, nil)
-	defer rcleanup()
+	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
 
 	a := NewAPI(r, r.store, log.NewNopLogger())
@@ -215,7 +634,7 @@ interval: 15s
 			err:    errors.New("invalid rules config: rule group 'rg_name' has no rules"),
 		},
 		{
-			name:   "with a a valid rules file",
+			name:   "with a valid rules file",
 			status: 202,
 			input: `
 name: test
@@ -232,6 +651,19 @@ rules:
     test: test
 `,
 			output: "name: test\ninterval: 15s\nrules:\n    - record: up_rule\n      expr: up{}\n    - alert: up_alert\n      expr: sum(up{}) > 1\n      for: 30s\n      labels:\n        test: test\n      annotations:\n        test: test\n",
+		},
+		{
+			name:   "with a valid rule query offset",
+			status: 202,
+			input: `
+name: test
+interval: 15s
+query_offset: 2m
+rules:
+- record: up_rule
+  expr: up{}
+`,
+			output: "name: test\ninterval: 15s\nquery_offset: 2m\nrules:\n    - record: up_rule\n      expr: up{}\n",
 		},
 	}
 
@@ -263,11 +695,10 @@ rules:
 }
 
 func TestRuler_DeleteNamespace(t *testing.T) {
-	cfg, cleanup := defaultRulerConfig(t, newMockRuleStore(mockRulesNamespaces))
-	defer cleanup()
+	store := newMockRuleStore(mockRulesNamespaces, nil)
+	cfg := defaultRulerConfig(t)
 
-	r, rcleanup := newTestRuler(t, cfg, nil)
-	defer rcleanup()
+	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
 
 	a := NewAPI(r, r.store, log.NewNopLogger())
@@ -282,7 +713,7 @@ func TestRuler_DeleteNamespace(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, "name: group1\ninterval: 1m\nrules:\n    - record: UP_RULE\n      expr: up\n    - alert: UP_ALERT\n      expr: up < 1\n", w.Body.String())
+	require.Equal(t, "name: group1\ninterval: 10s\nrules:\n    - record: UP_RULE\n      expr: up\n    - alert: UP_ALERT\n      expr: up < 1\n", w.Body.String())
 
 	// Delete namespace1
 	req = requestFor(t, http.MethodDelete, "https://localhost:8080/api/v1/rules/namespace1", nil, "user1")
@@ -290,7 +721,7 @@ func TestRuler_DeleteNamespace(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 	require.Equal(t, http.StatusAccepted, w.Code)
-	require.Equal(t, "{\"status\":\"success\",\"data\":null,\"errorType\":\"\",\"error\":\"\"}", w.Body.String())
+	require.Equal(t, "{\"status\":\"success\"}", w.Body.String())
 
 	// On Partial failures
 	req = requestFor(t, http.MethodDelete, "https://localhost:8080/api/v1/rules/namespace2", nil, "user1")
@@ -298,18 +729,17 @@ func TestRuler_DeleteNamespace(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 	require.Equal(t, http.StatusInternalServerError, w.Code)
-	require.Equal(t, "{\"status\":\"error\",\"data\":null,\"errorType\":\"server_error\",\"error\":\"unable to delete rg\"}", w.Body.String())
+	require.Equal(t, "{\"status\":\"error\",\"errorType\":\"server_error\",\"error\":\"unable to delete rg\"}", w.Body.String())
 }
 
 func TestRuler_LimitsPerGroup(t *testing.T) {
-	cfg, cleanup := defaultRulerConfig(t, newMockRuleStore(make(map[string]rulespb.RuleGroupList)))
-	defer cleanup()
+	store := newMockRuleStore(make(map[string]rulespb.RuleGroupList), nil)
+	cfg := defaultRulerConfig(t)
 
-	r, rcleanup := newTestRuler(t, cfg, nil)
-	defer rcleanup()
+	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
 
-	r.limits = ruleLimits{maxRuleGroups: 1, maxRulesPerRuleGroup: 1}
+	r.limits = &ruleLimits{maxRuleGroups: 1, maxRulesPerRuleGroup: 1}
 
 	a := NewAPI(r, r.store, log.NewNopLogger())
 
@@ -357,14 +787,13 @@ rules:
 }
 
 func TestRuler_RulerGroupLimits(t *testing.T) {
-	cfg, cleanup := defaultRulerConfig(t, newMockRuleStore(make(map[string]rulespb.RuleGroupList)))
-	defer cleanup()
+	store := newMockRuleStore(make(map[string]rulespb.RuleGroupList), nil)
+	cfg := defaultRulerConfig(t)
 
-	r, rcleanup := newTestRuler(t, cfg, nil)
-	defer rcleanup()
+	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
 
-	r.limits = ruleLimits{maxRuleGroups: 1, maxRulesPerRuleGroup: 1}
+	r.limits = &ruleLimits{maxRuleGroups: 1, maxRulesPerRuleGroup: 1}
 
 	a := NewAPI(r, r.store, log.NewNopLogger())
 
@@ -385,7 +814,7 @@ rules:
 - record: up_rule
   expr: up{}
 `,
-			output: "{\"status\":\"success\",\"data\":null,\"errorType\":\"\",\"error\":\"\"}",
+			output: "{\"status\":\"success\"}",
 		},
 		{
 			name:   "when exceeding the rule group limit after sending the first group",
@@ -418,6 +847,67 @@ rules:
 	}
 }
 
+func TestRuler_ProtoToRuleGroupYamlConvertion(t *testing.T) {
+	store := newMockRuleStore(make(map[string]rulespb.RuleGroupList), nil)
+	cfg := defaultRulerConfig(t)
+
+	r := newTestRuler(t, cfg, store, nil)
+	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+	a := NewAPI(r, r.store, log.NewNopLogger())
+
+	tc := []struct {
+		name   string
+		input  string
+		output string
+		err    error
+		status int
+	}{
+		{
+			name:   "when pushing group that can be safely converted from RuleGroupDesc to RuleGroup yaml",
+			status: 202,
+			input: `
+name: test_first_group_will_succeed
+interval: 15s
+rules:
+- record: up_rule
+  expr: |2+
+    up{}
+`,
+			output: "{\"status\":\"success\"}",
+		},
+		{
+			name:   "when pushing group that CANNOT be safely converted from RuleGroupDesc to RuleGroup yaml",
+			status: 400,
+			input: `
+name: test_first_group_will_succeed
+interval: 15s
+rules:
+- record: up_rule
+  expr: |2+
+
+    up{}
+`,
+			output: "unable to decoded rule group\n",
+		},
+	}
+
+	router := mux.NewRouter()
+	router.Path("/api/v1/rules/{namespace}").Methods("POST").HandlerFunc(a.CreateRuleGroup)
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			// POST
+			req := requestFor(t, http.MethodPost, "https://localhost:8080/api/v1/rules/namespace", strings.NewReader(tt.input), "user1")
+			w := httptest.NewRecorder()
+
+			router.ServeHTTP(w, req)
+			require.Equal(t, tt.status, w.Code)
+			require.Equal(t, tt.output, w.Body.String())
+		})
+	}
+}
+
 func requestFor(t *testing.T, method string, url string, body io.Reader, userID string) *http.Request {
 	t.Helper()
 
@@ -425,4 +915,133 @@ func requestFor(t *testing.T, method string, url string, body io.Reader, userID 
 	ctx := user.InjectOrgID(req.Context(), userID)
 
 	return req.WithContext(ctx)
+}
+
+func TestRuler_CreateFederated(t *testing.T) {
+	const federatedGroup = `
+name: test
+interval: 15s
+source_tenants: [team-b, team-a, team-b]
+rules:
+- record: up_rule
+  expr: sum by (__tenant_id__) (up)
+`
+	const plainGroup = `
+name: test
+interval: 15s
+rules:
+- record: up_rule
+  expr: up
+`
+
+	tc := []struct {
+		name   string
+		cfg    func(cfg *Config)
+		user   string
+		input  string
+		status int
+		err    string
+		output string
+	}{
+		{
+			name:   "federated rules disabled",
+			cfg:    func(*Config) {},
+			user:   "infra",
+			input:  federatedGroup,
+			status: 400,
+			err:    "federated rules are disabled\n",
+		},
+		{
+			name:   "plain group accepted when federated rules are disabled",
+			cfg:    func(*Config) {},
+			user:   "infra",
+			input:  plainGroup,
+			status: 202,
+			output: "name: test\ninterval: 15s\nrules:\n    - record: up_rule\n      expr: up\n",
+		},
+		{
+			name: "tenant not allowed",
+			cfg: func(cfg *Config) {
+				cfg.EnableFederatedRules = true
+				cfg.AllowedFederatedTenants = []string{"infra"}
+			},
+			user:   "team-a",
+			input:  federatedGroup,
+			status: 403,
+			err:    "tenant is not allowed to create federated rule groups: team-a\n",
+		},
+		{
+			name: "invalid source tenant",
+			cfg: func(cfg *Config) {
+				cfg.EnableFederatedRules = true
+			},
+			user:   "infra",
+			input:  strings.Replace(federatedGroup, "team-a", "team|a", 1),
+			status: 400,
+			err:    "invalid source tenant \"team|a\"",
+		},
+		{
+			name: "too many source tenants",
+			cfg: func(cfg *Config) {
+				cfg.EnableFederatedRules = true
+				cfg.TenantFederationMaxTenant = 1
+			},
+			user:   "infra",
+			input:  federatedGroup,
+			status: 400,
+			err:    "too many source tenants (limit: 1 actual: 2)\n",
+		},
+		{
+			name: "stored with normalized source tenants",
+			cfg: func(cfg *Config) {
+				cfg.EnableFederatedRules = true
+				cfg.AllowedFederatedTenants = []string{"infra"}
+			},
+			user:   "infra",
+			input:  federatedGroup,
+			status: 202,
+			output: "name: test\ninterval: 15s\nrules:\n    - record: up_rule\n      expr: sum by (__tenant_id__) (up)\nsource_tenants:\n    - team-a\n    - team-b\n",
+		},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newMockRuleStore(make(map[string]rulespb.RuleGroupList), nil)
+			cfg := defaultRulerConfig(t)
+			tt.cfg(&cfg)
+
+			r := newTestRuler(t, cfg, store, nil)
+			defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+			a := NewAPI(r, r.store, log.NewNopLogger())
+
+			router := mux.NewRouter()
+			router.Path("/api/v1/rules").Methods("GET").HandlerFunc(a.ListRules)
+			router.Path("/api/v1/rules/{namespace}").Methods("POST").HandlerFunc(a.CreateRuleGroup)
+			router.Path("/api/v1/rules/{namespace}/{groupName}").Methods("GET").HandlerFunc(a.GetRuleGroup)
+
+			req := requestFor(t, http.MethodPost, "https://localhost:8080/api/v1/rules/namespace", strings.NewReader(tt.input), tt.user)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			require.Equal(t, tt.status, w.Code)
+
+			if tt.err != "" {
+				require.Contains(t, w.Body.String(), tt.err)
+				return
+			}
+
+			req = requestFor(t, http.MethodGet, "https://localhost:8080/api/v1/rules/namespace/test", nil, tt.user)
+			w = httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			require.Equal(t, 200, w.Code)
+			require.Equal(t, tt.output, w.Body.String())
+
+			// The rule group listing exposes source_tenants as well.
+			req = requestFor(t, http.MethodGet, "https://localhost:8080/api/v1/rules", nil, tt.user)
+			w = httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			require.Equal(t, 200, w.Code)
+			require.Equal(t, strings.Contains(tt.input, "source_tenants"), strings.Contains(w.Body.String(), "source_tenants"))
+		})
+	}
 }

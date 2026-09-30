@@ -1,4 +1,4 @@
-// +build requires_docker
+//go:build integration_querier
 
 package integration
 
@@ -54,7 +54,8 @@ func TestQuerierNoShardingWithQueryScheduler(t *testing.T) {
 
 func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
 	// Going to high starts hitting file descriptor limit, since we run all queriers concurrently.
-	const numQueries = 100
+	const batchSize = 100
+	const numQueries = 500
 
 	s, err := e2e.NewScenario(networkName)
 	require.NoError(t, err)
@@ -65,11 +66,11 @@ func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
 	require.NoError(t, s.StartAndWaitReady(consul, memcached))
 
 	flags := mergeFlags(BlocksStorageFlags(), map[string]string{
-		"-querier.cache-results":                       "true",
-		"-querier.split-queries-by-interval":           "24h",
-		"-querier.query-ingesters-within":              "12h", // Required by the test on query /series out of ingesters time range
-		"-frontend.memcached.addresses":                "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort),
-		"-querier.max-outstanding-requests-per-tenant": strconv.Itoa(numQueries), // To avoid getting errors.
+		"-querier.cache-results":                        "true",
+		"-querier.split-queries-by-interval":            "24h",
+		"-limits.query-ingesters-within":                "12h", // Required by the test on query /series out of ingesters time range
+		"-frontend.memcached.addresses":                 "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort),
+		"-frontend.max-outstanding-requests-per-tenant": strconv.Itoa(numQueries), // To avoid getting errors.
 	})
 
 	minio := e2edb.NewMinio(9000, flags["-blocks-storage.s3.bucket-name"])
@@ -98,10 +99,10 @@ func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
 	}
 
 	// Start all other services.
-	ingester := e2ecortex.NewIngester("ingester", consul.NetworkHTTPEndpoint(), flags, "")
-	distributor := e2ecortex.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags, "")
-	querier1 := e2ecortex.NewQuerier("querier-1", consul.NetworkHTTPEndpoint(), flags, "")
-	querier2 := e2ecortex.NewQuerier("querier-2", consul.NetworkHTTPEndpoint(), flags, "")
+	ingester := e2ecortex.NewIngester("ingester", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
+	distributor := e2ecortex.NewDistributor("distributor", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
+	querier1 := e2ecortex.NewQuerier("querier-1", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
+	querier2 := e2ecortex.NewQuerier("querier-2", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
 
 	require.NoError(t, s.StartAndWaitReady(querier1, querier2, ingester, distributor))
 	require.NoError(t, s.WaitReady(queryFrontend))
@@ -140,25 +141,26 @@ func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
 		require.NoError(t, queryFrontend.WaitSumMetrics(e2e.Equals(2), "cortex_query_frontend_connected_clients"))
 	}
 
+	batches := generateBatches(batchSize, numQueries)
+
 	wg := sync.WaitGroup{}
 
 	// Run all queries concurrently to get better distribution of requests between queriers.
-	for i := 0; i < numQueries; i++ {
-		wg.Add(1)
+	for _, concurrentQueries := range batches {
+		for range concurrentQueries {
+			wg.Go(func() {
+				c, err := e2ecortex.NewClient("", queryFrontend.HTTPEndpoint(), "", "", userID)
+				require.NoError(t, err)
 
-		go func() {
-			defer wg.Done()
-			c, err := e2ecortex.NewClient("", queryFrontend.HTTPEndpoint(), "", "", userID)
-			require.NoError(t, err)
+				result, err := c.Query("series_1", now)
+				require.NoError(t, err)
+				require.Equal(t, model.ValVector, result.Type())
+				assert.Equal(t, expectedVector, result.(model.Vector))
+			})
+		}
 
-			result, err := c.Query("series_1", now)
-			require.NoError(t, err)
-			require.Equal(t, model.ValVector, result.Type())
-			assert.Equal(t, expectedVector, result.(model.Vector))
-		}()
+		wg.Wait()
 	}
-
-	wg.Wait()
 
 	require.NoError(t, queryFrontend.WaitSumMetrics(e2e.Equals(numQueries), "cortex_query_frontend_queries_total"))
 
@@ -192,4 +194,20 @@ func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
 	assertServiceMetricsPrefixes(t, Querier, querier2)
 	assertServiceMetricsPrefixes(t, QueryFrontend, queryFrontend)
 	assertServiceMetricsPrefixes(t, QueryScheduler, queryScheduler)
+}
+
+func generateBatches(batchSize, total int) []int {
+	remain := total
+	batches := []int{}
+	for remain != 0 {
+		if remain > batchSize {
+			batches = append(batches, batchSize)
+			remain -= batchSize
+		} else {
+			batches = append(batches, remain)
+			remain = 0
+		}
+	}
+
+	return batches
 }

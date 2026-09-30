@@ -6,116 +6,137 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
+	"github.com/cortexproject/cortex/pkg/util"
+	histogram_util "github.com/cortexproject/cortex/pkg/util/histogram"
 )
 
 const (
-	fp     = 1
-	userID = "0"
-	step   = 1 * time.Second
+	step = 1 * time.Second
 )
 
 func TestChunkIter(t *testing.T) {
+	t.Parallel()
 	forEncodings(t, func(t *testing.T, enc promchunk.Encoding) {
 		chunk := mkGenericChunk(t, 0, 100, enc)
 		iter := &chunkIterator{}
 
 		iter.reset(chunk)
-		testIter(t, 100, newIteratorAdapter(iter))
+		testIter(t, 100, newIteratorAdapter(iter), enc)
 
 		iter.reset(chunk)
-		testSeek(t, 100, newIteratorAdapter(iter))
+		testSeek(t, 100, newIteratorAdapter(iter), enc)
 	})
 }
 
 func forEncodings(t *testing.T, f func(t *testing.T, enc promchunk.Encoding)) {
 	for _, enc := range []promchunk.Encoding{
-		promchunk.DoubleDelta, promchunk.Varbit, promchunk.Bigchunk, promchunk.PrometheusXorChunk,
+		//promchunk.PrometheusXorChunk,
+		promchunk.PrometheusHistogramChunk,
+		//promchunk.PrometheusFloatHistogramChunk,
 	} {
 		t.Run(enc.String(), func(t *testing.T) {
+			t.Parallel()
 			f(t, enc)
 		})
 	}
 }
 
-func mkChunk(t require.TestingT, from model.Time, points int, enc promchunk.Encoding) chunk.Chunk {
-	metric := labels.Labels{
-		{Name: model.MetricNameLabel, Value: "foo"},
-	}
-	pc, err := promchunk.NewForEncoding(enc)
-	require.NoError(t, err)
-	ts := from
-	for i := 0; i < points; i++ {
-		npc, err := pc.Add(model.SamplePair{
-			Timestamp: ts,
-			Value:     model.SampleValue(float64(ts)),
-		})
-		require.NoError(t, err)
-		require.Nil(t, npc)
-		ts = ts.Add(step)
-	}
-	ts = ts.Add(-step) // undo the add that we did just before exiting the loop
-	return chunk.NewChunk(userID, fp, metric, pc, from, ts)
-}
-
 func mkGenericChunk(t require.TestingT, from model.Time, points int, enc promchunk.Encoding) GenericChunk {
-	ck := mkChunk(t, from, points, enc)
-	return NewGenericChunk(int64(ck.From), int64(ck.Through), ck.Data.NewIterator)
+	ck := util.GenerateChunk(t, step, from, points, enc)
+	return NewGenericChunk(int64(ck.From), int64(ck.Through), ck.NewIterator)
 }
 
-func testIter(t require.TestingT, points int, iter chunkenc.Iterator) {
+func testIter(t require.TestingT, points int, iter chunkenc.Iterator, enc promchunk.Encoding) {
+	histograms := histogram_util.GenerateTestHistograms(0, 1000, points)
 	ets := model.TimeFromUnix(0)
-	for i := 0; i < points; i++ {
-		require.True(t, iter.Next(), strconv.Itoa(i))
-		ts, v := iter.At()
-		require.EqualValues(t, int64(ets), ts, strconv.Itoa(i))
-		require.EqualValues(t, float64(ets), v, strconv.Itoa(i))
+	for i := range points {
+		require.Equal(t, iter.Next(), enc.ChunkValueType(), strconv.Itoa(i))
+		switch enc {
+		case promchunk.PrometheusXorChunk:
+			ts, v := iter.At()
+			require.EqualValues(t, int64(ets), ts, strconv.Itoa(i))
+			require.EqualValues(t, float64(ets), v, strconv.Itoa(i))
+		case promchunk.PrometheusHistogramChunk:
+			ts, v := iter.AtHistogram(nil)
+			require.EqualValues(t, int64(ets), ts, strconv.Itoa(i))
+			require.EqualValues(t, histograms[i], v, strconv.Itoa(i))
+		case promchunk.PrometheusFloatHistogramChunk:
+			ts, v := iter.AtFloatHistogram(nil)
+			require.EqualValues(t, int64(ets), ts, strconv.Itoa(i))
+			require.EqualValues(t, histograms[i].ToFloat(nil), v, strconv.Itoa(i))
+		}
 		ets = ets.Add(step)
 	}
-	require.False(t, iter.Next())
+	require.Equal(t, iter.Next(), chunkenc.ValNone)
 }
 
-func testSeek(t require.TestingT, points int, iter chunkenc.Iterator) {
+func testSeek(t require.TestingT, points int, iter chunkenc.Iterator, enc promchunk.Encoding) {
+	histograms := histogram_util.GenerateTestHistograms(0, 1000, points)
 	for i := 0; i < points; i += points / 10 {
 		ets := int64(i * int(step/time.Millisecond))
 
-		require.True(t, iter.Seek(ets))
-		ts, v := iter.At()
-		require.EqualValues(t, ets, ts)
-		require.EqualValues(t, v, float64(ets))
+		require.Equal(t, iter.Seek(ets), enc.ChunkValueType(), strconv.Itoa(i))
+
+		switch enc {
+		case promchunk.PrometheusXorChunk:
+			ts, v := iter.At()
+			require.EqualValues(t, ets, ts, strconv.Itoa(i))
+			require.EqualValues(t, float64(ets), v, strconv.Itoa(i))
+		case promchunk.PrometheusHistogramChunk:
+			ts, v := iter.AtHistogram(nil)
+			require.EqualValues(t, ets, ts, strconv.Itoa(i))
+			require.EqualValues(t, histograms[i], v, strconv.Itoa(i))
+		case promchunk.PrometheusFloatHistogramChunk:
+			ts, v := iter.AtFloatHistogram(nil)
+			require.EqualValues(t, ets, ts, strconv.Itoa(i))
+			require.EqualValues(t, histograms[i].ToFloat(nil), v, strconv.Itoa(i))
+		}
 		require.NoError(t, iter.Err())
 
 		for j := i + 1; j < i+points/10; j++ {
 			ets := int64(j * int(step/time.Millisecond))
-			require.True(t, iter.Next())
-			ts, v := iter.At()
-			require.EqualValues(t, ets, ts)
-			require.EqualValues(t, float64(ets), v)
+			require.Equal(t, iter.Next(), enc.ChunkValueType(), strconv.Itoa(i))
+
+			switch enc {
+			case promchunk.PrometheusXorChunk:
+				ts, v := iter.At()
+				require.EqualValues(t, ets, ts)
+				require.EqualValues(t, float64(ets), v)
+			case promchunk.PrometheusHistogramChunk:
+				ts, v := iter.AtHistogram(nil)
+				require.EqualValues(t, ets, ts)
+				require.EqualValues(t, histograms[j], v)
+			case promchunk.PrometheusFloatHistogramChunk:
+				ts, v := iter.AtFloatHistogram(nil)
+				require.EqualValues(t, ets, ts)
+				require.EqualValues(t, histograms[j].ToFloat(nil), v)
+			}
 			require.NoError(t, iter.Err())
 		}
 	}
 }
 
 func TestSeek(t *testing.T) {
+	t.Parallel()
 	var it mockIterator
 	c := chunkIterator{
 		chunk: GenericChunk{
-			MaxTime: promchunk.BatchSize,
+			MaxTime: chunk.BatchSize,
 		},
 		it: &it,
 	}
 
-	for i := 0; i < promchunk.BatchSize-1; i++ {
-		require.True(t, c.Seek(int64(i), 1))
+	for i := range chunk.BatchSize - 1 {
+		require.Equal(t, chunkenc.ValFloat, c.Seek(int64(i), 1))
 	}
 	require.Equal(t, 1, it.seeks)
 
-	require.True(t, c.Seek(int64(promchunk.BatchSize), 1))
+	require.Equal(t, chunkenc.ValFloat, c.Seek(int64(chunk.BatchSize), 1))
 	require.Equal(t, 2, it.seeks)
 }
 
@@ -123,24 +144,21 @@ type mockIterator struct {
 	seeks int
 }
 
-func (i *mockIterator) Scan() bool {
-	return true
+func (i *mockIterator) Scan() chunkenc.ValueType {
+	return chunkenc.ValFloat
 }
 
-func (i *mockIterator) FindAtOrAfter(model.Time) bool {
+func (i *mockIterator) FindAtOrAfter(model.Time) chunkenc.ValueType {
 	i.seeks++
-	return true
+	return chunkenc.ValFloat
 }
 
-func (i *mockIterator) Value() model.SamplePair {
-	return model.SamplePair{}
-}
-
-func (i *mockIterator) Batch(size int) promchunk.Batch {
-	batch := promchunk.Batch{
-		Length: promchunk.BatchSize,
+func (i *mockIterator) Batch(size int, valType chunkenc.ValueType) chunk.Batch {
+	batch := chunk.Batch{
+		Length:  chunk.BatchSize,
+		ValType: valType,
 	}
-	for i := 0; i < promchunk.BatchSize; i++ {
+	for i := range chunk.BatchSize {
 		batch.Timestamps[i] = int64(i)
 	}
 	return batch

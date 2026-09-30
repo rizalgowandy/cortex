@@ -9,12 +9,12 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket/s3"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func TestSSEBucketClient_Upload_ShouldInjectCustomSSEConfig(t *testing.T) {
@@ -48,15 +48,16 @@ func TestSSEBucketClient_Upload_ShouldInjectCustomSSEConfig(t *testing.T) {
 			defer srv.Close()
 
 			s3Cfg := s3.Config{
-				Endpoint:        srv.Listener.Addr().String(),
-				Region:          "test",
-				BucketName:      "test-bucket",
-				SecretAccessKey: flagext.Secret{Value: "test"},
-				AccessKeyID:     "test",
-				Insecure:        true,
+				Endpoint:         srv.Listener.Addr().String(),
+				Region:           "test",
+				BucketName:       "test-bucket",
+				SecretAccessKey:  flagext.Secret{Value: "test"},
+				AccessKeyID:      "test",
+				Insecure:         true,
+				BucketLookupType: s3.BucketPathLookup,
 			}
 
-			s3Client, err := s3.NewBucketClient(s3Cfg, "test", log.NewNopLogger())
+			s3Client, err := s3.NewBucketClient(s3Cfg, nil, "test", log.NewNopLogger())
 			require.NoError(t, err)
 
 			// Configure the config provider with NO KMS key ID.
@@ -103,6 +104,19 @@ func TestSSEBucketClient_Upload_ShouldInjectCustomSSEConfig(t *testing.T) {
 			assert.Equal(t, base64.StdEncoding.EncodeToString([]byte(kmsEncryptionContext)), req.Header.Get("x-amz-server-side-encryption-context"))
 		})
 	}
+}
+
+func Test_shouldWrapSSeErrors(t *testing.T) {
+	cfgProvider := &mockTenantConfigProvider{}
+
+	bkt := &ClientMock{}
+
+	bkt.MockGet("Test", "someContent", ErrKeyPermissionDenied)
+
+	sseBkt := NewSSEBucketClient("user-1", bkt, cfgProvider)
+
+	_, err := sseBkt.Get(context.Background(), "Test")
+	require.True(t, sseBkt.IsAccessDeniedErr(err))
 }
 
 type mockTenantConfigProvider struct {

@@ -5,24 +5,30 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
+	"github.com/grafana/regexp"
 	"github.com/pkg/errors"
+	"github.com/prometheus-community/parquet-common/search"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
+	"github.com/prometheus/prometheus/util/features"
 	v1 "github.com/prometheus/prometheus/web/api/v1"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
-	"github.com/cortexproject/cortex/pkg/chunk"
+	"github.com/cortexproject/cortex/pkg/storegateway"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -39,14 +45,14 @@ func TestApiStatusCodes(t *testing.T) {
 		},
 
 		{
-			err:            chunk.QueryError("special handling"), // handled specially by chunk_store_queryable
-			expectedString: "special handling",
+			err:            validation.LimitError("limit exceeded"),
+			expectedString: "limit exceeded",
 			expectedCode:   422,
 		},
 
 		{
-			err:            validation.LimitError("limit exceeded"),
-			expectedString: "limit exceeded",
+			err:            validation.AccessDeniedError("access denied"),
+			expectedString: "access denied",
 			expectedCode:   422,
 		},
 
@@ -59,7 +65,7 @@ func TestApiStatusCodes(t *testing.T) {
 		{
 			err:            promql.ErrQueryCanceled("query execution"),
 			expectedString: "query was canceled",
-			expectedCode:   503,
+			expectedCode:   499,
 		},
 
 		{
@@ -82,6 +88,12 @@ func TestApiStatusCodes(t *testing.T) {
 			expectedCode:   422,
 		},
 
+		{
+			err:            search.NewQuota(1).Reserve(2),
+			expectedString: "resource exhausted (used 1)",
+			expectedCode:   422,
+		},
+
 		// 505 is translated to 500
 		{
 			err:            httpgrpc.Errorf(http.StatusHTTPVersionNotSupported, "test"),
@@ -98,13 +110,33 @@ func TestApiStatusCodes(t *testing.T) {
 		{
 			err:            context.Canceled,
 			expectedString: "context canceled",
-			expectedCode:   422,
+			expectedCode:   499,
 		},
 		// Status code 400 is remapped to 422 (only choice we have)
 		{
 			err:            errors.Wrap(httpgrpc.Errorf(http.StatusBadRequest, "test string"), "wrapped error"),
 			expectedString: "test string",
 			expectedCode:   422,
+		},
+		{
+			err:            storegateway.ErrTooManyInflightRequests,
+			expectedString: "too many inflight requests in store gateway",
+			expectedCode:   500,
+		},
+		{
+			err:            limiter.ErrResourceLimitReached,
+			expectedString: limiter.ErrResourceLimitReachedStr,
+			expectedCode:   500,
+		},
+		{
+			err:            status.Error(codes.Canceled, "context canceled"),
+			expectedString: "query was canceled",
+			expectedCode:   499,
+		},
+		{
+			err:            errors.Wrap(status.Error(codes.Canceled, "context canceled"), "wrapped grpc error"),
+			expectedString: "query was canceled",
+			expectedCode:   499,
 		},
 	} {
 		for k, q := range map[string]storage.SampleAndChunkQueryable{
@@ -113,7 +145,15 @@ func TestApiStatusCodes(t *testing.T) {
 			"error from seriesset": errorTestQueryable{q: errorTestQuerier{s: errorTestSeriesSet{err: tc.err}}},
 		} {
 			t.Run(fmt.Sprintf("%s/%d", k, ix), func(t *testing.T) {
-				r := createPrometheusAPI(NewErrorTranslateSampleAndChunkQueryable(q))
+				opts := promql.EngineOpts{
+					Logger:             promslog.NewNopLogger(),
+					Reg:                nil,
+					ActiveQueryTracker: nil,
+					MaxSamples:         100,
+					Timeout:            5 * time.Second,
+				}
+				queryEngine := promql.NewEngine(opts)
+				r := createPrometheusAPI(NewErrorTranslateSampleAndChunkQueryable(q), queryEngine)
 				rec := httptest.NewRecorder()
 
 				req := httptest.NewRequest("GET", "/api/v1/query?query=up", nil)
@@ -128,20 +168,13 @@ func TestApiStatusCodes(t *testing.T) {
 	}
 }
 
-func createPrometheusAPI(q storage.SampleAndChunkQueryable) *route.Router {
-	engine := promql.NewEngine(promql.EngineOpts{
-		Logger:             log.NewNopLogger(),
-		Reg:                nil,
-		ActiveQueryTracker: nil,
-		MaxSamples:         100,
-		Timeout:            5 * time.Second,
-	})
-
+func createPrometheusAPI(q storage.SampleAndChunkQueryable, engine promql.QueryEngine) *route.Router {
 	api := v1.NewAPI(
 		engine,
 		q,
 		nil,
 		nil,
+		func(ctx context.Context) v1.ScrapePoolsRetriever { return nil },
 		func(context.Context) v1.TargetRetriever { return &DummyTargetRetriever{} },
 		func(context.Context) v1.AlertmanagerRetriever { return &DummyAlertmanagerRetriever{} },
 		func() config.Config { return config.Config{} },
@@ -151,15 +184,29 @@ func createPrometheusAPI(q storage.SampleAndChunkQueryable) *route.Router {
 		nil,   // Only needed for admin APIs.
 		"",    // This is for snapshots, which is disabled when admin APIs are disabled. Hence empty.
 		false, // Disable admin APIs.
-		log.NewNopLogger(),
+		promslog.NewNopLogger(),
 		func(context.Context) v1.RulesRetriever { return &DummyRulesRetriever{} },
 		0, 0, 0, // Remote read samples and concurrency limit.
 		false,
 		regexp.MustCompile(".*"),
 		func() (v1.RuntimeInfo, error) { return v1.RuntimeInfo{}, errors.New("not implemented") },
 		&v1.PrometheusVersion{},
+		nil,
+		nil,
 		prometheus.DefaultGatherer,
 		nil,
+		nil,
+		false,
+		nil,
+		false,
+		false,
+		false,
+		false,
+		5*time.Minute,
+		false,
+		false,
+		nil,
+		features.NewRegistry(),
 	)
 
 	promRouter := route.New().WithPrefix("/api/v1")
@@ -173,11 +220,11 @@ type errorTestQueryable struct {
 	err error
 }
 
-func (t errorTestQueryable) ChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
+func (t errorTestQueryable) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
 	return nil, t.err
 }
 
-func (t errorTestQueryable) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+func (t errorTestQueryable) Querier(mint, maxt int64) (storage.Querier, error) {
 	if t.q != nil {
 		return t.q, nil
 	}
@@ -189,11 +236,11 @@ type errorTestQuerier struct {
 	err error
 }
 
-func (t errorTestQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+func (t errorTestQuerier) LabelValues(ctx context.Context, name string, _ *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	return nil, nil, t.err
 }
 
-func (t errorTestQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+func (t errorTestQuerier) LabelNames(ctx context.Context, _ *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	return nil, nil, t.err
 }
 
@@ -201,7 +248,7 @@ func (t errorTestQuerier) Close() error {
 	return nil
 }
 
-func (t errorTestQuerier) Select(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+func (t errorTestQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	if t.s != nil {
 		return t.s
 	}
@@ -224,6 +271,6 @@ func (t errorTestSeriesSet) Err() error {
 	return t.err
 }
 
-func (t errorTestSeriesSet) Warnings() storage.Warnings {
+func (t errorTestSeriesSet) Warnings() annotations.Annotations {
 	return nil
 }

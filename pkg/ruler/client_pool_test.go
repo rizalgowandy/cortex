@@ -5,14 +5,16 @@ import (
 	"net"
 	"testing"
 
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/grpcclient"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/grpcclient"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 func Test_newRulerClientFactory(t *testing.T) {
@@ -38,7 +40,7 @@ func Test_newRulerClientFactory(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	factory := newRulerClientFactory(cfg, reg)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		client, err := factory(listener.Addr().String())
 		require.NoError(t, err)
 		defer client.Close() //nolint:errcheck
@@ -61,6 +63,12 @@ func Test_newRulerClientFactory(t *testing.T) {
 }
 
 type mockRulerServer struct{}
+
+func (m *mockRulerServer) LivenessCheck(ctx context.Context, request *LivenessCheckRequest) (*LivenessCheckResponse, error) {
+	return &LivenessCheckResponse{
+		State: int32(services.Running),
+	}, nil
+}
 
 func (m *mockRulerServer) Rules(context.Context, *RulesRequest) (*RulesResponse, error) {
 	return &RulesResponse{}, nil

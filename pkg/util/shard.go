@@ -10,6 +10,10 @@ const (
 	// Sharding strategies.
 	ShardingStrategyDefault = "default"
 	ShardingStrategyShuffle = "shuffle-sharding"
+
+	// Compaction strategies
+	CompactionStrategyDefault      = "default"
+	CompactionStrategyPartitioning = "partitioning"
 )
 
 var (
@@ -42,4 +46,13 @@ func ShuffleShardExpectedInstancesPerZone(shardSize, numZones int) int {
 // tenant. If zone-aware replication is disabled, the input numZones should be 1.
 func ShuffleShardExpectedInstances(shardSize, numZones int) int {
 	return ShuffleShardExpectedInstancesPerZone(shardSize, numZones) * numZones
+}
+
+// DynamicShardSize returns the shard size as a percentage of numInstances if the value is < 1. If the value is >= 1, the value is rounded and returned.
+func DynamicShardSize(value float64, numInstances int) int {
+	var shardSize = int(math.Ceil(value))
+	if value < 1 {
+		shardSize = int(math.Ceil(float64(numInstances) * value))
+	}
+	return shardSize
 }

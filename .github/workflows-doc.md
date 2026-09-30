@@ -17,8 +17,8 @@ test-build-deploy.yml specifies a workflow that runs all Cortex continuous integ
 |------------------------|-------------------------------------------------------------------------------------------------------------------------------|------|
 | lint                   | Runs linting and ensures vendor directory, protos and generated documentation are consistent.                                 | CI   |
 | test                   | Runs units tests on Cassandra testing framework.                                                                              | CI   |
-| integration-configs-db | Integration tests for database configurations.                                                                                | CI   |
 | integration            | Runs integration tests after upgrading golang, pulling necessary docker images and downloading necessary module dependencies. | CI   |
+| Security/CodeQL        | CodeQL is a semantic code analysis engine used for automating security checks.                                                | CI   |
 | build                  | Builds and saves an up-to-date Cortex image and website.                                                                      | CI   |
 | deploy_website         | Deploys the latest version of Cortex website to gh-pages branch. Triggered within workflow.                                   | CD   |
 | deploy                 | Deploys the latest Cortex image.                                                                                              | CD   |
@@ -61,14 +61,14 @@ As of October 2020, GitHub Actions do not persist between different jobs in the 
 | Artifact                      | Stored In | Used By                                     | Purpose of Storing Artifact |
 |-------------------------------|-----------|---------------------------------------------|-----------------------------|
 | website public                | build     | deploy_website                              | share data between jobs     |
-| Docker Images                 | build     | deploy, integration, integrations-config-db | share data between jobs     |
+| Docker Images                 | build     | deploy, integration                         | share data between jobs     |
 
 *Note:* Docker Images are zipped before uploading as a workaround. The images contain characters that are illegal in the upload-artifact action.
 ```yaml
 - name: Compressing Images
         run: tar -zcvf images.tar.gz /tmp/images
       - name: Cache Images
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: Docker Images
           path: ./images.tar.gz

@@ -29,11 +29,13 @@ import (
 
 // GetAlertGroupsURL generates an URL for the get alert groups operation
 type GetAlertGroupsURL struct {
-	Active    *bool
-	Filter    []string
-	Inhibited *bool
-	Receiver  *string
-	Silenced  *bool
+	Active           *bool
+	Filter           []string
+	Inhibited        *bool
+	Muted            *bool
+	Receiver         *string
+	ReceiverMatchers []string
+	Silenced         *bool
 
 	_basePath string
 	// avoid unkeyed usage
@@ -62,6 +64,9 @@ func (o *GetAlertGroupsURL) Build() (*url.URL, error) {
 	var _path = "/alerts/groups"
 
 	_basePath := o._basePath
+	if _basePath == "" {
+		_basePath = "/api/v2/"
+	}
 	_result.Path = golangswaggerpaths.Join(_basePath, _path)
 
 	qs := make(url.Values)
@@ -96,12 +101,34 @@ func (o *GetAlertGroupsURL) Build() (*url.URL, error) {
 		qs.Set("inhibited", inhibitedQ)
 	}
 
+	var mutedQ string
+	if o.Muted != nil {
+		mutedQ = swag.FormatBool(*o.Muted)
+	}
+	if mutedQ != "" {
+		qs.Set("muted", mutedQ)
+	}
+
 	var receiverQ string
 	if o.Receiver != nil {
 		receiverQ = *o.Receiver
 	}
 	if receiverQ != "" {
 		qs.Set("receiver", receiverQ)
+	}
+
+	var receiverMatchersIR []string
+	for _, receiverMatchersI := range o.ReceiverMatchers {
+		receiverMatchersIS := receiverMatchersI
+		if receiverMatchersIS != "" {
+			receiverMatchersIR = append(receiverMatchersIR, receiverMatchersIS)
+		}
+	}
+
+	receiverMatchers := swag.JoinByFormat(receiverMatchersIR, "multi")
+
+	for _, qsv := range receiverMatchers {
+		qs.Add("receiver_matchers", qsv)
 	}
 
 	var silencedQ string

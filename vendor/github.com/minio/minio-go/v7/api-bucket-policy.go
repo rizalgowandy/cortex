@@ -18,7 +18,7 @@ package minio
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -26,8 +26,17 @@ import (
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
 
-// SetBucketPolicy sets the access permissions on an existing bucket.
-func (c Client) SetBucketPolicy(ctx context.Context, bucketName, policy string) error {
+// SetBucketPolicy sets the access permissions policy on an existing bucket.
+// The policy should be a valid JSON string that conforms to the IAM policy format.
+// If policy is an empty string, the existing bucket policy will be removed.
+//
+// Parameters:
+//   - ctx: Context for request cancellation and timeout
+//   - bucketName: Name of the bucket
+//   - policy: JSON policy string (empty string to remove existing policy)
+//
+// Returns an error if the operation fails.
+func (c *Client) SetBucketPolicy(ctx context.Context, bucketName, policy string) error {
 	// Input validation.
 	if err := s3utils.CheckValidBucketName(bucketName); err != nil {
 		return err
@@ -43,7 +52,7 @@ func (c Client) SetBucketPolicy(ctx context.Context, bucketName, policy string) 
 }
 
 // Saves a new bucket policy.
-func (c Client) putBucketPolicy(ctx context.Context, bucketName, policy string) error {
+func (c *Client) putBucketPolicy(ctx context.Context, bucketName, policy string) error {
 	// Get resources properly escaped and lined up before
 	// using them in http request.
 	urlValues := make(url.Values)
@@ -63,7 +72,7 @@ func (c Client) putBucketPolicy(ctx context.Context, bucketName, policy string) 
 		return err
 	}
 	if resp != nil {
-		if resp.StatusCode != http.StatusNoContent {
+		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 			return httpRespToErrorResponse(resp, bucketName, "")
 		}
 	}
@@ -71,7 +80,7 @@ func (c Client) putBucketPolicy(ctx context.Context, bucketName, policy string) 
 }
 
 // Removes all policies on a bucket.
-func (c Client) removeBucketPolicy(ctx context.Context, bucketName string) error {
+func (c *Client) removeBucketPolicy(ctx context.Context, bucketName string) error {
 	// Get resources properly escaped and lined up before
 	// using them in http request.
 	urlValues := make(url.Values)
@@ -87,11 +96,23 @@ func (c Client) removeBucketPolicy(ctx context.Context, bucketName string) error
 	if err != nil {
 		return err
 	}
+
+	if resp.StatusCode != http.StatusNoContent {
+		return httpRespToErrorResponse(resp, bucketName, "")
+	}
+
 	return nil
 }
 
-// GetBucketPolicy returns the current policy
-func (c Client) GetBucketPolicy(ctx context.Context, bucketName string) (string, error) {
+// GetBucketPolicy retrieves the access permissions policy for the bucket.
+// If no bucket policy exists, returns an empty string with no error.
+//
+// Parameters:
+//   - ctx: Context for request cancellation and timeout
+//   - bucketName: Name of the bucket
+//
+// Returns the policy as a JSON string or an error if the operation fails.
+func (c *Client) GetBucketPolicy(ctx context.Context, bucketName string) (string, error) {
 	// Input validation.
 	if err := s3utils.CheckValidBucketName(bucketName); err != nil {
 		return "", err
@@ -99,7 +120,7 @@ func (c Client) GetBucketPolicy(ctx context.Context, bucketName string) (string,
 	bucketPolicy, err := c.getBucketPolicy(ctx, bucketName)
 	if err != nil {
 		errResponse := ToErrorResponse(err)
-		if errResponse.Code == "NoSuchBucketPolicy" {
+		if errResponse.Code == NoSuchBucketPolicy {
 			return "", nil
 		}
 		return "", err
@@ -108,7 +129,7 @@ func (c Client) GetBucketPolicy(ctx context.Context, bucketName string) (string,
 }
 
 // Request server for current bucket policy.
-func (c Client) getBucketPolicy(ctx context.Context, bucketName string) (string, error) {
+func (c *Client) getBucketPolicy(ctx context.Context, bucketName string) (string, error) {
 	// Get resources properly escaped and lined up before
 	// using them in http request.
 	urlValues := make(url.Values)
@@ -132,7 +153,7 @@ func (c Client) getBucketPolicy(ctx context.Context, bucketName string) (string,
 		}
 	}
 
-	bucketPolicyBuf, err := ioutil.ReadAll(resp.Body)
+	bucketPolicyBuf, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}

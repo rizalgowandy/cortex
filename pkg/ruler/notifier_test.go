@@ -10,9 +10,11 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/dns"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func TestBuildNotifierConfig(t *testing.T) {
@@ -36,7 +38,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 				AlertingConfig: config.AlertingConfig{
 					AlertmanagerConfigs: []*config.AlertmanagerConfig{
 						{
-							APIVersion: "v1",
+							APIVersion: "v2",
 							Scheme:     "http",
 							PathPrefix: "/alertmanager",
 							ServiceDiscoveryConfigs: discovery.Configs{
@@ -62,7 +64,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 				AlertingConfig: config.AlertingConfig{
 					AlertmanagerConfigs: []*config.AlertmanagerConfig{
 						{
-							APIVersion: "v1",
+							APIVersion: "v2",
 							Scheme:     "http",
 							PathPrefix: "/alertmanager",
 							ServiceDiscoveryConfigs: discovery.Configs{
@@ -95,7 +97,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 				AlertingConfig: config.AlertingConfig{
 					AlertmanagerConfigs: []*config.AlertmanagerConfig{
 						{
-							APIVersion: "v1",
+							APIVersion: "v2",
 							Scheme:     "http",
 							PathPrefix: "/alertmanager",
 							ServiceDiscoveryConfigs: discovery.Configs{
@@ -106,7 +108,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 							},
 						},
 						{
-							APIVersion: "v1",
+							APIVersion: "v2",
 							Scheme:     "http",
 							PathPrefix: "/alertmanager",
 							ServiceDiscoveryConfigs: discovery.Configs{
@@ -131,7 +133,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 				AlertingConfig: config.AlertingConfig{
 					AlertmanagerConfigs: []*config.AlertmanagerConfig{
 						{
-							APIVersion: "v1",
+							APIVersion: "v2",
 							Scheme:     "http",
 							PathPrefix: "/alertmanager",
 							ServiceDiscoveryConfigs: discovery.Configs{
@@ -144,7 +146,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 							},
 						},
 						{
-							APIVersion: "v1",
+							APIVersion: "v2",
 							Scheme:     "http",
 							PathPrefix: "/alertmanager",
 							ServiceDiscoveryConfigs: discovery.Configs{
@@ -172,7 +174,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 							HTTPClientConfig: config_util.HTTPClientConfig{
 								BasicAuth: &config_util.BasicAuth{Username: "marco", Password: "hunter2"},
 							},
-							APIVersion: "v1",
+							APIVersion: "v2",
 							Scheme:     "http",
 							PathPrefix: "/alertmanager",
 							ServiceDiscoveryConfigs: discovery.Configs{
@@ -194,7 +196,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 				Notifier: NotifierConfig{
 					BasicAuth: util.BasicAuth{
 						Username: "jacob",
-						Password: "test",
+						Password: flagext.Secret{Value: "test"},
 					},
 				},
 			},
@@ -205,7 +207,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 							HTTPClientConfig: config_util.HTTPClientConfig{
 								BasicAuth: &config_util.BasicAuth{Username: "jacob", Password: "test"},
 							},
-							APIVersion: "v1",
+							APIVersion: "v2",
 							Scheme:     "http",
 							PathPrefix: "/alertmanager",
 							ServiceDiscoveryConfigs: discovery.Configs{
@@ -217,6 +219,34 @@ func TestBuildNotifierConfig(t *testing.T) {
 							},
 						},
 					},
+				},
+			},
+		},
+		{
+			name: "with external labels",
+			cfg: &Config{
+				AlertmanagerURL: "http://alertmanager.default.svc.cluster.local/alertmanager",
+				ExternalLabels:  labels.FromStrings("region", "us-east-1"),
+			},
+			ncfg: &config.Config{
+				AlertingConfig: config.AlertingConfig{
+					AlertmanagerConfigs: []*config.AlertmanagerConfig{
+						{
+							APIVersion: "v2",
+							Scheme:     "http",
+							PathPrefix: "/alertmanager",
+							ServiceDiscoveryConfigs: discovery.Configs{
+								discovery.StaticConfig{
+									{
+										Targets: []model.LabelSet{{"__address__": "alertmanager.default.svc.cluster.local"}},
+									},
+								},
+							},
+						},
+					},
+				},
+				GlobalConfig: config.GlobalConfig{
+					ExternalLabels: labels.FromStrings("region", "us-east-1"),
 				},
 			},
 		},

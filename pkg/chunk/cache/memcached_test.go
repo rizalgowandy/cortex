@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/go-kit/log"
@@ -43,19 +44,19 @@ func testMemcache(t *testing.T, memcache *cache.Memcached) {
 	bufs := make([][]byte, 0, numKeys)
 
 	// Insert 1000 keys skipping all multiples of 5.
-	for i := 0; i < numKeys; i++ {
+	for i := range numKeys {
 		keysIncMissing = append(keysIncMissing, fmt.Sprint(i))
 		if i%5 == 0 {
 			continue
 		}
 
 		keys = append(keys, fmt.Sprint(i))
-		bufs = append(bufs, []byte(fmt.Sprint(i)))
+		bufs = append(bufs, fmt.Append(nil, i))
 	}
-	memcache.Store(ctx, keys, bufs)
+	memcache.Store(ctx, keys, bufs, 0)
 
-	found, bufs, missing := memcache.Fetch(ctx, keysIncMissing)
-	for i := 0; i < numKeys; i++ {
+	found, bufs, missing := memcache.Fetch(ctx, keysIncMissing, 0)
+	for i := range numKeys {
 		if i%5 == 0 {
 			require.Equal(t, fmt.Sprint(i), missing[0])
 			missing = missing[1:]
@@ -118,18 +119,18 @@ func testMemcacheFailing(t *testing.T, memcache *cache.Memcached) {
 	keys := make([]string, 0, numKeys)
 	bufs := make([][]byte, 0, numKeys)
 	// Insert 1000 keys skipping all multiples of 5.
-	for i := 0; i < numKeys; i++ {
+	for i := range numKeys {
 		keysIncMissing = append(keysIncMissing, fmt.Sprint(i))
 		if i%5 == 0 {
 			continue
 		}
 		keys = append(keys, fmt.Sprint(i))
-		bufs = append(bufs, []byte(fmt.Sprint(i)))
+		bufs = append(bufs, fmt.Append(nil, i))
 	}
-	memcache.Store(ctx, keys, bufs)
+	memcache.Store(ctx, keys, bufs, 0)
 
-	for i := 0; i < 10; i++ {
-		found, bufs, missing := memcache.Fetch(ctx, keysIncMissing)
+	for range 10 {
+		found, bufs, missing := memcache.Fetch(ctx, keysIncMissing, 0)
 
 		require.Equal(t, len(found), len(bufs))
 		for i := range found {
@@ -182,13 +183,43 @@ func testMemcachedStopping(t *testing.T, memcache *cache.Memcached) {
 	ctx := context.Background()
 	keys := make([]string, 0, numKeys)
 	bufs := make([][]byte, 0, numKeys)
-	for i := 0; i < numKeys; i++ {
+	for i := range numKeys {
 		keys = append(keys, fmt.Sprint(i))
-		bufs = append(bufs, []byte(fmt.Sprint(i)))
+		bufs = append(bufs, fmt.Append(nil, i))
 	}
 
-	memcache.Store(ctx, keys, bufs)
+	memcache.Store(ctx, keys, bufs, 0)
 
-	go memcache.Fetch(ctx, keys)
+	go memcache.Fetch(ctx, keys, 0)
+	memcache.Stop()
+}
+
+func TestMemcachedTTLFallback(t *testing.T) {
+	client := newMockMemcache()
+	defaultExpiration := 100 * time.Second
+
+	memcache := cache.NewMemcached(
+		cache.MemcachedConfig{
+			Expiration: defaultExpiration,
+		},
+		client,
+		"test",
+		nil,
+		log.NewNopLogger(),
+	)
+
+	ctx := context.Background()
+
+	// Test 1: TTL=0 should use configured Expiration (100s)
+	memcache.Store(ctx, []string{"key1"}, [][]byte{[]byte("value1")}, 0)
+	require.Equal(t, int32(defaultExpiration.Seconds()), client.GetLastExpiration(),
+		"TTL=0 should use configured default expiration")
+
+	// Test 2: Custom TTL should override configured Expiration
+	customTTL := 20 * time.Second
+	memcache.Store(ctx, []string{"key2"}, [][]byte{[]byte("value2")}, customTTL)
+	require.Equal(t, int32(customTTL.Seconds()), client.GetLastExpiration(),
+		"custom TTL should override default expiration")
+
 	memcache.Stop()
 }

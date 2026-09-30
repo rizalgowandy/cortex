@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"math"
+	"slices"
 
 	io_prometheus_client "github.com/prometheus/client_model/go"
 )
@@ -124,6 +125,26 @@ func Less(value float64) func(sums ...float64) bool {
 			panic("less: expected one value")
 		}
 		return sums[0] < value
+	}
+}
+
+// LessOrEqual is an isExpected function for WaitSumMetrics that returns true if given single sum is less or equal than given value.
+func LessOrEqual(value float64) func(sums ...float64) bool {
+	return func(sums ...float64) bool {
+		if len(sums) != 1 {
+			panic("less: expected one value")
+		}
+		return sums[0] <= value
+	}
+}
+
+// EqualsAmong is an isExpected function for WaitSumMetrics that returns true if the first sum is equal to any value provided.
+func EqualsAmong(values ...float64) func(sums ...float64) bool {
+	return func(sums ...float64) bool {
+		if len(sums) != 1 {
+			panic("equals among: expected one value")
+		}
+		return slices.Contains(values, sums[0])
 	}
 }
 

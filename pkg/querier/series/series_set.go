@@ -17,16 +17,57 @@
 package series
 
 import (
+	"context"
+	"slices"
 	"sort"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/util/annotations"
 
-	"github.com/cortexproject/cortex/pkg/chunk/purger"
-	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
+	"github.com/cortexproject/cortex/pkg/querier/iterators"
+	"github.com/cortexproject/cortex/pkg/util"
 )
+
+type labelsSetSeriesSet struct {
+	cur       int
+	labelsSet []labels.Labels
+}
+
+// LabelsSetToSeriesSet creates a storage.SeriesSet from a []labels.Labels.
+func LabelsSetToSeriesSet(sortSeries bool, labelsSet []labels.Labels) storage.SeriesSet {
+	if sortSeries {
+		slices.SortFunc(labelsSet, func(a, b labels.Labels) int { return labels.Compare(a, b) })
+	}
+	return &labelsSetSeriesSet{
+		cur:       -1,
+		labelsSet: labelsSet,
+	}
+}
+
+// Next iterates through a series set and implements storage.SeriesSet.
+func (c *labelsSetSeriesSet) Next() bool {
+	c.cur++
+	return c.cur < len(c.labelsSet)
+}
+
+// At returns the current series and implements storage.SeriesSet.
+func (c *labelsSetSeriesSet) At() storage.Series {
+	lset := c.labelsSet[c.cur]
+	return &ConcreteSeries{labels: lset}
+}
+
+// Err implements storage.SeriesSet.
+func (c *labelsSetSeriesSet) Err() error {
+	return nil
+}
+
+// Warnings implements storage.SeriesSet.
+func (c *labelsSetSeriesSet) Warnings() annotations.Annotations {
+	return nil
+}
 
 // ConcreteSeriesSet implements storage.SeriesSet.
 type ConcreteSeriesSet struct {
@@ -35,9 +76,11 @@ type ConcreteSeriesSet struct {
 }
 
 // NewConcreteSeriesSet instantiates an in-memory series set from a series
-// Series will be sorted by labels.
-func NewConcreteSeriesSet(series []storage.Series) storage.SeriesSet {
-	sort.Sort(byLabels(series))
+// Series will be sorted by labels if sortSeries is set.
+func NewConcreteSeriesSet(sortSeries bool, series []storage.Series) storage.SeriesSet {
+	if sortSeries {
+		sort.Sort(byLabels(series))
+	}
 	return &ConcreteSeriesSet{
 		cur:    -1,
 		series: series,
@@ -61,7 +104,7 @@ func (c *ConcreteSeriesSet) Err() error {
 }
 
 // Warnings implements storage.SeriesSet.
-func (c *ConcreteSeriesSet) Warnings() storage.Warnings {
+func (c *ConcreteSeriesSet) Warnings() annotations.Annotations {
 	return nil
 }
 
@@ -85,7 +128,7 @@ func (c *ConcreteSeries) Labels() labels.Labels {
 }
 
 // Iterator implements storage.Series
-func (c *ConcreteSeries) Iterator() chunkenc.Iterator {
+func (c *ConcreteSeries) Iterator(chunkenc.Iterator) chunkenc.Iterator {
 	return NewConcreteSeriesIterator(c)
 }
 
@@ -97,10 +140,10 @@ type concreteSeriesIterator struct {
 
 // NewConcreteSeriesIterator instaniates an in memory chunkenc.Iterator
 func NewConcreteSeriesIterator(series *ConcreteSeries) chunkenc.Iterator {
-	return &concreteSeriesIterator{
+	return iterators.NewCompatibleChunksIterator(&concreteSeriesIterator{
 		cur:    -1,
 		series: series,
-	}
+	})
 }
 
 func (c *concreteSeriesIterator) Seek(t int64) bool {
@@ -124,35 +167,9 @@ func (c *concreteSeriesIterator) Err() error {
 	return nil
 }
 
-// NewErrIterator instantiates an errIterator
-func NewErrIterator(err error) chunkenc.Iterator {
-	return errIterator{err}
-}
-
-// errIterator implements chunkenc.Iterator, just returning an error.
-type errIterator struct {
-	err error
-}
-
-func (errIterator) Seek(int64) bool {
-	return false
-}
-
-func (errIterator) Next() bool {
-	return false
-}
-
-func (errIterator) At() (t int64, v float64) {
-	return 0, 0
-}
-
-func (e errIterator) Err() error {
-	return e.err
-}
-
 // MatrixToSeriesSet creates a storage.SeriesSet from a model.Matrix
-// Series will be sorted by labels.
-func MatrixToSeriesSet(m model.Matrix) storage.SeriesSet {
+// Series will be sorted by labels if sortSeries is set.
+func MatrixToSeriesSet(sortSeries bool, m model.Matrix) storage.SeriesSet {
 	series := make([]storage.Series, 0, len(m))
 	for _, ss := range m {
 		series = append(series, &ConcreteSeries{
@@ -160,33 +177,30 @@ func MatrixToSeriesSet(m model.Matrix) storage.SeriesSet {
 			samples: ss.Values,
 		})
 	}
-	return NewConcreteSeriesSet(series)
+	return NewConcreteSeriesSet(sortSeries, series)
 }
 
 // MetricsToSeriesSet creates a storage.SeriesSet from a []metric.Metric
-func MetricsToSeriesSet(ms []metric.Metric) storage.SeriesSet {
+func MetricsToSeriesSet(ctx context.Context, sortSeries bool, ms []model.Metric) storage.SeriesSet {
 	series := make([]storage.Series, 0, len(ms))
-	for _, m := range ms {
+	for i, m := range ms {
+		if (i+1)%util.CheckContextEveryNIterations == 0 && ctx.Err() != nil {
+			return storage.ErrSeriesSet(ctx.Err())
+		}
 		series = append(series, &ConcreteSeries{
-			labels:  metricToLabels(m.Metric),
-			samples: nil,
+			labels: metricToLabels(m),
 		})
 	}
-	return NewConcreteSeriesSet(series)
+	return NewConcreteSeriesSet(sortSeries, series)
 }
 
 func metricToLabels(m model.Metric) labels.Labels {
-	ls := make(labels.Labels, 0, len(m))
+	builder := labels.NewBuilder(labels.EmptyLabels())
 	for k, v := range m {
-		ls = append(ls, labels.Label{
-			Name:  string(k),
-			Value: string(v),
-		})
+		builder.Set(string(k), string(v))
+
 	}
-	// PromQL expects all labels to be sorted! In general, anyone constructing
-	// a labels.Labels list is responsible for sorting it during construction time.
-	sort.Sort(ls)
-	return ls
+	return builder.Labels()
 }
 
 type byLabels []storage.Series
@@ -195,173 +209,12 @@ func (b byLabels) Len() int           { return len(b) }
 func (b byLabels) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
 func (b byLabels) Less(i, j int) bool { return labels.Compare(b[i].Labels(), b[j].Labels()) < 0 }
 
-type DeletedSeriesSet struct {
-	seriesSet     storage.SeriesSet
-	tombstones    *purger.TombstonesSet
-	queryInterval model.Interval
-}
-
-func NewDeletedSeriesSet(seriesSet storage.SeriesSet, tombstones *purger.TombstonesSet, queryInterval model.Interval) storage.SeriesSet {
-	return &DeletedSeriesSet{
-		seriesSet:     seriesSet,
-		tombstones:    tombstones,
-		queryInterval: queryInterval,
-	}
-}
-
-func (d DeletedSeriesSet) Next() bool {
-	return d.seriesSet.Next()
-}
-
-func (d DeletedSeriesSet) At() storage.Series {
-	series := d.seriesSet.At()
-	deletedIntervals := d.tombstones.GetDeletedIntervals(series.Labels(), d.queryInterval.Start, d.queryInterval.End)
-
-	// series is deleted for whole query range so return empty series
-	if len(deletedIntervals) == 1 && deletedIntervals[0] == d.queryInterval {
-		return NewEmptySeries(series.Labels())
-	}
-
-	return NewDeletedSeries(series, deletedIntervals)
-}
-
-func (d DeletedSeriesSet) Err() error {
-	return d.seriesSet.Err()
-}
-
-func (d DeletedSeriesSet) Warnings() storage.Warnings {
-	return nil
-}
-
-type DeletedSeries struct {
-	series           storage.Series
-	deletedIntervals []model.Interval
-}
-
-func NewDeletedSeries(series storage.Series, deletedIntervals []model.Interval) storage.Series {
-	return &DeletedSeries{
-		series:           series,
-		deletedIntervals: deletedIntervals,
-	}
-}
-
-func (d DeletedSeries) Labels() labels.Labels {
-	return d.series.Labels()
-}
-
-func (d DeletedSeries) Iterator() chunkenc.Iterator {
-	return NewDeletedSeriesIterator(d.series.Iterator(), d.deletedIntervals)
-}
-
-type DeletedSeriesIterator struct {
-	itr              chunkenc.Iterator
-	deletedIntervals []model.Interval
-}
-
-func NewDeletedSeriesIterator(itr chunkenc.Iterator, deletedIntervals []model.Interval) chunkenc.Iterator {
-	return &DeletedSeriesIterator{
-		itr:              itr,
-		deletedIntervals: deletedIntervals,
-	}
-}
-
-func (d DeletedSeriesIterator) Seek(t int64) bool {
-	if found := d.itr.Seek(t); !found {
-		return false
-	}
-
-	seekedTs, _ := d.itr.At()
-	if d.isDeleted(seekedTs) {
-		// point we have seeked into is deleted, Next() should find a new non-deleted sample which is after t and seekedTs
-		return d.Next()
-	}
-
-	return true
-}
-
-func (d DeletedSeriesIterator) At() (t int64, v float64) {
-	return d.itr.At()
-}
-
-func (d DeletedSeriesIterator) Next() bool {
-	for d.itr.Next() {
-		ts, _ := d.itr.At()
-
-		if d.isDeleted(ts) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-func (d DeletedSeriesIterator) Err() error {
-	return d.itr.Err()
-}
-
-// isDeleted removes intervals which are past ts while checking for whether ts happens to be in one of the deleted intervals
-func (d *DeletedSeriesIterator) isDeleted(ts int64) bool {
-	mts := model.Time(ts)
-
-	for _, interval := range d.deletedIntervals {
-		if mts > interval.End {
-			d.deletedIntervals = d.deletedIntervals[1:]
-			continue
-		} else if mts < interval.Start {
-			return false
-		}
-
-		return true
-	}
-
-	return false
-}
-
-type emptySeries struct {
-	labels labels.Labels
-}
-
-func NewEmptySeries(labels labels.Labels) storage.Series {
-	return emptySeries{labels}
-}
-
-func (e emptySeries) Labels() labels.Labels {
-	return e.labels
-}
-
-func (emptySeries) Iterator() chunkenc.Iterator {
-	return NewEmptySeriesIterator()
-}
-
-type emptySeriesIterator struct {
-}
-
-func NewEmptySeriesIterator() chunkenc.Iterator {
-	return emptySeriesIterator{}
-}
-
-func (emptySeriesIterator) Seek(t int64) bool {
-	return false
-}
-
-func (emptySeriesIterator) At() (t int64, v float64) {
-	return 0, 0
-}
-
-func (emptySeriesIterator) Next() bool {
-	return false
-}
-
-func (emptySeriesIterator) Err() error {
-	return nil
-}
-
 type seriesSetWithWarnings struct {
 	wrapped  storage.SeriesSet
-	warnings storage.Warnings
+	warnings annotations.Annotations
 }
 
-func NewSeriesSetWithWarnings(wrapped storage.SeriesSet, warnings storage.Warnings) storage.SeriesSet {
+func NewSeriesSetWithWarnings(wrapped storage.SeriesSet, warnings annotations.Annotations) storage.SeriesSet {
 	return seriesSetWithWarnings{
 		wrapped:  wrapped,
 		warnings: warnings,
@@ -380,6 +233,7 @@ func (s seriesSetWithWarnings) Err() error {
 	return s.wrapped.Err()
 }
 
-func (s seriesSetWithWarnings) Warnings() storage.Warnings {
-	return append(s.wrapped.Warnings(), s.warnings...)
+func (s seriesSetWithWarnings) Warnings() annotations.Annotations {
+	w := s.wrapped.Warnings()
+	return w.Merge(s.warnings)
 }

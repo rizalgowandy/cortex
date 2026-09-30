@@ -13,6 +13,13 @@ const (
 	GossipPort = 9094
 )
 
+type RingStore string
+
+const (
+	RingStoreConsul RingStore = "consul"
+	RingStoreEtcd   RingStore = "etcd"
+)
+
 // GetDefaultImage returns the Docker image to use to run Cortex.
 func GetDefaultImage() string {
 	// Get the cortex image from the CORTEX_IMAGE env variable,
@@ -24,13 +31,22 @@ func GetDefaultImage() string {
 	return "quay.io/cortexproject/cortex:latest"
 }
 
-func NewDistributor(name string, consulAddress string, flags map[string]string, image string) *CortexService {
-	return NewDistributorWithConfigFile(name, consulAddress, "", flags, image)
+func NewDistributor(name string, store RingStore, address string, flags map[string]string, image string) *CortexService {
+	return NewDistributorWithConfigFile(name, store, address, "", flags, image)
 }
 
-func NewDistributorWithConfigFile(name, consulAddress, configFile string, flags map[string]string, image string) *CortexService {
+func NewDistributorWithConfigFile(name string, store RingStore, address, configFile string, flags map[string]string, image string) *CortexService {
 	if configFile != "" {
 		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
+	}
+
+	// Configure the ingesters ring backend
+	flags["-ring.store"] = string(store)
+	switch store {
+	case RingStoreConsul:
+		flags["-consul.hostname"] = address
+	case RingStoreEtcd:
+		flags["-etcd.endpoints"] = address
 	}
 
 	if image == "" {
@@ -45,9 +61,6 @@ func NewDistributorWithConfigFile(name, consulAddress, configFile string, flags 
 			"-log.level":                      "warn",
 			"-auth.enabled":                   "true",
 			"-distributor.replication-factor": "1",
-			// Configure the ingesters ring backend
-			"-ring.store":      "consul",
-			"-consul.hostname": consulAddress,
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,
@@ -55,14 +68,32 @@ func NewDistributorWithConfigFile(name, consulAddress, configFile string, flags 
 	)
 }
 
-func NewQuerier(name string, consulAddress string, flags map[string]string, image string) *CortexService {
-	return NewQuerierWithConfigFile(name, consulAddress, "", flags, image)
+func NewQuerier(name string, store RingStore, address string, flags map[string]string, image string) *CortexService {
+	return NewQuerierWithConfigFile(name, store, address, "", flags, image)
 }
 
-func NewQuerierWithConfigFile(name, consulAddress, configFile string, flags map[string]string, image string) *CortexService {
+func NewQuerierWithConfigFile(name string, store RingStore, address, configFile string, flags map[string]string, image string) *CortexService {
 	if configFile != "" {
 		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
 	}
+
+	// Configure the ingesters ring backend and the store-gateway ring backend.
+	ringBackendFlags := map[string]string{
+		"-ring.store":                        string(store),
+		"-store-gateway.sharding-ring.store": string(store),
+	}
+
+	switch store {
+	case RingStoreConsul:
+		ringBackendFlags["-consul.hostname"] = address
+		ringBackendFlags["-store-gateway.sharding-ring.consul.hostname"] = address
+	case RingStoreEtcd:
+		ringBackendFlags["-etcd.endpoints"] = address
+		ringBackendFlags["-store-gateway.sharding-ring.etcd.endpoints"] = address
+	}
+
+	// For backward compatibility
+	flags = e2e.MergeFlagsWithoutRemovingEmpty(ringBackendFlags, flags)
 
 	if image == "" {
 		image = GetDefaultImage()
@@ -75,9 +106,6 @@ func NewQuerierWithConfigFile(name, consulAddress, configFile string, flags map[
 			"-target":                         "querier",
 			"-log.level":                      "warn",
 			"-distributor.replication-factor": "1",
-			// Ingesters ring backend.
-			"-ring.store":      "consul",
-			"-consul.hostname": consulAddress,
 			// Query-frontend worker.
 			"-querier.frontend-client.backoff-min-period": "100ms",
 			"-querier.frontend-client.backoff-max-period": "100ms",
@@ -87,8 +115,6 @@ func NewQuerierWithConfigFile(name, consulAddress, configFile string, flags map[
 			"-querier.dns-lookup-period": "1s",
 			// Store-gateway ring backend.
 			"-store-gateway.sharding-enabled":                 "true",
-			"-store-gateway.sharding-ring.store":              "consul",
-			"-store-gateway.sharding-ring.consul.hostname":    consulAddress,
 			"-store-gateway.sharding-ring.replication-factor": "1",
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
@@ -97,13 +123,22 @@ func NewQuerierWithConfigFile(name, consulAddress, configFile string, flags map[
 	)
 }
 
-func NewStoreGateway(name string, consulAddress string, flags map[string]string, image string) *CortexService {
-	return NewStoreGatewayWithConfigFile(name, consulAddress, "", flags, image)
+func NewStoreGateway(name string, store RingStore, address string, flags map[string]string, image string) *CortexService {
+	return NewStoreGatewayWithConfigFile(name, store, address, "", flags, image)
 }
 
-func NewStoreGatewayWithConfigFile(name, consulAddress, configFile string, flags map[string]string, image string) *CortexService {
+func NewStoreGatewayWithConfigFile(name string, store RingStore, address string, configFile string, flags map[string]string, image string) *CortexService {
 	if configFile != "" {
 		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
+	}
+
+	switch store {
+	case RingStoreConsul:
+		flags["-consul.hostname"] = address
+		flags["-store-gateway.sharding-ring.consul.hostname"] = address
+	case RingStoreEtcd:
+		flags["-etcd.endpoints"] = address
+		flags["-store-gateway.sharding-ring.etcd.endpoints"] = address
 	}
 
 	if image == "" {
@@ -118,8 +153,7 @@ func NewStoreGatewayWithConfigFile(name, consulAddress, configFile string, flags
 			"-log.level": "warn",
 			// Store-gateway ring backend.
 			"-store-gateway.sharding-enabled":                 "true",
-			"-store-gateway.sharding-ring.store":              "consul",
-			"-store-gateway.sharding-ring.consul.hostname":    consulAddress,
+			"-store-gateway.sharding-ring.store":              string(store),
 			"-store-gateway.sharding-ring.replication-factor": "1",
 			// Startup quickly.
 			"-store-gateway.sharding-ring.wait-stability-min-duration": "0",
@@ -131,14 +165,24 @@ func NewStoreGatewayWithConfigFile(name, consulAddress, configFile string, flags
 	)
 }
 
-func NewIngester(name string, consulAddress string, flags map[string]string, image string) *CortexService {
-	return NewIngesterWithConfigFile(name, consulAddress, "", flags, image)
+func NewIngester(name string, store RingStore, address string, flags map[string]string, image string) *CortexService {
+	return NewIngesterWithConfigFile(name, store, address, "", flags, image)
 }
 
-func NewIngesterWithConfigFile(name, consulAddress, configFile string, flags map[string]string, image string) *CortexService {
+func NewIngesterWithConfigFile(name string, store RingStore, address, configFile string, flags map[string]string, image string) *CortexService {
 	if configFile != "" {
 		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
 	}
+
+	// Configure the ingesters ring backend
+	flags["-ring.store"] = string(store)
+	switch store {
+	case RingStoreConsul:
+		flags["-consul.hostname"] = address
+	case RingStoreEtcd:
+		flags["-etcd.endpoints"] = address
+	}
+
 	if image == "" {
 		image = GetDefaultImage()
 	}
@@ -147,17 +191,12 @@ func NewIngesterWithConfigFile(name, consulAddress, configFile string, flags map
 		name,
 		image,
 		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
-			"-target":                        "ingester",
-			"-log.level":                     "warn",
-			"-ingester.final-sleep":          "0s",
-			"-ingester.join-after":           "0s",
-			"-ingester.min-ready-duration":   "0s",
-			"-ingester.concurrent-flushes":   "10",
-			"-ingester.max-transfer-retries": "10",
-			"-ingester.num-tokens":           "512",
-			// Configure the ingesters ring backend
-			"-ring.store":      "consul",
-			"-consul.hostname": consulAddress,
+			"-target":                      "ingester",
+			"-log.level":                   "warn",
+			"-ingester.final-sleep":        "0s",
+			"-ingester.join-after":         "0s",
+			"-ingester.min-ready-duration": "0s",
+			"-ingester.num-tokens":         "512",
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,
@@ -165,13 +204,22 @@ func NewIngesterWithConfigFile(name, consulAddress, configFile string, flags map
 	)
 }
 
-func NewTableManager(name string, flags map[string]string, image string) *CortexService {
-	return NewTableManagerWithConfigFile(name, "", flags, image)
+func NewParquetConverter(name string, store RingStore, address string, flags map[string]string, image string) *CortexService {
+	return NewParquetConverterWithConfigFile(name, store, address, "", flags, image)
 }
 
-func NewTableManagerWithConfigFile(name, configFile string, flags map[string]string, image string) *CortexService {
+func NewParquetConverterWithConfigFile(name string, store RingStore, address, configFile string, flags map[string]string, image string) *CortexService {
 	if configFile != "" {
 		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
+	}
+
+	// Configure the ingesters ring backend
+	flags["-ring.store"] = string(store)
+	switch store {
+	case RingStoreConsul:
+		flags["-consul.hostname"] = address
+	case RingStoreEtcd:
+		flags["-etcd.endpoints"] = address
 	}
 
 	if image == "" {
@@ -182,7 +230,7 @@ func NewTableManagerWithConfigFile(name, configFile string, flags map[string]str
 		name,
 		image,
 		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
-			"-target":    "table-manager",
+			"-target":    "parquet-converter",
 			"-log.level": "warn",
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
@@ -298,12 +346,10 @@ func NewSingleBinary(name string, flags map[string]string, image string, otherPo
 			// Distributor.
 			"-distributor.replication-factor": "1",
 			// Ingester.
-			"-ingester.final-sleep":          "0s",
-			"-ingester.join-after":           "0s",
-			"-ingester.min-ready-duration":   "0s",
-			"-ingester.concurrent-flushes":   "10",
-			"-ingester.max-transfer-retries": "10",
-			"-ingester.num-tokens":           "512",
+			"-ingester.final-sleep":        "0s",
+			"-ingester.join-after":         "0s",
+			"-ingester.min-ready-duration": "0s",
+			"-ingester.num-tokens":         "512",
 			// Startup quickly.
 			"-store-gateway.sharding-ring.wait-stability-min-duration": "0",
 			"-store-gateway.sharding-ring.wait-stability-max-duration": "0",
@@ -345,9 +391,9 @@ func NewAlertmanager(name string, flags map[string]string, image string) *Cortex
 		name,
 		image,
 		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
-			"-target":                               "alertmanager",
-			"-log.level":                            "warn",
-			"-experimental.alertmanager.enable-api": "true",
+			"-target":                  "alertmanager",
+			"-log.level":               "warn",
+			"-alertmanager.enable-api": "true",
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,
@@ -365,9 +411,9 @@ func NewAlertmanagerWithTLS(name string, flags map[string]string, image string) 
 		name,
 		image,
 		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
-			"-target":                               "alertmanager",
-			"-log.level":                            "warn",
-			"-experimental.alertmanager.enable-api": "true",
+			"-target":                  "alertmanager",
+			"-log.level":               "warn",
+			"-alertmanager.enable-api": "true",
 		}, flags))...),
 		e2e.NewTCPReadinessProbe(httpPort),
 		httpPort,
@@ -387,9 +433,14 @@ func NewRuler(name string, consulAddress string, flags map[string]string, image 
 		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
 			"-target":    "ruler",
 			"-log.level": "warn",
-			// Configure the ingesters ring backend
-			"-ring.store":      "consul",
-			"-consul.hostname": consulAddress,
+			// Configure the ring backend
+			"-ring.store":                                  "consul",
+			"-store-gateway.sharding-ring.store":           "consul",
+			"-consul.hostname":                             consulAddress,
+			"-store-gateway.sharding-ring.consul.hostname": consulAddress,
+			// Store-gateway ring backend.
+			"-store-gateway.sharding-enabled":                 "true",
+			"-store-gateway.sharding-ring.replication-factor": "1",
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,
@@ -397,15 +448,7 @@ func NewRuler(name string, consulAddress string, flags map[string]string, image 
 	)
 }
 
-func NewPurger(name string, flags map[string]string, image string) *CortexService {
-	return NewPurgerWithConfigFile(name, "", flags, image)
-}
-
-func NewPurgerWithConfigFile(name, configFile string, flags map[string]string, image string) *CortexService {
-	if configFile != "" {
-		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
-	}
-
+func NewConfigs(name string, flags map[string]string, image string) *CortexService {
 	if image == "" {
 		image = GetDefaultImage()
 	}
@@ -414,10 +457,11 @@ func NewPurgerWithConfigFile(name, configFile string, flags map[string]string, i
 		name,
 		image,
 		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
-			"-target":                   "purger",
-			"-log.level":                "warn",
-			"-purger.object-store-type": "filesystem",
-			"-local.chunk-directory":    e2e.ContainerSharedDir,
+			"-target":    "configs",
+			"-log.level": "warn",
+			// /migrations is the path the cortex Docker image copies the SQL migrations to;
+			// see cmd/cortex/Dockerfile.
+			"-configs.database.migrations-dir": "/migrations",
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,

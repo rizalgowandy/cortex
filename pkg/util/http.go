@@ -2,6 +2,7 @@ package util
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"flag"
@@ -17,7 +18,10 @@ import (
 	"github.com/golang/snappy"
 	"github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
+	yamlv3 "gopkg.in/yaml.v3"
+
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 const messageSizeLargerErrFmt = "received message larger than max (%d vs %d)"
@@ -29,22 +33,22 @@ func IsRequestBodyTooLarge(err error) bool {
 
 // BasicAuth configures basic authentication for HTTP clients.
 type BasicAuth struct {
-	Username string `yaml:"basic_auth_username"`
-	Password string `yaml:"basic_auth_password"`
+	Username string         `yaml:"basic_auth_username"`
+	Password flagext.Secret `yaml:"basic_auth_password"`
 }
 
 func (b *BasicAuth) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&b.Username, prefix+"basic-auth-username", "", "HTTP Basic authentication username. It overrides the username set in the URL (if any).")
-	f.StringVar(&b.Password, prefix+"basic-auth-password", "", "HTTP Basic authentication password. It overrides the password set in the URL (if any).")
+	f.Var(&b.Password, prefix+"basic-auth-password", "HTTP Basic authentication password. It overrides the password set in the URL (if any).")
 }
 
 // IsEnabled returns false if basic authentication isn't enabled.
 func (b BasicAuth) IsEnabled() bool {
-	return b.Username != "" || b.Password != ""
+	return b.Username != "" || b.Password.Value != ""
 }
 
 // WriteJSONResponse writes some JSON as a HTTP response.
-func WriteJSONResponse(w http.ResponseWriter, v interface{}) {
+func WriteJSONResponse(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 
 	data, err := json.Marshal(v)
@@ -60,7 +64,7 @@ func WriteJSONResponse(w http.ResponseWriter, v interface{}) {
 }
 
 // WriteYAMLResponse writes some YAML as a HTTP response.
-func WriteYAMLResponse(w http.ResponseWriter, v interface{}) {
+func WriteYAMLResponse(w http.ResponseWriter, v any) {
 	// There is not standardised content-type for YAML, text/plain ensures the
 	// YAML is displayed in the browser instead of offered as a download
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -95,7 +99,7 @@ func WriteHTMLResponse(w http.ResponseWriter, message string) {
 
 // RenderHTTPResponse either responds with json or a rendered html page using the passed in template
 // by checking the Accepts header
-func RenderHTTPResponse(w http.ResponseWriter, v interface{}, t *template.Template, r *http.Request) {
+func RenderHTTPResponse(w http.ResponseWriter, v any, t *template.Template, r *http.Request) {
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "application/json") {
 		WriteJSONResponse(w, v)
@@ -108,11 +112,11 @@ func RenderHTTPResponse(w http.ResponseWriter, v interface{}, t *template.Templa
 	}
 }
 
-// StreamWriteYAMLResponse stream writes data as http response
-func StreamWriteYAMLResponse(w http.ResponseWriter, iter chan interface{}, logger log.Logger) {
+// StreamWriteYAMLResponseCommon stream writes data as http response
+func streamWriteYAMLResponseCommon(w http.ResponseWriter, iter chan any, logger log.Logger, marshalFn func(in any) (out []byte, err error)) {
 	w.Header().Set("Content-Type", "application/yaml")
 	for v := range iter {
-		data, err := yaml.Marshal(v)
+		data, err := marshalFn(v)
 		if err != nil {
 			level.Error(logger).Log("msg", "yaml marshal failed", "err", err)
 			continue
@@ -125,6 +129,16 @@ func StreamWriteYAMLResponse(w http.ResponseWriter, iter chan interface{}, logge
 	}
 }
 
+// StreamWriteYAMLResponse stream writes data as http response using yaml v2 library
+func StreamWriteYAMLResponse(w http.ResponseWriter, iter chan any, logger log.Logger) {
+	streamWriteYAMLResponseCommon(w, iter, logger, yaml.Marshal)
+}
+
+// StreamWriteYAMLV3Response stream writes data as http response using yaml v3 library
+func StreamWriteYAMLV3Response(w http.ResponseWriter, iter chan any, logger log.Logger) {
+	streamWriteYAMLResponseCommon(w, iter, logger, yamlv3.Marshal)
+}
+
 // CompressionType for encoding and decoding requests and responses.
 type CompressionType int
 
@@ -132,6 +146,7 @@ type CompressionType int
 const (
 	NoCompression CompressionType = iota
 	RawSnappy
+	Gzip
 )
 
 // ParseProtoReader parses a compressed proto from an io.Reader.
@@ -204,6 +219,13 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 			return nil, err
 		}
 		body, err = decompressFromBuffer(&buf, maxSize, RawSnappy, sp)
+	case Gzip:
+		gzReader, gzErr := gzip.NewReader(reader)
+		if gzErr != nil {
+			return nil, gzErr
+		}
+		_, err = buf.ReadFrom(io.LimitReader(gzReader, int64(maxSize)+1))
+		body = buf.Bytes()
 	}
 	return body, err
 }

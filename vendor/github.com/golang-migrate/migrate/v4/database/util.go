@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"strings"
+	"sync/atomic"
 )
 
 const advisoryLockIDSalt uint = 1486364155
@@ -16,4 +17,17 @@ func GenerateAdvisoryLockId(databaseName string, additionalNames ...string) (str
 	sum := crc32.ChecksumIEEE([]byte(databaseName))
 	sum = sum * uint32(advisoryLockIDSalt)
 	return fmt.Sprint(sum), nil
+}
+
+// CasRestoreOnErr CAS wrapper to automatically restore the lock state on error
+func CasRestoreOnErr(lock *atomic.Bool, o, n bool, casErr error, f func() error) error {
+	if !lock.CompareAndSwap(o, n) {
+		return casErr
+	}
+	if err := f(); err != nil {
+		// Automatically unlock/lock on error
+		lock.Store(o)
+		return err
+	}
+	return nil
 }

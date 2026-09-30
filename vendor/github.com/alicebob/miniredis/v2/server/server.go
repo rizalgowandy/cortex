@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
-	"math"
 	"net"
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/alicebob/miniredis/v2/fpconv"
 )
 
 func errUnknownCommand(cmd string, args []string) string {
@@ -33,7 +34,7 @@ type Hook func(*Peer, string, ...string) bool
 // Server is a simple redis server
 type Server struct {
 	l         net.Listener
-	cmds      map[string]Cmd
+	cmds      map[string]*cmdMeta
 	preHook   Hook
 	peers     map[net.Conn]struct{}
 	mu        sync.Mutex
@@ -61,7 +62,7 @@ func NewServerTLS(addr string, cfg *tls.Config) (*Server, error) {
 
 func newServer(l net.Listener) *Server {
 	s := Server{
-		cmds:  map[string]Cmd{},
+		cmds:  map[string]*cmdMeta{},
 		peers: map[net.Conn]struct{}{},
 		l:     l,
 	}
@@ -142,14 +143,23 @@ func (s *Server) Close() {
 
 // Register a command. It can't have been registered before. Safe to call on a
 // running server.
-func (s *Server) Register(cmd string, f Cmd) error {
+func (s *Server) Register(cmd string, f Cmd, options ...CmdOption) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cmd = strings.ToUpper(cmd)
 	if _, ok := s.cmds[cmd]; ok {
 		return fmt.Errorf("command already registered: %s", cmd)
 	}
-	s.cmds[cmd] = f
+
+	meta := &cmdMeta{
+		handler:  f,
+		readOnly: false,
+	}
+	for _, option := range options {
+		option(meta)
+	}
+	s.cmds[cmd] = meta
+
 	return nil
 }
 
@@ -158,24 +168,34 @@ func (s *Server) servePeer(c net.Conn) {
 	peer := &Peer{
 		w: bufio.NewWriter(c),
 	}
+
 	defer func() {
 		for _, f := range peer.onDisconnect {
 			f()
 		}
 	}()
 
-	for {
-		args, err := readArray(r)
-		if err != nil {
-			return
+	readCh := make(chan []string)
+
+	go func() {
+		defer close(readCh)
+
+		for {
+			args, err := readArray(r)
+			if err != nil {
+				peer.Close()
+				return
+			}
+
+			readCh <- args
 		}
+	}()
+
+	for args := range readCh {
 		s.Dispatch(peer, args)
 		peer.Flush()
 
-		s.mu.Lock()
-		closed := peer.closed
-		s.mu.Unlock()
-		if closed {
+		if peer.Closed() {
 			c.Close()
 		}
 	}
@@ -194,7 +214,7 @@ func (s *Server) Dispatch(c *Peer, args []string) {
 	}
 
 	s.mu.Lock()
-	cb, ok := s.cmds[cmdUp]
+	cmdMeta, ok := s.cmds[cmdUp]
 	s.mu.Unlock()
 	if !ok {
 		c.WriteError(errUnknownCommand(cmd, args))
@@ -204,7 +224,11 @@ func (s *Server) Dispatch(c *Peer, args []string) {
 	s.mu.Lock()
 	s.infoCmds++
 	s.mu.Unlock()
-	cb(c, cmdUp, args)
+	cmdMeta.handler(c, cmdUp, args)
+	if c.SwitchResp3 != nil {
+		c.Resp3 = *c.SwitchResp3
+		c.SwitchResp3 = nil
+	}
 }
 
 // TotalCommands is total (known) commands since this the server started
@@ -212,6 +236,26 @@ func (s *Server) TotalCommands() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.infoCmds
+}
+
+// IsRegisteredCommand checks if a command is registered
+func (s *Server) IsRegisteredCommand(cmd string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cmdUp := strings.ToUpper(cmd)
+	_, ok := s.cmds[cmdUp]
+	return ok
+}
+
+// IsReadOnlyCommand checks if a command is marked as read-only
+func (s *Server) IsReadOnlyCommand(cmd string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cmdUp := strings.ToUpper(cmd)
+	if cmdMeta, ok := s.cmds[cmdUp]; ok {
+		return cmdMeta.readOnly
+	}
+	return false
 }
 
 // ClientsLen gives the number of connected clients right now
@@ -234,9 +278,11 @@ type Peer struct {
 	w            *bufio.Writer
 	closed       bool
 	Resp3        bool
+	SwitchResp3  *bool       // we'll switch to this version _after_ the command
 	Ctx          interface{} // anything goes, server won't touch this
 	onDisconnect []func()    // list of callbacks
 	mu           sync.Mutex  // for Block()
+	ClientName   string      // client name set by CLIENT SETNAME
 }
 
 func NewPeer(w *bufio.Writer) *Peer {
@@ -257,6 +303,13 @@ func (c *Peer) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
+}
+
+// Return true if the peer connection closed.
+func (c *Peer) Closed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 // Register a function to execute on disconnect. There can be multiple
@@ -354,6 +407,13 @@ func (c *Peer) WriteRaw(s string) {
 	})
 }
 
+// WriteStrings is a helper to (bulk)write a string list
+func (c *Peer) WriteStrings(strs []string) {
+	c.Block(func(w *Writer) {
+		w.WriteStrings(strs)
+	})
+}
+
 func toInline(s string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) {
@@ -407,6 +467,14 @@ func (w *Writer) WriteBulk(s string) {
 	fmt.Fprintf(w.w, "$%d\r\n%s\r\n", len(s), s)
 }
 
+// WriteStrings writes a list of strings (bulk)
+func (w *Writer) WriteStrings(strs []string) {
+	w.WriteLen(len(strs))
+	for _, s := range strs {
+		w.WriteBulk(s)
+	}
+}
+
 // WriteInt writes an integer
 func (w *Writer) WriteInt(n int) {
 	fmt.Fprintf(w.w, ":%d\r\n", n)
@@ -444,29 +512,8 @@ func (w *Writer) Flush() {
 	w.w.Flush()
 }
 
-// formatFloat formats a float the way redis does (sort-of)
+// formatFloat formats a float the way redis does.
+// Redis uses a method called "grisu2", which we ported from C.
 func formatFloat(v float64) string {
-	if math.IsInf(v, 1) {
-		return "inf"
-	}
-	if math.IsInf(v, -1) {
-		return "-inf"
-	}
-	return stripZeros(fmt.Sprintf("%.12f", v))
-}
-
-func stripZeros(sv string) string {
-	for strings.Contains(sv, ".") {
-		if sv[len(sv)-1] != '0' {
-			break
-		}
-		// Remove trailing 0s.
-		sv = sv[:len(sv)-1]
-		// Ends with a '.'.
-		if sv[len(sv)-1] == '.' {
-			sv = sv[:len(sv)-1]
-			break
-		}
-	}
-	return sv
+	return fpconv.Dtoa(v)
 }

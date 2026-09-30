@@ -4,42 +4,49 @@
 package storecache
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/route"
 	"gopkg.in/yaml.v2"
 
+	"github.com/thanos-io/objstore"
+
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	cache "github.com/thanos-io/thanos/pkg/cache"
+	"github.com/thanos-io/thanos/pkg/cache"
 	"github.com/thanos-io/thanos/pkg/cacheutil"
 	"github.com/thanos-io/thanos/pkg/model"
-	"github.com/thanos-io/thanos/pkg/objstore"
 )
 
 // BucketCacheProvider is a type used to evaluate all bucket cache providers.
 type BucketCacheProvider string
 
 const (
-	InMemoryBucketCacheProvider  BucketCacheProvider = "IN-MEMORY" // In-memory cache-provider for caching bucket.
-	MemcachedBucketCacheProvider BucketCacheProvider = "MEMCACHED" // Memcached cache-provider for caching bucket.
-	RedisBucketCacheProvider     BucketCacheProvider = "REDIS"     // Redis cache-provider for caching bucket.
+	InMemoryBucketCacheProvider   BucketCacheProvider = "IN-MEMORY"  // In-memory cache-provider for caching bucket.
+	MemcachedBucketCacheProvider  BucketCacheProvider = "MEMCACHED"  // Memcached cache-provider for caching bucket.
+	RedisBucketCacheProvider      BucketCacheProvider = "REDIS"      // Redis cache-provider for caching bucket.
+	GroupcacheBucketCacheProvider BucketCacheProvider = "GROUPCACHE" // Groupcache cache-provider for caching bucket.
 )
 
 // CachingWithBackendConfig is a configuration of caching bucket used by Store component.
 type CachingWithBackendConfig struct {
 	Type          BucketCacheProvider `yaml:"type"`
-	BackendConfig interface{}         `yaml:"config"`
+	BackendConfig any                 `yaml:"config"`
 
 	// Basic unit used to cache chunks.
 	ChunkSubrangeSize int64 `yaml:"chunk_subrange_size"`
 
 	// Maximum number of GetRange requests issued by this bucket for single GetRange call. Zero or negative value = unlimited.
 	MaxChunksGetRangeRequests int `yaml:"max_chunks_get_range_requests"`
+
+	MetafileMaxSize model.Bytes `yaml:"metafile_max_size"`
 
 	// TTLs for various cache items.
 	ChunkObjectAttrsTTL time.Duration `yaml:"chunk_object_attrs_ttl"`
@@ -52,7 +59,6 @@ type CachingWithBackendConfig struct {
 	MetafileExistsTTL      time.Duration `yaml:"metafile_exists_ttl"`
 	MetafileDoesntExistTTL time.Duration `yaml:"metafile_doesnt_exist_ttl"`
 	MetafileContentTTL     time.Duration `yaml:"metafile_content_ttl"`
-	MetafileMaxSize        model.Bytes   `yaml:"metafile_max_size"`
 }
 
 func (cfg *CachingWithBackendConfig) Defaults() {
@@ -68,7 +74,7 @@ func (cfg *CachingWithBackendConfig) Defaults() {
 }
 
 // NewCachingBucketFromYaml uses YAML configuration to create new caching bucket.
-func NewCachingBucketFromYaml(yamlContent []byte, bucket objstore.Bucket, logger log.Logger, reg prometheus.Registerer) (objstore.InstrumentedBucket, error) {
+func NewCachingBucketFromYaml(yamlContent []byte, bucket objstore.Bucket, logger log.Logger, reg prometheus.Registerer, r *route.Router, configPath string) (objstore.InstrumentedBucket, error) {
 	level.Info(logger).Log("msg", "loading caching bucket configuration")
 
 	config := &CachingWithBackendConfig{}
@@ -78,12 +84,28 @@ func NewCachingBucketFromYaml(yamlContent []byte, bucket objstore.Bucket, logger
 		return nil, errors.Wrap(err, "parsing config YAML file")
 	}
 
+	// Append the config path to the YAML content. This allows
+	// using identical config with multiple instances.
+	// TODO(GiedriusS): in the long-term add some kind of "name"
+	// identifier for each instance.
+	cfgHash := string(fmt.Sprintf("%d", xxhash.Sum64(append(yamlContent, []byte(configPath)...))))
+
 	backendConfig, err := yaml.Marshal(config.BackendConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "marshal content of cache backend configuration")
 	}
 
 	var c cache.Cache
+	cfg := cache.NewCachingBucketConfig()
+
+	// Configure cache paths.
+	cfg.CacheAttributes("chunks", nil, isTSDBChunkFile, config.ChunkObjectAttrsTTL)
+	cfg.CacheGetRange("chunks", nil, isTSDBChunkFile, config.ChunkSubrangeSize, config.ChunkObjectAttrsTTL, config.ChunkSubrangeTTL, config.MaxChunksGetRangeRequests)
+	cfg.CacheExists("meta.jsons", nil, isMetaFile, config.MetafileExistsTTL, config.MetafileDoesntExistTTL)
+	cfg.CacheGet("meta.jsons", nil, isMetaFile, int(config.MetafileMaxSize), config.MetafileContentTTL, config.MetafileExistsTTL, config.MetafileDoesntExistTTL)
+
+	// Cache Iter requests for root.
+	cfg.CacheIter("blocks-iter", nil, isBlocksRootDir, config.BlocksIterTTL, JSONIterCodec{}, cfgHash)
 
 	switch strings.ToUpper(string(config.Type)) {
 	case string(MemcachedBucketCacheProvider):
@@ -98,10 +120,18 @@ func NewCachingBucketFromYaml(yamlContent []byte, bucket objstore.Bucket, logger
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create inmemory cache")
 		}
+	case string(GroupcacheBucketCacheProvider):
+		const basePath = "/_galaxycache/"
+
+		c, err = cache.NewGroupcache(logger, reg, backendConfig, basePath, r, bucket, cfg)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create groupcache")
+		}
+
 	case string(RedisBucketCacheProvider):
 		redisCache, err := cacheutil.NewRedisClient(logger, "caching-bucket", backendConfig, reg)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to create memcached client")
+			return nil, errors.Wrapf(err, "failed to create redis client")
 		}
 		c = cache.NewRedisCache("caching-bucket", logger, redisCache, reg)
 	default:
@@ -110,15 +140,7 @@ func NewCachingBucketFromYaml(yamlContent []byte, bucket objstore.Bucket, logger
 
 	// Include interactions with cache in the traces.
 	c = cache.NewTracingCache(c)
-	cfg := NewCachingBucketConfig()
-
-	// Configure cache.
-	cfg.CacheGetRange("chunks", c, isTSDBChunkFile, config.ChunkSubrangeSize, config.ChunkObjectAttrsTTL, config.ChunkSubrangeTTL, config.MaxChunksGetRangeRequests)
-	cfg.CacheExists("meta.jsons", c, isMetaFile, config.MetafileExistsTTL, config.MetafileDoesntExistTTL)
-	cfg.CacheGet("meta.jsons", c, isMetaFile, int(config.MetafileMaxSize), config.MetafileContentTTL, config.MetafileExistsTTL, config.MetafileDoesntExistTTL)
-
-	// Cache Iter requests for root.
-	cfg.CacheIter("blocks-iter", c, isBlocksRootDir, config.BlocksIterTTL, JSONIterCodec{})
+	cfg.SetCacheImplementation(c)
 
 	cb, err := NewCachingBucket(bucket, cfg, logger, reg)
 	if err != nil {

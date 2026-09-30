@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/go-kit/log/level"
@@ -12,13 +14,14 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/prometheus/model/labels"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"google.golang.org/protobuf/proto"
 
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 var (
 	bytesBufferPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return bytes.NewBuffer(nil)
 		},
 	}
@@ -290,6 +293,16 @@ func (d MetricFamiliesPerUser) SendSumOfSummariesPerUser(out chan<- prometheus.M
 	}
 }
 
+func (d MetricFamiliesPerUser) SendSumOfHistogramsPerUser(out chan<- prometheus.Metric, desc *prometheus.Desc, histogramName string) {
+	for _, userEntry := range d {
+		if userEntry.user == "" {
+			continue
+		}
+		hd := userEntry.metrics.SumHistograms(histogramName)
+		out <- hd.Metric(desc, userEntry.user)
+	}
+}
+
 func (d MetricFamiliesPerUser) SendSumOfHistograms(out chan<- prometheus.Metric, desc *prometheus.Desc, histogramName string) {
 	hd := HistogramData{}
 	for _, userEntry := range d {
@@ -455,10 +468,77 @@ func (s *SummaryData) Metric(desc *prometheus.Desc, labelValues ...string) prome
 }
 
 // HistogramData keeps data required to build histogram Metric.
+//
+// For native histograms, the Schema and ZeroThreshold are set from the first
+// native histogram encountered. All aggregated histograms should use the same
+// schema, as bucket indices have different meanings across different schemas.
 type HistogramData struct {
 	sampleCount uint64
 	sampleSum   float64
 	buckets     map[float64]uint64
+
+	// Native histogram fields
+	nativeMode      bool
+	Schema          int32
+	ZeroThreshold   float64
+	ZeroCount       uint64
+	PositiveBuckets map[int]int64 // bucket index -> count
+	NegativeBuckets map[int]int64
+}
+
+// isNative returns true if the dto.Histogram carries native histogram data.
+// The authoritative signal is Schema being set (non-nil), which client_golang
+// always populates for native/classic histograms regardless of observation count.
+// Spans alone are insufficient because a zero-observation dual histogram has
+// no spans but still has Schema set.
+func isNative(histo *dto.Histogram) bool {
+	return histo.Schema != nil
+}
+
+func (d *HistogramData) hasNative() bool {
+	return d.nativeMode
+}
+
+// spansCountsToBucketMap converts native histogram spans and absolute bucket counts
+// into a map of bucket index -> count for easier aggregation.
+func spansCountsToBucketMap(spans []*dto.BucketSpan, counts []int64) map[int]int64 {
+	if len(spans) == 0 {
+		return nil
+	}
+	bucketMap := make(map[int]int64, len(counts))
+	var idx int32
+	bucketIdx := 0
+	for _, sp := range spans {
+		idx += sp.GetOffset()
+		for j := 0; j < int(sp.GetLength()) && bucketIdx < len(counts); j++ {
+			bucketMap[int(idx)] += counts[bucketIdx]
+			idx++
+			bucketIdx++
+		}
+	}
+	return bucketMap
+}
+
+// deltasToCountsInt converts delta-encoded bucket counts to absolute counts.
+func deltasToCountsInt(deltas []int64) []int64 {
+	counts := make([]int64, len(deltas))
+	var cur int64
+	for i, d := range deltas {
+		cur += int64(d)
+		counts[i] = cur
+	}
+	return counts
+}
+
+// mergeBucketMaps merges src bucket map into dst bucket map by summing counts for each bucket index.
+func mergeBucketMaps(dst, src map[int]int64) map[int]int64 {
+	if dst == nil {
+		dst = make(map[int]int64)
+	}
+	for idx, count := range src {
+		dst[idx] += count
+	}
+	return dst
 }
 
 // AddHistogram adds histogram from gathered metrics to this histogram data.
@@ -469,6 +549,26 @@ func (d *HistogramData) AddHistogram(histo *dto.Histogram) {
 	d.sampleCount += histo.GetSampleCount()
 	d.sampleSum += histo.GetSampleSum()
 
+	if isNative(histo) {
+		// Initialize schema/threshold on first native histogram
+		if !d.hasNative() {
+			d.Schema = histo.GetSchema()
+			d.ZeroThreshold = histo.GetZeroThreshold()
+			d.nativeMode = true
+		}
+		d.ZeroCount += histo.GetZeroCount()
+
+		posCounts := deltasToCountsInt(histo.GetPositiveDelta())
+		negCounts := deltasToCountsInt(histo.GetNegativeDelta())
+
+		posMap := spansCountsToBucketMap(histo.GetPositiveSpan(), posCounts)
+		negMap := spansCountsToBucketMap(histo.GetNegativeSpan(), negCounts)
+
+		d.PositiveBuckets = mergeBucketMaps(d.PositiveBuckets, posMap)
+		d.NegativeBuckets = mergeBucketMaps(d.NegativeBuckets, negMap)
+	}
+
+	// Always collect classic buckets
 	histoBuckets := histo.GetBucket()
 	if len(histoBuckets) > 0 && d.buckets == nil {
 		d.buckets = map[float64]uint64{}
@@ -487,7 +587,18 @@ func (d *HistogramData) AddHistogram(histo *dto.Histogram) {
 func (d *HistogramData) AddHistogramData(histo HistogramData) {
 	d.sampleCount += histo.sampleCount
 	d.sampleSum += histo.sampleSum
+	if histo.hasNative() {
+		if !d.hasNative() {
+			d.Schema = histo.Schema
+			d.ZeroThreshold = histo.ZeroThreshold
+			d.nativeMode = true
+		}
+		d.ZeroCount += histo.ZeroCount
+		d.PositiveBuckets = mergeBucketMaps(d.PositiveBuckets, histo.PositiveBuckets)
+		d.NegativeBuckets = mergeBucketMaps(d.NegativeBuckets, histo.NegativeBuckets)
+	}
 
+	// Always merge classic buckets.
 	if len(histo.buckets) > 0 && d.buckets == nil {
 		d.buckets = map[float64]uint64{}
 	}
@@ -498,11 +609,84 @@ func (d *HistogramData) AddHistogramData(histo HistogramData) {
 	}
 }
 
+// nativeHistogramMetric enables dual-format histogram exposition (both native and classic simultaneously).
+// Similar to prometheus/client_golang's constNativeHistogram (see
+// https://github.com/prometheus/client_golang/blob/v1.23.2/prometheus/histogram.go#L1865-L1869)
+// but populates both native histogram fields (spans/deltas) and classic bucket fields,
+// allowing scrapers to choose which format to use via content negotiation.
+type nativeHistogramMetric struct {
+	desc *prometheus.Desc
+	dto.Histogram
+	labelPairs []*dto.LabelPair
+}
+
+func (m *nativeHistogramMetric) Desc() *prometheus.Desc { return m.desc }
+func (m *nativeHistogramMetric) Write(out *dto.Metric) error {
+	out.Histogram = &m.Histogram
+	out.Label = m.labelPairs
+	return nil
+}
+
 // Metric returns prometheus metric from this histogram data.
 //
 // Note that returned metric shares bucket with this HistogramData, so avoid
 // doing more modifications to this HistogramData after calling Metric.
 func (d *HistogramData) Metric(desc *prometheus.Desc, labelValues ...string) prometheus.Metric {
+	if d.hasNative() {
+		// Build native spans+deltas from bucket maps.
+		posSpans, posDeltas := makeBucketsFromMap(d.PositiveBuckets)
+		negSpans, negDeltas := makeBucketsFromMap(d.NegativeBuckets)
+
+		schema := d.Schema
+		zt := d.ZeroThreshold
+		sc := d.sampleCount
+		ss := d.sampleSum
+		zc := d.ZeroCount
+
+		// Build classic buckets if available
+		var buckets []*dto.Bucket
+		if len(d.buckets) > 0 {
+			buckets = make([]*dto.Bucket, 0, len(d.buckets))
+			for ub, cc := range d.buckets {
+				upperBound := ub
+				cumCount := cc
+				buckets = append(buckets, &dto.Bucket{
+					UpperBound:      &upperBound,
+					CumulativeCount: &cumCount,
+				})
+			}
+			sort.Slice(buckets, func(i, j int) bool {
+				return buckets[i].GetUpperBound() < buckets[j].GetUpperBound()
+			})
+		}
+
+		// Sentinel span for native histograms with no observations.
+		// This is required to distinguish an empty native histogram from a classic histogram.
+		// Matches prometheus/client_golang behavior:
+		// https://github.com/prometheus/client_golang/blob/v1.23.2/prometheus/histogram.go#L1958-L1962
+		if zt == 0 && zc == 0 && len(posSpans) == 0 && len(negSpans) == 0 {
+			posSpans = []*dto.BucketSpan{{
+				Offset: proto.Int32(0),
+				Length: proto.Uint32(0),
+			}}
+		}
+
+		// Construct histogram in-place within the struct (no intermediate copy)
+		return &nativeHistogramMetric{
+			desc:          desc,
+			Schema:        &schema,
+			ZeroThreshold: &zt,
+			SampleCount:   &sc,
+			SampleSum:     &ss,
+			ZeroCount:     &zc,
+			PositiveSpan:  posSpans,
+			PositiveDelta: posDeltas,
+			NegativeSpan:  negSpans,
+			NegativeDelta: negDeltas,
+			Bucket:        buckets,
+			labelPairs:    prometheus.MakeLabelPairs(desc, labelValues),
+		}
+	}
 	return prometheus.MustNewConstHistogram(desc, d.sampleCount, d.sampleSum, d.buckets, labelValues...)
 }
 
@@ -562,13 +746,14 @@ type UserRegistry struct {
 // UserRegistries holds Prometheus registries for multiple users, guaranteeing
 // multi-thread safety and stable ordering.
 type UserRegistries struct {
-	regsMu sync.Mutex
-	regs   []UserRegistry
+	regsMu         sync.Mutex
+	regs           []UserRegistry
+	removedMetrics MetricFamilyMap
 }
 
 // NewUserRegistries makes new UserRegistries.
 func NewUserRegistries() *UserRegistries {
-	return &UserRegistries{}
+	return &UserRegistries{removedMetrics: make(MetricFamilyMap)}
 }
 
 // AddUserRegistry adds an user registry. If user already has a registry,
@@ -647,15 +832,21 @@ func (r *UserRegistries) softRemoveUserRegistry(ur *UserRegistry) bool {
 		return false
 	}
 
-	ur.lastGather, err = NewMetricFamilyMap(last)
+	gatheredMetrics, err := NewMetricFamilyMap(last)
 	if err != nil {
 		level.Warn(util_log.Logger).Log("msg", "failed to gather metrics from registry", "user", ur.user, "err", err)
 		return false
 	}
 
+	aggregatedMetrics, err := MergeMetricFamilies([]MetricFamilyMap{gatheredMetrics, r.removedMetrics})
+	if err != nil {
+		level.Warn(util_log.Logger).Log("msg", "failed to merge metrics", "user", ur.user, "err", err)
+		return false
+	}
+	r.removedMetrics = aggregatedMetrics
 	ur.user = ""
 	ur.reg = nil
-	return true
+	return false
 }
 
 // Registries returns a copy of the user registries list.
@@ -704,12 +895,17 @@ func (r *UserRegistries) BuildMetricFamiliesPerUser() MetricFamiliesPerUser {
 			continue
 		}
 	}
+	data = append(data, struct {
+		user    string
+		metrics MetricFamilyMap
+	}{
+		user: "", metrics: r.removedMetrics})
 	return data
 }
 
 // FromLabelPairsToLabels converts dto.LabelPair into labels.Labels.
 func FromLabelPairsToLabels(pairs []*dto.LabelPair) labels.Labels {
-	builder := labels.NewBuilder(nil)
+	builder := labels.NewBuilder(labels.EmptyLabels())
 	for _, pair := range pairs {
 		builder.Set(pair.GetName(), pair.GetValue())
 	}
@@ -743,7 +939,7 @@ func GetSumOfHistogramSampleCount(families []*dto.MetricFamily, metricName strin
 	return sum
 }
 
-// GetLables returns list of label combinations used by this collector at the time of call.
+// GetLabels returns list of label combinations used by this collector at the time of call.
 // This can be used to find and delete unused metrics.
 func GetLabels(c prometheus.Collector, filter map[string]string) ([]labels.Labels, error) {
 	ch := make(chan prometheus.Metric, 16)
@@ -756,7 +952,7 @@ func GetLabels(c prometheus.Collector, filter map[string]string) ([]labels.Label
 	errs := tsdb_errors.NewMulti()
 	var result []labels.Labels
 	dtoMetric := &dto.Metric{}
-	lbls := labels.NewBuilder(nil)
+	lbls := labels.NewBuilder(labels.EmptyLabels())
 
 nextMetric:
 	for m := range ch {
@@ -767,7 +963,7 @@ nextMetric:
 			continue
 		}
 
-		lbls.Reset(nil)
+		lbls.Reset(labels.EmptyLabels())
 		for _, lp := range dtoMetric.Label {
 			n := lp.GetName()
 			v := lp.GetValue()
@@ -804,4 +1000,279 @@ func DeleteMatchingLabels(c CollectorVec, filter map[string]string) error {
 type CollectorVec interface {
 	prometheus.Collector
 	Delete(labels prometheus.Labels) bool
+}
+
+type MergedMetricFamily struct {
+	metricFamily *dto.MetricFamily
+	metricMap    MetricMap
+}
+
+func (m *MergedMetricFamily) CreateMetricFamily() *dto.MetricFamily {
+	newMetricFamily := proto.Clone(m.metricFamily).(*dto.MetricFamily)
+	var metrics []*dto.Metric
+
+	for _, metric := range m.metricMap.metrics {
+		for _, m := range metric {
+			metrics = append(metrics, m.metric)
+		}
+	}
+
+	newMetricFamily.Metric = metrics
+	return newMetricFamily
+}
+
+// MergeMetricFamilies - Capable of merging summaries, histograms, and counters
+func MergeMetricFamilies(metricFamilies []MetricFamilyMap) (MetricFamilyMap, error) {
+	mergedMap := make(map[string]*MergedMetricFamily)
+
+	for _, mf := range metricFamilies {
+		for metricName, metricFamily := range mf {
+			mergeFunc, err := getMergeFunc(metricFamily.GetType())
+			if err != nil {
+				return nil, err
+			}
+
+			if _, found := mergedMap[metricName]; !found {
+				mergedMap[metricName] = &MergedMetricFamily{metricFamily: proto.Clone(metricFamily).(*dto.MetricFamily), metricMap: NewMetricMap()}
+			}
+
+			for _, metric := range metricFamily.Metric {
+				(mergedMap[metricName].metricMap).AddOrSetMetric(metric, mergeFunc)
+			}
+		}
+	}
+
+	metricFamilyMap := make(MetricFamilyMap)
+	for metricName, mergedMetricFamily := range mergedMap {
+		metricFamilyMap[metricName] = mergedMetricFamily.CreateMetricFamily()
+	}
+
+	return metricFamilyMap, nil
+}
+
+func getMergeFunc(metricType dto.MetricType) (func(existing *dto.Metric, new *dto.Metric), error) {
+	switch metricType {
+	case dto.MetricType_SUMMARY:
+		return mergeSummary, nil
+	case dto.MetricType_COUNTER:
+		return mergeCounter, nil
+	case dto.MetricType_HISTOGRAM:
+		return mergeHistogram, nil
+	default:
+		return nil, fmt.Errorf("unknown metric type: %v", metricType)
+	}
+}
+
+func mergeCounter(mf1, mf2 *dto.Metric) {
+	newValue := *mf1.Counter.Value + *mf2.Counter.Value
+	mf1.Counter.Value = &newValue
+}
+
+func mergeHistogram(mf1, mf2 *dto.Metric) {
+	newSampleCount := *mf1.Histogram.SampleCount + *mf2.Histogram.SampleCount
+	newSampleSum := *mf1.Histogram.SampleSum + *mf2.Histogram.SampleSum
+	mf1.Histogram.SampleCount = &newSampleCount
+	mf1.Histogram.SampleSum = &newSampleSum
+
+	h1 := mf1.Histogram
+	h2 := mf2.Histogram
+
+	// Merge native histogram data if present.
+	// We'll process both native AND classic data below and expose in both formats
+	if isNative(h1) || isNative(h2) {
+		// Use schema/threshold from whichever side has native data.
+		// Assumption: when both have native data, they share the same schema/zero_threshold.
+		// This holds for SendSumOfHistograms use case which aggregates metrics from the same
+		// prometheus client library histogram across multiple instances.
+		if !isNative(h1) {
+			schema := h2.GetSchema()
+			h1.Schema = &schema
+			zt := h2.GetZeroThreshold()
+			h1.ZeroThreshold = &zt
+		}
+
+		// Merge zero bucket counts
+		zc := h1.GetZeroCount() + h2.GetZeroCount()
+		h1.ZeroCount = &zc
+
+		// Convert spans+deltas to bucket maps, merge them, then convert back
+		posCounts1 := deltasToCountsInt(h1.GetPositiveDelta())
+		posCounts2 := deltasToCountsInt(h2.GetPositiveDelta())
+		negCounts1 := deltasToCountsInt(h1.GetNegativeDelta())
+		negCounts2 := deltasToCountsInt(h2.GetNegativeDelta())
+
+		posMap := mergeBucketMaps(
+			spansCountsToBucketMap(h1.GetPositiveSpan(), posCounts1),
+			spansCountsToBucketMap(h2.GetPositiveSpan(), posCounts2),
+		)
+		negMap := mergeBucketMaps(
+			spansCountsToBucketMap(h1.GetNegativeSpan(), negCounts1),
+			spansCountsToBucketMap(h2.GetNegativeSpan(), negCounts2),
+		)
+
+		h1.PositiveSpan, h1.PositiveDelta = makeBucketsFromMap(posMap)
+		h1.NegativeSpan, h1.NegativeDelta = makeBucketsFromMap(negMap)
+	}
+
+	// Merge classic histogram buckets if present.
+	if len(h1.GetBucket()) > 0 || len(h2.GetBucket()) > 0 {
+		bucketMap := map[float64]uint64{}
+		for _, bucket := range append(h1.GetBucket(), h2.GetBucket()...) {
+			bucketMap[bucket.GetUpperBound()] += bucket.GetCumulativeCount()
+		}
+
+		var newBucket []*dto.Bucket
+		for upperBound, cumulativeCount := range bucketMap {
+			ubValue := upperBound
+			ccValue := cumulativeCount
+			newBucket = append(newBucket, &dto.Bucket{UpperBound: &ubValue, CumulativeCount: &ccValue})
+		}
+		// Sort buckets by UpperBound to ensure deterministic order
+		sort.Slice(newBucket, func(i, j int) bool {
+			return newBucket[i].GetUpperBound() < newBucket[j].GetUpperBound()
+		})
+		h1.Bucket = newBucket
+	}
+}
+
+// makeBucketsFromMap converts a bucket index->count map back into the
+// spans+deltas encoding used by the native histogram proto representation.
+//
+// Implementation adapted from prometheus/client_golang's makeBucketsFromMap
+// (https://github.com/prometheus/client_golang/blob/v1.23.2/prometheus/histogram.go#L2006-L2056)
+// with the gap-filling optimization: gaps of 1-2 empty buckets are filled with zeros
+// rather than creating new spans, resulting in more efficient encoding.
+func makeBucketsFromMap(buckets map[int]int64) ([]*dto.BucketSpan, []int64) {
+	if len(buckets) == 0 {
+		return nil, nil
+	}
+	var ii []int
+	for k := range buckets {
+		ii = append(ii, k)
+	}
+	sort.Ints(ii)
+
+	var (
+		spans     []*dto.BucketSpan
+		deltas    []int64
+		prevCount int64
+		nextI     int
+	)
+
+	appendDelta := func(count int64) {
+		*spans[len(spans)-1].Length++
+		deltas = append(deltas, count-prevCount)
+		prevCount = count
+	}
+
+	for n, i := range ii {
+		count := buckets[i]
+		// Multiple spans with only small gaps in between are probably
+		// encoded more efficiently as one larger span with a few empty
+		// buckets. Needs some research to find the sweet spot. For now,
+		// we assume that gaps of one or two buckets should not create
+		// a new span.
+		iDelta := int32(i - nextI)
+		if n == 0 || iDelta > 2 {
+			// We have to create a new span, either because we are
+			// at the very beginning, or because we have found a gap
+			// of more than two buckets.
+			spans = append(spans, &dto.BucketSpan{
+				Offset: new(iDelta),
+				Length: proto.Uint32(0),
+			})
+		} else {
+			// We have found a small gap (or no gap at all).
+			// Insert empty buckets as needed.
+			for range iDelta {
+				appendDelta(0)
+			}
+		}
+		appendDelta(count)
+		nextI = i + 1
+	}
+	return spans, deltas
+}
+
+func mergeSummary(mf1 *dto.Metric, mf2 *dto.Metric) {
+	newSampleCount := *mf1.Summary.SampleCount + *mf2.Summary.SampleCount
+	newSampleSum := *mf1.Summary.SampleSum + *mf2.Summary.SampleSum
+
+	// we are not merging the Quantiles themselves because there's no operation that makes sense
+	mf1.Summary.Quantile = []*dto.Quantile{}
+	mf1.Summary.SampleCount = &newSampleCount
+	mf1.Summary.SampleSum = &newSampleSum
+}
+
+type MetricMap struct {
+	metrics map[string][]*Metric
+	lock    sync.Mutex
+}
+
+type Metric struct {
+	metric *dto.Metric
+	lock   sync.Mutex
+}
+
+func NewMetricMap() MetricMap {
+	return MetricMap{
+		metrics: make(map[string][]*Metric),
+	}
+}
+
+// AddOrSetMetric - given a metric, see if there's another metric with the same labels. If not, add metric to list
+// If yes, call mergeFn to merge the two metrics in-place, and updating existing metric
+func (m *MetricMap) AddOrSetMetric(metric *dto.Metric, mergeFn func(existing *dto.Metric, new *dto.Metric)) {
+	var metricLabels []string
+	for _, labelPair := range metric.GetLabel() {
+		metricLabels = append(metricLabels, fmt.Sprintf("%s=%s", labelPair.GetName(), labelPair.GetValue()))
+	}
+
+	metricKey := strings.Join(metricLabels, ",")
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if metrics, found := m.metrics[metricKey]; found {
+		// we might have hash collision, so let's iterate through the list to make sure the item is actually what we want
+		for _, existingMetric := range metrics {
+			same := m.compareLabels(existingMetric.metric.GetLabel(), metric.GetLabel())
+			if same {
+				existingMetric.lock.Lock()
+				mergeFn(existingMetric.metric, metric)
+				existingMetric.lock.Unlock()
+				return
+			}
+		}
+		// only get there if we don't have the same metric, so let's append it
+		m.metrics[metricKey] = append(m.metrics[metricKey], &Metric{metric: metric})
+		return
+	}
+
+	// no such key, so let's add it
+	m.metrics[metricKey] = []*Metric{{metric: metric}}
+}
+
+func (m *MetricMap) compareLabels(labels1, labels2 []*dto.LabelPair) bool {
+	if len(labels1) != len(labels2) {
+		return false
+	}
+
+	// create a map of labels for lookup
+	labelMap := make(map[string]string)
+	for _, labelPair := range labels1 {
+		labelMap[labelPair.GetName()] = labelPair.GetValue()
+	}
+
+	for _, labelPair := range labels2 {
+		if value, found := labelMap[labelPair.GetName()]; found {
+			if value != labelPair.GetValue() {
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+
+	return true
 }

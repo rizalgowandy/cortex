@@ -15,67 +15,73 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 
 ## Endpoints
 
-| API | Service | Endpoint |
-| --- | ------- | -------- |
-| [Index page](#index-page) | _All services_ | `GET /` |
-| [Configuration](#configuration) | _All services_ | `GET /config` |
-| [Runtime Configuration](#runtime-configuration) | _All services_ | `GET /runtime_config` |
-| [Services status](#services-status) | _All services_ | `GET /services` |
-| [Readiness probe](#readiness-probe) | _All services_ | `GET /ready` |
-| [Metrics](#metrics) | _All services_ | `GET /metrics` |
-| [Pprof](#pprof) | _All services_ | `GET /debug/pprof` |
-| [Fgprof](#fgprof) | _All services_ | `GET /debug/fgprof` |
-| [Remote write](#remote-write) | Distributor | `POST /api/v1/push` |
-| [Tenants stats](#tenants-stats) | Distributor | `GET /distributor/all_user_stats` |
-| [HA tracker status](#ha-tracker-status) | Distributor | `GET /distributor/ha_tracker` |
-| [Flush chunks / blocks](#flush-chunks--blocks) | Ingester | `GET,POST /ingester/flush` |
-| [Shutdown](#shutdown) | Ingester | `GET,POST /ingester/shutdown` |
-| [Ingesters ring status](#ingesters-ring-status) | Ingester | `GET /ingester/ring` |
-| [Instant query](#instant-query) | Querier, Query-frontend | `GET,POST <prometheus-http-prefix>/api/v1/query` |
-| [Range query](#range-query) | Querier, Query-frontend | `GET,POST <prometheus-http-prefix>/api/v1/query_range` |
-| [Exemplar query](#exemplar-query) | Querier, Query-frontend | `GET,POST <prometheus-http-prefix>/api/v1/query_exemplars` |
-| [Get series by label matchers](#get-series-by-label-matchers) | Querier, Query-frontend | `GET,POST <prometheus-http-prefix>/api/v1/series` |
-| [Get label names](#get-label-names) | Querier, Query-frontend | `GET,POST <prometheus-http-prefix>/api/v1/labels` |
-| [Get label values](#get-label-values) | Querier, Query-frontend | `GET <prometheus-http-prefix>/api/v1/label/{name}/values` |
-| [Get metric metadata](#get-metric-metadata) | Querier, Query-frontend | `GET <prometheus-http-prefix>/api/v1/metadata` |
-| [Remote read](#remote-read) | Querier, Query-frontend | `POST <prometheus-http-prefix>/api/v1/read` |
-| [Get tenant ingestion stats](#get-tenant-ingestion-stats) | Querier | `GET /api/v1/user_stats` |
-| [Get tenant chunks](#get-tenant-chunks) | Querier | `GET /api/v1/chunks` |
-| [Ruler ring status](#ruler-ring-status) | Ruler | `GET /ruler/ring` |
-| [Ruler rules ](#ruler-rule-groups) | Ruler | `GET /ruler/rule_groups` |
-| [List rules](#list-rules) | Ruler | `GET <prometheus-http-prefix>/api/v1/rules` |
-| [List alerts](#list-alerts) | Ruler | `GET <prometheus-http-prefix>/api/v1/alerts` |
-| [List rule groups](#list-rule-groups) | Ruler | `GET /api/v1/rules` |
-| [Get rule groups by namespace](#get-rule-groups-by-namespace) | Ruler | `GET /api/v1/rules/{namespace}` |
-| [Get rule group](#get-rule-group) | Ruler | `GET /api/v1/rules/{namespace}/{groupName}` |
-| [Set rule group](#set-rule-group) | Ruler | `POST /api/v1/rules/{namespace}` |
-| [Delete rule group](#delete-rule-group) | Ruler | `DELETE /api/v1/rules/{namespace}/{groupName}` |
-| [Delete namespace](#delete-namespace) | Ruler | `DELETE /api/v1/rules/{namespace}` |
-| [Delete tenant configuration](#delete-tenant-configuration) | Ruler | `POST /ruler/delete_tenant_config` |
-| [Alertmanager status](#alertmanager-status) | Alertmanager | `GET /multitenant_alertmanager/status` |
-| [Alertmanager configs](#alertmanager-configs) | Alertmanager | `GET /multitenant_alertmanager/configs` |
-| [Alertmanager ring status](#alertmanager-ring-status) | Alertmanager | `GET /multitenant_alertmanager/ring` |
-| [Alertmanager UI](#alertmanager-ui) | Alertmanager | `GET /<alertmanager-http-prefix>` |
-| [Alertmanager Delete Tenant Configuration](#alertmanager-delete-tenant-configuration) | Alertmanager | `POST /multitenant_alertmanager/delete_tenant_config` |
-| [Get Alertmanager configuration](#get-alertmanager-configuration) | Alertmanager | `GET /api/v1/alerts` |
-| [Set Alertmanager configuration](#set-alertmanager-configuration) | Alertmanager | `POST /api/v1/alerts` |
-| [Delete Alertmanager configuration](#delete-alertmanager-configuration) | Alertmanager | `DELETE /api/v1/alerts` |
-| [Delete series](#delete-series) | Purger | `PUT,POST <prometheus-http-prefix>/api/v1/admin/tsdb/delete_series` |
-| [List delete requests](#list-delete-requests) | Purger | `GET <prometheus-http-prefix>/api/v1/admin/tsdb/delete_series` |
-| [Cancel delete request](#cancel-delete-request) | Purger | `PUT,POST <prometheus-http-prefix>/api/v1/admin/tsdb/cancel_delete_request` |
-| [Tenant delete request](#tenant-delete-request) | Purger | `POST /purger/delete_tenant` |
-| [Tenant delete status](#tenant-delete-status) | Purger | `GET /purger/delete_tenant_status` |
-| [Store-gateway ring status](#store-gateway-ring-status) | Store-gateway | `GET /store-gateway/ring` |
-| [Compactor ring status](#compactor-ring-status) | Compactor | `GET /compactor/ring` |
-| [Get rule files](#get-rule-files) | Configs API (deprecated) | `GET /api/prom/configs/rules` |
-| [Set rule files](#set-rule-files) | Configs API (deprecated) | `POST /api/prom/configs/rules` |
-| [Get template files](#get-template-files) | Configs API (deprecated) | `GET /api/prom/configs/templates` |
-| [Set template files](#set-template-files) | Configs API (deprecated) | `POST /api/prom/configs/templates` |
-| [Get Alertmanager config file](#get-alertmanager-config-file) | Configs API (deprecated) | `GET /api/prom/configs/alertmanager` |
-| [Set Alertmanager config file](#set-alertmanager-config-file) | Configs API (deprecated) | `POST /api/prom/configs/alertmanager` |
-| [Validate Alertmanager config](#validate-alertmanager-config-file) | Configs API (deprecated) | `POST /api/prom/configs/alertmanager/validate` |
-| [Deactivate configs](#deactivate-configs) | Configs API (deprecated) | `DELETE /api/prom/configs/deactivate` |
-| [Restore configs](#restore-configs) | Configs API (deprecated) | `POST /api/prom/configs/restore` |
+| API | Service | Available Since | Endpoint |
+| --- | ------- | --------------- | ---------|
+| [Index page](#index-page) | _All services_ || `GET /` |
+| [Configuration](#configuration) | _All services_ || `GET /config` |
+| [Runtime Configuration](#runtime-configuration) | _All services_ || `GET /runtime_config` |
+| [Services status](#services-status) | _All services_ || `GET /services` |
+| [Readiness probe](#readiness-probe) | _All services_ || `GET /ready` |
+| [Metrics](#metrics) | _All services_ || `GET /metrics` |
+| [Pprof](#pprof) | _All services_ || `GET /debug/pprof` |
+| [Fgprof](#fgprof) | _All services_ || `GET /debug/fgprof` |
+| [Remote write](#remote-write) | Distributor || `POST /api/v1/push` |
+| [OTLP receiver](#otlp-receiver) | Distributor || `POST /api/v1/otlp/v1/metrics` |
+| [Tenants stats](#tenants-stats) | Distributor || `GET /distributor/all_user_stats` |
+| [HA tracker status](#ha-tracker-status) | Distributor || `GET /distributor/ha_tracker` |
+| [Flush blocks](#flush-blocks) | Ingester || `GET,POST /ingester/flush` |
+| [Shutdown](#shutdown) | Ingester || `GET,POST /ingester/shutdown` |
+| [Ingesters ring status](#ingesters-ring-status) | Ingester || `GET /ingester/ring` |
+| [Ingester tenants stats](#ingester-tenants-stats) | Ingester || `GET /ingester/all_user_stats` |
+| [Ingester mode](#ingester-mode) | Ingester || `GET,POST /ingester/mode` |
+| [Instant query](#instant-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/query` |
+| [Range query](#range-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/query_range` |
+| [Exemplar query](#exemplar-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/query_exemplars` |
+| [Format query](#format-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/format_query` |
+| [Parse query](#parse-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/parse_query` |
+| [Get series by label matchers](#get-series-by-label-matchers) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/series` |
+| [Get label names](#get-label-names) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/labels` |
+| [Get label values](#get-label-values) | Querier, Query-frontend || `GET <prometheus-http-prefix>/api/v1/label/{name}/values` |
+| [Get metric metadata](#get-metric-metadata) | Querier, Query-frontend || `GET <prometheus-http-prefix>/api/v1/metadata` |
+| [Remote read](#remote-read) | Querier, Query-frontend || `POST <prometheus-http-prefix>/api/v1/read` |
+| [Build information](#build-information) | Querier, Query-frontend |v1.15.0| `GET <prometheus-http-prefix>/api/v1/status/buildinfo` |
+| [Get tenant ingestion stats](#get-tenant-ingestion-stats) | Querier || `GET /api/v1/user_stats` |
+| [Ruler ring status](#ruler-ring-status) | Ruler || `GET /ruler/ring` |
+| [Ruler rules ](#ruler-rule-groups) | Ruler || `GET /ruler/rule_groups` |
+| [List rules](#list-rules) | Ruler || `GET <prometheus-http-prefix>/api/v1/rules` |
+| [List alerts](#list-alerts) | Ruler || `GET <prometheus-http-prefix>/api/v1/alerts` |
+| [List rule groups](#list-rule-groups) | Ruler || `GET /api/v1/rules` |
+| [Get rule groups by namespace](#get-rule-groups-by-namespace) | Ruler || `GET /api/v1/rules/{namespace}` |
+| [Get rule group](#get-rule-group) | Ruler || `GET /api/v1/rules/{namespace}/{groupName}` |
+| [Set rule group](#set-rule-group) | Ruler || `POST /api/v1/rules/{namespace}` |
+| [Delete rule group](#delete-rule-group) | Ruler || `DELETE /api/v1/rules/{namespace}/{groupName}` |
+| [Delete namespace](#delete-namespace) | Ruler || `DELETE /api/v1/rules/{namespace}` |
+| [Delete tenant configuration](#delete-tenant-configuration) | Ruler || `POST /ruler/delete_tenant_config` |
+| [Alertmanager status](#alertmanager-status) | Alertmanager || `GET /multitenant_alertmanager/status` |
+| [Alertmanager configs](#alertmanager-configs) | Alertmanager || `GET /multitenant_alertmanager/configs` |
+| [Alertmanager ring status](#alertmanager-ring-status) | Alertmanager || `GET /multitenant_alertmanager/ring` |
+| [Alertmanager UI](#alertmanager-ui) | Alertmanager || `GET /<alertmanager-http-prefix>` |
+| [Alertmanager Delete Tenant Configuration](#alertmanager-delete-tenant-configuration) | Alertmanager || `POST /multitenant_alertmanager/delete_tenant_config` |
+| [Get Alertmanager configuration](#get-alertmanager-configuration) | Alertmanager || `GET /api/v1/alerts` |
+| [Set Alertmanager configuration](#set-alertmanager-configuration) | Alertmanager || `POST /api/v1/alerts` |
+| [Delete Alertmanager configuration](#delete-alertmanager-configuration) | Alertmanager || `DELETE /api/v1/alerts` |
+| [Tenant delete request](#tenant-delete-request) | Purger || `POST /purger/delete_tenant` |
+| [Tenant delete status](#tenant-delete-status) | Purger || `GET /purger/delete_tenant_status` |
+| [Get user overrides](#get-user-overrides) | Overrides || `GET /api/v1/user-overrides` |
+| [Set user overrides](#set-user-overrides) | Overrides || `POST /api/v1/user-overrides` |
+| [Delete user overrides](#delete-user-overrides) | Overrides || `DELETE /api/v1/user-overrides` |
+| [Store-gateway ring status](#store-gateway-ring-status) | Store-gateway || `GET /store-gateway/ring` |
+| [Compactor ring status](#compactor-ring-status) | Compactor || `GET /compactor/ring` |
+| [Parquet Converter ring status](#parquet-converter-ring-status) | Parquet Converter || `GET /parquet-converter/ring` |
+| [Get rule files](#get-rule-files) | Configs API (deprecated) || `GET /api/prom/configs/rules` |
+| [Set rule files](#set-rule-files) | Configs API (deprecated) || `POST /api/prom/configs/rules` |
+| [Get template files](#get-template-files) | Configs API (deprecated) || `GET /api/prom/configs/templates` |
+| [Set template files](#set-template-files) | Configs API (deprecated) || `POST /api/prom/configs/templates` |
+| [Get Alertmanager config file](#get-alertmanager-config-file) | Configs API (deprecated) || `GET /api/prom/configs/alertmanager` |
+| [Set Alertmanager config file](#set-alertmanager-config-file) | Configs API (deprecated) || `POST /api/prom/configs/alertmanager` |
+| [Validate Alertmanager config](#validate-alertmanager-config-file) | Configs API (deprecated) || `POST /api/prom/configs/alertmanager/validate` |
+| [Deactivate configs](#deactivate-configs) | Configs API (deprecated) || `DELETE /api/prom/configs/deactivate` |
+| [Restore configs](#restore-configs) | Configs API (deprecated) || `POST /api/prom/configs/restore` |
 
 
 ### Path prefixes
@@ -214,6 +220,18 @@ _For more information, please check out Prometheus [Remote storage integrations]
 
 _Requires [authentication](#authentication)._
 
+### OTLP Receiver
+
+```
+POST /api/v1/otlp/v1/metrics
+```
+
+Entrypoint for the OTLP Receiver
+
+This API endpoint accepts a HTTP POST request using [OTLP](https://opentelemetry.io/docs/specs/otlp/) format
+
+_Requires [authentication](#authentication)._
+
 ### Distributor ring status
 
 ```
@@ -231,7 +249,7 @@ GET /distributor/all_user_stats
 GET /all_user_stats
 ```
 
-Displays a web page with per-tenant statistics updated in realtime, including the total number of active series across all ingesters and the current ingestion rate (samples / sec).
+Displays a web page with per-tenant statistics updated in realtime, including the total number of loaded blocks and active series across all ingesters as well as the current ingestion rate (samples / sec).
 
 ### HA tracker status
 
@@ -247,7 +265,7 @@ Displays a web page with the current status of the HA tracker, including the ele
 
 ## Ingester
 
-### Flush chunks / blocks
+### Flush blocks
 
 ```
 GET,POST /ingester/flush
@@ -256,11 +274,11 @@ GET,POST /ingester/flush
 GET,POST /flush
 ```
 
-Triggers a flush of the in-memory time series data (chunks or blocks) to the long-term storage. This endpoint triggers the flush also when `-ingester.flush-on-shutdown-with-wal-enabled` or `-blocks-storage.tsdb.flush-blocks-on-shutdown` are disabled.
+Triggers a flush of the in-memory time series data to the long-term storage. This endpoint triggers the flush also when `-ingester.flush-on-shutdown-with-wal-enabled` or `-blocks-storage.tsdb.flush-blocks-on-shutdown` are disabled.
 
-When using blocks storage, this endpoint accepts `tenant` parameter to specify tenant whose blocks are compacted and shipped. This parameter may be specified multiple times to select more tenants. If no tenant is specified, all tenants are flushed.
+This endpoint accepts `tenant` parameter to specify tenant whose blocks are compacted and shipped. This parameter may be specified multiple times to select more tenants. If no tenant is specified, all tenants are flushed.
 
-Flush endpoint now also accepts `wait=true` parameter, which makes the call synchronous – it will only return after flushing has finished. Note that returned status code does not reflect the result of flush operation. This parameter is only available when using blocks storage.
+Flush endpoint now also accepts `wait=true` parameter, which makes the call synchronous – it will only return after flushing has finished. Note that returned status code does not reflect the result of flush operation.
 
 ### Shutdown
 
@@ -286,6 +304,24 @@ GET /ring
 
 Displays a web page with the ingesters hash ring status, including the state, healthy and last heartbeat time of each ingester.
 
+### Ingester tenants stats
+
+```
+GET /ingester/all_user_stats
+
+```
+
+Displays a web page with per-tenant statistics updated in realtime, including the total number of loaded blocks and active series from a specific ingester as well as the current ingestion rate (samples / sec).
+
+### Ingester mode
+
+```
+GET,POST /ingester/mode
+```
+Change ingester mode between ACTIVE or READONLY. READONLY ingester does not receive push requests and will only be called for query operations.
+
+The endpoint accept query param `mode` or POST as `application/x-www-form-urlencoded` with mode type.
+
 
 ## Querier / Query-frontend
 
@@ -301,6 +337,7 @@ GET,POST <legacy-http-prefix>/api/v1/query
 ```
 
 Prometheus-compatible instant query endpoint.
+PromQL engine can be selected using `X-PromQL-EngineType` header with values `prometheus` (default) and `thanos`.
 
 _For more information, please check out the Prometheus [instant query](https://prometheus.io/docs/prometheus/latest/querying/api/#instant-queries) documentation._
 
@@ -316,6 +353,7 @@ GET,POST <legacy-http-prefix>/api/v1/query_range
 ```
 
 Prometheus-compatible range query endpoint. When the request is sent through the query-frontend, the query will be accelerated by query-frontend (results caching and execution parallelisation).
+PromQL engine can be selected using `X-PromQL-EngineType` header with values `prometheus` (default) and `thanos`.
 
 _For more information, please check out the Prometheus [range query](https://prometheus.io/docs/prometheus/latest/querying/api/#range-queries) documentation._
 
@@ -336,6 +374,36 @@ _For more information, please check out the Prometheus [exemplar query](https://
 
 _Requires [authentication](#authentication)._
 
+### Format query
+
+```
+GET,POST <prometheus-http-prefix>/api/v1/format_query
+
+# Legacy
+GET,POST <legacy-http-prefix>/api/v1/format_query
+```
+
+Prometheus-compatible format query endpoint. The endpoint formats a PromQL expression in a prettified way.
+
+_For more information, please check out the Prometheus [fomatting query expressions](https://prometheus.io/docs/prometheus/latest/querying/api/#formatting-query-expressions) documentation._
+
+_Requires [authentication](#authentication)._
+
+### Parse query
+
+```
+GET,POST <prometheus-http-prefix>/api/v1/parse_query
+
+# Legacy
+GET,POST <legacy-http-prefix>/api/v1/parse_query
+```
+
+Prometheus-compatible parse query endpoint. This endpoint is **experimental**, it parses a PromQL expression and returns it as a JSON-formatted AST (abstract syntax tree) representation.
+
+_For more information, please check out the Prometheus [Parsing query expressions](https://prometheus.io/docs/prometheus/latest/querying/api/#parsing-a-promql-expressions-into-a-abstract-syntax-tree-ast) documentation._
+
+_Requires [authentication](#authentication)._
+
 ### Get series by label matchers
 
 ```
@@ -345,7 +413,7 @@ GET,POST <prometheus-http-prefix>/api/v1/series
 GET,POST <legacy-http-prefix>/api/v1/series
 ```
 
-Find series by label matchers. Differently than Prometheus and due to scalability and performances reasons, Cortex currently ignores the `start` and `end` request parameters and always fetches the series from in-memory data stored in the ingesters. There is experimental support to query the long-term store with the *blocks* storage engine when `-querier.query-store-for-labels-enabled` is set.
+Find series by label matchers. Starting from release v1.18.0, Cortex by default honors the `start` and `end` request parameters and fetches series from either ingester, store gateway or both. The special case is that if `start` param is not specified, Cortex currently fetches series from data stored in the ingesters.
 
 _For more information, please check out the Prometheus [series endpoint](https://prometheus.io/docs/prometheus/latest/querying/api/#finding-series-by-label-matchers) documentation._
 
@@ -360,7 +428,7 @@ GET,POST <prometheus-http-prefix>/api/v1/labels
 GET,POST <legacy-http-prefix>/api/v1/labels
 ```
 
-Get label names of ingested series. Differently than Prometheus and due to scalability and performances reasons, Cortex currently ignores the `start` and `end` request parameters and always fetches the label names from in-memory data stored in the ingesters. There is experimental support to query the long-term store with the *blocks* storage engine when `-querier.query-store-for-labels-enabled` is set.
+Get label names of ingested series. Starting from release v1.18.0, Cortex by default honors the `start` and `end` request parameters and fetches label names from either ingester, store gateway or both. The special case is that if `start` param is not specified, Cortex currently fetches labels from data stored in the ingesters.
 
 _For more information, please check out the Prometheus [get label names](https://prometheus.io/docs/prometheus/latest/querying/api/#getting-label-names) documentation._
 
@@ -375,7 +443,7 @@ GET <prometheus-http-prefix>/api/v1/label/{name}/values
 GET <legacy-http-prefix>/api/v1/label/{name}/values
 ```
 
-Get label values for a given label name. Differently than Prometheus and due to scalability and performances reasons, Cortex currently ignores the `start` and `end` request parameters and always fetches the label values from in-memory data stored in the ingesters. There is experimental support to query the long-term store with the *blocks* storage engine when `-querier.query-store-for-labels-enabled` is set.
+Get label values for a given label name. Starting from release v1.18.0, Cortex by default honors the `start` and `end` request parameters and fetches label values from either ingester, store gateway or both. The special case is that if `start` param is not specified, Cortex currently fetches label values from data stored in the ingesters.
 
 _For more information, please check out the Prometheus [get label values](https://prometheus.io/docs/prometheus/latest/querying/api/#querying-label-values) documentation._
 
@@ -411,6 +479,17 @@ _For more information, please check out Prometheus [Remote storage integrations]
 
 _Requires [authentication](#authentication)._
 
+### Build Information
+
+```
+GET <prometheus-http-prefix>/api/v1/status/buildinfo
+# Legacy
+GET <legacy-http-prefix>/api/v1/status/buildinfo
+```
+
+Prometheus-compatible [build information](https://prometheus.io/docs/prometheus/latest/querying/api/#build-information) endpoint.
+
+_Requires [authentication](#authentication)._
 
 ## Querier
 
@@ -424,25 +503,6 @@ GET <legacy-http-prefix>/user_stats
 ```
 
 Returns realtime ingestion rate, for the authenticated tenant, in `JSON` format.
-
-_Requires [authentication](#authentication)._
-
-### Get tenant chunks
-
-```
-GET /api/v1/chunks
-
-# Legacy
-GET <legacy-http-prefix>/chunks
-```
-
-Fetch a compressed tar of all the chunks containing samples for the given time range and label matchers. This endpoint is supported only by the **chunks storage**, requires `-querier.ingester-streaming=true` and should **not be exposed to users** but just used for debugging purposes.
-
-| URL query parameter | Description |
-| ------------------- | ----------- |
-| `start` | Start timestamp, in RFC3339 format or unix epoch. |
-| `end` | End timestamp, in RFC3339 format or unix epoch. |
-| `matcher` | Label matcher that selects the series for which chunks should be fetched. |
 
 _Requires [authentication](#authentication)._
 
@@ -482,7 +542,7 @@ Prometheus-compatible rules endpoint to list alerting and recording rules that a
 
 _For more information, please check out the Prometheus [rules](https://prometheus.io/docs/prometheus/latest/querying/api/#rules) documentation._
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -499,7 +559,7 @@ Prometheus-compatible rules endpoint to list of all active alerts.
 
 _For more information, please check out the Prometheus [alerts](https://prometheus.io/docs/prometheus/latest/querying/api/#alerts) documentation._
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -514,7 +574,7 @@ GET <legacy-http-prefix>/rules
 
 List all rules configured for the authenticated tenant. This endpoint returns a YAML dictionary with all the rule groups for each namespace and `200` status code on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -573,7 +633,7 @@ GET <legacy-http-prefix>/rules/{namespace}
 
 Returns the rule groups defined for a given namespace.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -605,7 +665,7 @@ GET <legacy-http-prefix>/rules/{namespace}/{groupName}
 
 Returns the rule group matching the request namespace and group name.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -620,7 +680,7 @@ POST <legacy-http-prefix>/rules/{namespace}
 
 Creates or updates a rule group. This endpoint expects a request with `Content-Type: application/yaml` header and the rules **YAML** definition in the request body, and returns `202` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -657,7 +717,7 @@ DELETE <legacy-http-prefix>/rules/{namespace}/{groupName}
 
 Deletes a rule group by namespace and group name. This endpoints returns `202` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -672,7 +732,7 @@ DELETE <legacy-http-prefix>/rules/{namespace}
 
 Deletes all the rule groups in a namespace (including the namespace itself). This endpoint returns `202` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -684,7 +744,7 @@ POST /ruler/delete_tenant_config
 
 This deletes all rule groups for tenant, and returns `200` on success. Calling endpoint when no rule groups exist for user returns `200`. Authentication is only to identify the tenant.
 
-This is intended as internal API, and not to be exposed to users. This endpoint is enabled regardless of whether `-experimental.ruler.enable-api` is enabled or not.
+This is intended as internal API, and not to be exposed to users. This endpoint is enabled regardless of whether `-ruler.enable-api` is enabled or not.
 
 _Requires [authentication](#authentication)._
 
@@ -737,7 +797,7 @@ POST /multitenant_alertmanager/delete_tenant_config
 ```
 
 This endpoint deletes configuration for a tenant identified by `X-Scope-OrgID` header.
-It is internal, available even if Alertmanager API is not enabled by using `-experimental.alertmanager.enable-api`.
+It is internal, available even if Alertmanager API is not enabled by using `-alertmanager.enable-api`.
 The endpoint returns a status code of `200` if the user's configuration has been deleted, or it didn't exist in the first place.
 
 _Requires [authentication](#authentication)._
@@ -752,7 +812,7 @@ Get the current Alertmanager configuration for the authenticated tenant, reading
 
 This endpoint doesn't accept any URL query parameter and returns `200` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.alertmanager.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-alertmanager.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -766,7 +826,7 @@ Stores or updates the Alertmanager configuration for the authenticated tenant. T
 
 This endpoint expects the Alertmanager **YAML** configuration in the request body and returns `201` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.alertmanager.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-alertmanager.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -804,58 +864,13 @@ Deletes the Alertmanager configuration for the authenticated tenant.
 
 This endpoint doesn't accept any URL query parameter and returns `200` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.alertmanager.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-alertmanager.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
 ## Purger
 
-The Purger service provides APIs for requesting deletion of series in chunks storage and managing delete requests. For more information about it, please read the [Delete series Guide](../guides/deleting-series.md).
-
-### Delete series
-
-```
-PUT,POST <prometheus-http-prefix>/api/v1/admin/tsdb/delete_series
-
-# Legacy
-PUT,POST <legacy-http-prefix>/api/v1/admin/tsdb/delete_series
-```
-
-Prometheus-compatible delete series endpoint.
-
-_For more information, please check out the Prometheus [delete series](https://prometheus.io/docs/prometheus/latest/querying/api/#delete-series) documentation._
-
-_Requires [authentication](#authentication)._
-
-### List delete requests
-
-```
-GET <prometheus-http-prefix>/api/v1/admin/tsdb/delete_series
-
-# Legacy
-GET <legacy-http-prefix>/api/v1/admin/tsdb/delete_series
-```
-
-List all the delete requests.
-
-_Requires [authentication](#authentication)._
-
-### Cancel delete request
-
-```
-PUT,POST <prometheus-http-prefix>/api/v1/admin/tsdb/cancel_delete_request
-
-# Legacy
-PUT,POST <legacy-http-prefix>/api/v1/admin/tsdb/cancel_delete_request
-```
-
-Cancel a delete request while the request is still in the grace period (before the request is effectively processed by the purger and time series data is hard-deleted from the storage).
-
-| URL query parameter | Description |
-| ------------------- | ----------- |
-| `request_id` | Deletion request ID to cancel. Can be obtained by the [List delete requests](#list-delete-requests) endpoint. |
-
-_Requires [authentication](#authentication)._
+The Purger service provides APIs for requesting deletion of tenants.
 
 ### Tenant Delete Request
 
@@ -877,6 +892,64 @@ Returns status of tenant deletion. Output format to be defined. Experimental.
 
 _Requires [authentication](#authentication)._
 
+## Overrides
+
+The Overrides service provides an API for managing user overrides.
+
+### Get user overrides
+
+```
+GET /api/v1/user-overrides
+```
+
+Get the current overrides for the authenticated tenant. Returns the overrides in JSON format.
+
+_Requires [authentication](#authentication)._
+
+### Set user overrides
+
+```
+POST /api/v1/user-overrides
+```
+
+Set or update overrides for the authenticated tenant. The request body should contain a JSON object with the override values.
+
+_Requires [authentication](#authentication)._
+
+### Delete user overrides
+
+```
+DELETE /api/v1/user-overrides
+```
+
+Delete all overrides for the authenticated tenant. This will revert the tenant to using default values.
+
+_Requires [authentication](#authentication)._
+
+#### Example request body for PUT
+
+```json
+{
+  "ingestion_rate": 50000,
+  "max_global_series_per_user": 1000000,
+  "ruler_max_rules_per_rule_group": 100
+}
+```
+
+#### Supported limits
+
+The following limits can be modified via the API:
+- `max_global_series_per_user`
+- `max_global_series_per_metric`
+- `ingestion_rate`
+- `ingestion_burst_size`
+- `ruler_max_rules_per_rule_group`
+- `ruler_max_rule_groups_per_tenant`
+
+#### Hard limits
+
+Overrides are validated against hard limits defined in the runtime configuration file. If a requested override exceeds the hard limit for the tenant, the request will be rejected with a 400 status code.
+
 ## Store-gateway
 
 ### Store-gateway ring status
@@ -895,6 +968,16 @@ GET /compactor/ring
 ```
 
 Displays a web page with the compactor hash ring status, including the state, healthy and last heartbeat time of each compactor.
+
+## Parquet Converter
+
+### Parquet Converter ring status
+
+```
+GET /parquet-converter/ring
+```
+
+Displays a web page with the parquet-converter hash ring status, including the state, healthy and last heartbeat time of each parquet-converter instance.
 
 ## Configs API
 

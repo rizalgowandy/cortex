@@ -4,26 +4,25 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/require"
 	yaml "gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket/http"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // defaultConfig should match the default flag values defined in RegisterFlagsWithPrefix.
 var defaultConfig = Config{
-	MaxRetries: 20,
-	Config: http.Config{
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 2 * time.Minute,
-		InsecureSkipVerify:    false,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
-		MaxConnsPerHost:       0,
-	},
+	Endpoint:              "blob.core.windows.net",
+	MaxRetries:            20,
+	IdleConnTimeout:       90 * time.Second,
+	ResponseHeaderTimeout: 2 * time.Minute,
+	InsecureSkipVerify:    false,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   100,
+	MaxConnsPerHost:       0,
 }
 
 func TestConfig(t *testing.T) {
@@ -45,6 +44,7 @@ account_name: test-account-name
 account_key: test-account-key
 container_name: test-container-name
 endpoint_suffix: test-endpoint-suffix
+user_assigned_id: test-user-assigned-id
 max_retries: 1
 http:
   idle_conn_timeout: 2s
@@ -61,6 +61,7 @@ http:
 				StorageAccountKey:  flagext.Secret{Value: "test-account-key"},
 				ContainerName:      "test-container-name",
 				Endpoint:           "test-endpoint-suffix",
+				UserAssignedID:     "test-user-assigned-id",
 				MaxRetries:         1,
 				Config: http.Config{
 					IdleConnTimeout:       2 * time.Second,
@@ -83,7 +84,6 @@ http:
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 
 		t.Run(testName, func(t *testing.T) {
 			cfg := Config{}

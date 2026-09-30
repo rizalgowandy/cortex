@@ -7,15 +7,16 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
 	"go.uber.org/atomic"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 const (
@@ -70,9 +71,12 @@ func NewLoader(cfg LoaderConfig, bucketClient objstore.Bucket, cfgProvider bucke
 			Help: "Total number of bucket index loading failures.",
 		}),
 		loadDuration: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
-			Name:    "cortex_bucket_index_load_duration_seconds",
-			Help:    "Duration of the a single bucket index loading operation in seconds.",
-			Buckets: []float64{0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 1, 10},
+			Name:                            "cortex_bucket_index_load_duration_seconds",
+			Help:                            "Duration of the a single bucket index loading operation in seconds.",
+			Buckets:                         []float64{0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 1, 10},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
 		}),
 	}
 
@@ -91,19 +95,26 @@ func NewLoader(cfg LoaderConfig, bucketClient objstore.Bucket, cfgProvider bucke
 
 // GetIndex returns the bucket index for the given user. It returns the in-memory cached
 // index if available, or load it from the bucket otherwise.
-func (l *Loader) GetIndex(ctx context.Context, userID string) (*Index, error) {
+func (l *Loader) GetIndex(ctx context.Context, userID string) (*Index, Status, error) {
 	l.indexesMx.RLock()
 	if entry := l.indexes[userID]; entry != nil {
 		idx := entry.index
 		err := entry.err
+		ss := entry.syncStatus
 		l.indexesMx.RUnlock()
 
 		// We don't check if the index is stale because it's the responsibility
 		// of the background job to keep it updated.
 		entry.requestedAt.Store(time.Now().Unix())
-		return idx, err
+		return idx, ss, err
 	}
 	l.indexesMx.RUnlock()
+
+	ss, err := ReadSyncStatus(ctx, l.bkt, userID, l.logger)
+
+	if err != nil {
+		level.Warn(l.logger).Log("msg", "unable to read bucket index status", "user", userID, "err", err)
+	}
 
 	startTime := time.Now()
 	l.loadAttempts.Inc()
@@ -111,10 +122,17 @@ func (l *Loader) GetIndex(ctx context.Context, userID string) (*Index, error) {
 	if err != nil {
 		// Cache the error, to avoid hammering the object store in case of persistent issues
 		// (eg. corrupted bucket index or not existing).
-		l.cacheIndex(userID, nil, err)
+		l.cacheIndex(userID, nil, ss, err)
+
+		if ctx.Err() != nil {
+			level.Warn(util_log.WithContext(ctx, l.logger)).Log("msg", "received context error when reading bucket index", "err", ctx.Err())
+			return nil, UnknownStatus, ctx.Err()
+		}
 
 		if errors.Is(err, ErrIndexNotFound) {
 			level.Warn(l.logger).Log("msg", "bucket index not found", "user", userID)
+		} else if errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied) {
+			level.Warn(l.logger).Log("msg", "key access denied when reading bucket index", "user", userID)
 		} else {
 			// We don't track ErrIndexNotFound as failure because it's a legit case (eg. a tenant just
 			// started to remote write and its blocks haven't uploaded to storage yet).
@@ -122,25 +140,29 @@ func (l *Loader) GetIndex(ctx context.Context, userID string) (*Index, error) {
 			level.Error(l.logger).Log("msg", "unable to load bucket index", "user", userID, "err", err)
 		}
 
-		return nil, err
+		return nil, ss, err
 	}
 
 	// Cache the index.
-	l.cacheIndex(userID, idx, nil)
+	l.cacheIndex(userID, idx, ss, nil)
 
 	elapsedTime := time.Since(startTime)
 	l.loadDuration.Observe(elapsedTime.Seconds())
 	level.Info(l.logger).Log("msg", "loaded bucket index", "user", userID, "duration", elapsedTime)
-	return idx, nil
+	return idx, ss, nil
 }
 
-func (l *Loader) cacheIndex(userID string, idx *Index, err error) {
+func (l *Loader) cacheIndex(userID string, idx *Index, ss Status, err error) {
+	if errors.Is(err, context.Canceled) {
+		level.Info(l.logger).Log("msg", "skipping cache bucket index", "err", err)
+		return
+	}
 	l.indexesMx.Lock()
 	defer l.indexesMx.Unlock()
 
 	// Not an issue if, due to concurrency, another index was already cached
 	// and we overwrite it: last will win.
-	l.indexes[userID] = newCachedIndex(idx, err)
+	l.indexes[userID] = newCachedIndex(idx, ss, err)
 }
 
 // checkCachedIndexes checks all cached indexes and, for each of them, does two things:
@@ -195,8 +217,21 @@ func (l *Loader) updateCachedIndex(ctx context.Context, userID string) {
 
 	l.loadAttempts.Inc()
 	startTime := time.Now()
+	ss, err := ReadSyncStatus(ctx, l.bkt, userID, l.logger)
+	if err != nil {
+		level.Warn(l.logger).Log("msg", "unable to read bucket index status", "user", userID, "err", err)
+	}
+
+	// Update Sync Status
+	l.indexesMx.Lock()
+	l.indexes[userID].syncStatus = ss
+	l.indexesMx.Unlock()
+
 	idx, err := ReadIndex(readCtx, l.bkt, userID, l.cfgProvider, l.logger)
-	if err != nil && !errors.Is(err, ErrIndexNotFound) {
+	if err != nil &&
+		!errors.Is(err, ErrIndexNotFound) &&
+		!errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied) &&
+		!errors.Is(err, context.Canceled) {
 		l.loadFailures.Inc()
 		level.Warn(l.logger).Log("msg", "unable to update bucket index", "user", userID, "err", err)
 		return
@@ -204,7 +239,7 @@ func (l *Loader) updateCachedIndex(ctx context.Context, userID string) {
 
 	l.loadDuration.Observe(time.Since(startTime).Seconds())
 
-	// We cache it either it was successfully refreshed or wasn't found. An use case for caching the ErrIndexNotFound
+	// We cache it either it was successfully refreshed,  wasn't found or when is a CMK error. An use case for caching the ErrIndexNotFound
 	// is when a tenant has rules configured but hasn't started remote writing yet. Rules will be evaluated and
 	// bucket index loaded by the ruler.
 	l.indexesMx.Lock()
@@ -238,8 +273,9 @@ func (l *Loader) countLoadedIndexesMetric() float64 {
 type cachedIndex struct {
 	// We cache either the index or the error occurred while fetching it. They're
 	// mutually exclusive.
-	index *Index
-	err   error
+	index      *Index
+	syncStatus Status
+	err        error
 
 	// Unix timestamp (seconds) of when the index has been updated from the storage the last time.
 	updatedAt atomic.Int64
@@ -248,10 +284,11 @@ type cachedIndex struct {
 	requestedAt atomic.Int64
 }
 
-func newCachedIndex(idx *Index, err error) *cachedIndex {
+func newCachedIndex(idx *Index, ss Status, err error) *cachedIndex {
 	entry := &cachedIndex{
-		index: idx,
-		err:   err,
+		index:      idx,
+		err:        err,
+		syncStatus: ss,
 	}
 
 	now := time.Now()

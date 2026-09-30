@@ -17,6 +17,11 @@ func (m *IngesterServerMock) Push(ctx context.Context, r *cortexpb.WriteRequest)
 	return args.Get(0).(*cortexpb.WriteResponse), args.Error(1)
 }
 
+func (m *IngesterServerMock) PushStream(srv Ingester_PushStreamServer) error {
+	args := m.Called(srv)
+	return args.Error(0)
+}
+
 func (m *IngesterServerMock) Query(ctx context.Context, r *QueryRequest) (*QueryResponse, error) {
 	args := m.Called(ctx, r)
 	return args.Get(0).(*QueryResponse), args.Error(1)
@@ -37,9 +42,19 @@ func (m *IngesterServerMock) LabelValues(ctx context.Context, r *LabelValuesRequ
 	return args.Get(0).(*LabelValuesResponse), args.Error(1)
 }
 
+func (m *IngesterServerMock) LabelValuesStream(r *LabelValuesRequest, s Ingester_LabelValuesStreamServer) error {
+	args := m.Called(r, s)
+	return args.Error(0)
+}
+
 func (m *IngesterServerMock) LabelNames(ctx context.Context, r *LabelNamesRequest) (*LabelNamesResponse, error) {
 	args := m.Called(ctx, r)
 	return args.Get(0).(*LabelNamesResponse), args.Error(1)
+}
+
+func (m *IngesterServerMock) LabelNamesStream(r *LabelNamesRequest, s Ingester_LabelNamesStreamServer) error {
+	args := m.Called(r, s)
+	return args.Error(0)
 }
 
 func (m *IngesterServerMock) UserStats(ctx context.Context, r *UserStatsRequest) (*UserStatsResponse, error) {
@@ -57,12 +72,12 @@ func (m *IngesterServerMock) MetricsForLabelMatchers(ctx context.Context, r *Met
 	return args.Get(0).(*MetricsForLabelMatchersResponse), args.Error(1)
 }
 
+func (m *IngesterServerMock) MetricsForLabelMatchersStream(r *MetricsForLabelMatchersRequest, s Ingester_MetricsForLabelMatchersStreamServer) error {
+	args := m.Called(r, s)
+	return args.Error(0)
+}
+
 func (m *IngesterServerMock) MetricsMetadata(ctx context.Context, r *MetricsMetadataRequest) (*MetricsMetadataResponse, error) {
 	args := m.Called(ctx, r)
 	return args.Get(0).(*MetricsMetadataResponse), args.Error(1)
-}
-
-func (m *IngesterServerMock) TransferChunks(s Ingester_TransferChunksServer) error {
-	args := m.Called(s)
-	return args.Error(0)
 }

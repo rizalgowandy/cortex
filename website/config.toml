@@ -4,7 +4,7 @@ title = "Cortex"
 enableRobotsTXT = true
 
 # Hugo allows theme composition (and inheritance). The precedence is from left to right.
-theme = ["docsy"]
+theme = ["github.com/google/docsy", "github.com/google/docsy/dependencies"]
 
 # Will give values to .Lastmod etc.
 enableGitInfo = true
@@ -16,7 +16,21 @@ defaultContentLanguageInSubdir = false
 # Useful when translating.
 enableMissingTranslationPlaceholders = true
 
-disableKinds = ["taxonomy", "taxonomyTerm"]
+disableKinds = []
+
+[security]
+  allowContent = ['^.*$']
+  [security.node.permissions]
+    allowRead = ['*']
+
+[taxonomies]
+tag = "tags"
+category = "categories"
+project = "projects"
+[params.taxonomy]
+taxonomyCloud = ["projects", "tags"] # set taxonomyCloud = [] to hide taxonomy clouds
+taxonomyCloudTitle = ["Our Projects", "Tag Cloud"] # if used, must have same length as taxonomyCloud
+taxonomyPageHeader = ["tags", "categories"] # set taxonomyPageHeader = [] to hide taxonomies on the page headers
 
 # Highlighting config
 pygmentsCodeFences = true
@@ -46,14 +60,14 @@ anchor = "smart"
 
 [services]
 [services.googleAnalytics]
-id = "UA-63872299-2"
+id = "G-SRR0DSREGX"
 
 # Language configuration
 
 [languages]
 [languages.en]
 title = "Cortex"
-description = "A horizontally scalable, highly available, multi-tenant, long term storage for Prometheus."
+description = "The horizontally scalable, highly available, multi-tenant, long term storage solution for Prometheus and OpenTelemetry Metrics."
 languageName ="English"
 # Weight used for sorting.
 weight = 1

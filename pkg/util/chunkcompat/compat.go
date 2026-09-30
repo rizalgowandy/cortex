@@ -1,31 +1,18 @@
 package chunkcompat
 
 import (
-	"bytes"
+	"fmt"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	prom_chunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/util"
 )
-
-// StreamsToMatrix converts a slice of QueryStreamResponse to a model.Matrix.
-func StreamsToMatrix(from, through model.Time, responses []*client.QueryStreamResponse) (model.Matrix, error) {
-	result := model.Matrix{}
-	for _, response := range responses {
-		series, err := SeriesChunksToMatrix(from, through, response.Chunkseries)
-		if err != nil {
-			return nil, err
-		}
-
-		result = append(result, series...)
-	}
-	return result, nil
-}
 
 // SeriesChunksToMatrix converts slice of []client.TimeSeriesChunk to a model.Matrix.
 func SeriesChunksToMatrix(from, through model.Time, serieses []client.TimeSeriesChunk) (model.Matrix, error) {
@@ -36,18 +23,29 @@ func SeriesChunksToMatrix(from, through model.Time, serieses []client.TimeSeries
 	result := model.Matrix{}
 	for _, series := range serieses {
 		metric := cortexpb.FromLabelAdaptersToMetric(series.Labels)
-		chunks, err := FromChunks("", cortexpb.FromLabelAdaptersToLabels(series.Labels), series.Chunks)
+		chunks, err := FromChunks(cortexpb.FromLabelAdaptersToLabels(series.Labels), series.Chunks)
 		if err != nil {
 			return nil, err
 		}
 
+		its := make([]chunkenc.Iterable, 0, len(chunks))
 		samples := []model.SamplePair{}
-		for _, chunk := range chunks {
-			ss, err := chunk.Samples(from, through)
-			if err != nil {
-				return nil, err
+		for _, chk := range chunks {
+			its = append(its, chk.Data)
+		}
+		it := storage.ChainSampleIteratorFromIterables(nil, its)
+		for it.Next() != chunkenc.ValNone {
+			t, v := it.At()
+			if model.Time(t) < from {
+				continue
 			}
-			samples = util.MergeSampleSets(samples, ss)
+			if model.Time(t) > through {
+				break
+			}
+			samples = append(samples, model.SamplePair{Timestamp: model.Time(t), Value: model.SampleValue(v)})
+		}
+		if err := it.Err(); err != nil {
+			return nil, err
 		}
 
 		result = append(result, &model.SampleStream{
@@ -59,22 +57,24 @@ func SeriesChunksToMatrix(from, through model.Time, serieses []client.TimeSeries
 }
 
 // FromChunks converts []client.Chunk to []chunk.Chunk.
-func FromChunks(userID string, metric labels.Labels, in []client.Chunk) ([]chunk.Chunk, error) {
+func FromChunks(metric labels.Labels, in []client.Chunk) ([]chunk.Chunk, error) {
 	out := make([]chunk.Chunk, 0, len(in))
 	for _, i := range in {
-		o, err := prom_chunk.NewForEncoding(prom_chunk.Encoding(byte(i.Encoding)))
-		if err != nil {
-			return nil, err
+		e := prom_chunk.Encoding(byte(i.Encoding))
+		chunkEnc := e.PromChunkEncoding()
+		if chunkEnc == chunkenc.EncNone {
+			return nil, fmt.Errorf("unknown chunk encoding: %v", e)
 		}
 
-		if err := o.UnmarshalFromBuf(i.Data); err != nil {
+		chk, err := chunkenc.FromData(chunkEnc, i.Data)
+		if err != nil {
 			return nil, err
 		}
 
 		firstTime, lastTime := model.Time(i.StartTimestampMs), model.Time(i.EndTimestampMs)
 		// As the lifetime of this chunk is scopes to this request, we don't need
 		// to supply a fingerprint.
-		out = append(out, chunk.NewChunk(userID, 0, metric, o, firstTime, lastTime))
+		out = append(out, chunk.NewChunk(metric, chk, firstTime, lastTime))
 	}
 	return out, nil
 }
@@ -83,18 +83,17 @@ func FromChunks(userID string, metric labels.Labels, in []client.Chunk) ([]chunk
 func ToChunks(in []chunk.Chunk) ([]client.Chunk, error) {
 	out := make([]client.Chunk, 0, len(in))
 	for _, i := range in {
+		e, err := prom_chunk.FromPromChunkEncoding(i.Data.Encoding())
+		if err != nil {
+			return nil, err
+		}
 		wireChunk := client.Chunk{
 			StartTimestampMs: int64(i.From),
 			EndTimestampMs:   int64(i.Through),
-			Encoding:         int32(i.Data.Encoding()),
+			Encoding:         int32(e),
+			Data:             i.Data.Bytes(),
 		}
 
-		buf := bytes.NewBuffer(make([]byte, 0, prom_chunk.ChunkLen))
-		if err := i.Data.Marshal(buf); err != nil {
-			return nil, err
-		}
-
-		wireChunk.Data = buf.Bytes()
 		out = append(out, wireChunk)
 	}
 	return out, nil

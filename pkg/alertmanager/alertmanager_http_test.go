@@ -1,24 +1,49 @@
 package alertmanager
 
 import (
-	"context"
-	"io/ioutil"
+	"bytes"
+	"io"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 )
 
+func TestStatusHandler_HTMLEscaping(t *testing.T) {
+	// Verify that html/template escapes XSS payloads in the status page.
+	xssPayload := `<script>alert("xss")</script>`
+
+	var buf bytes.Buffer
+	err := statusTemplate.Execute(&buf, struct {
+		ClusterInfo map[string]any
+	}{
+		ClusterInfo: map[string]any{
+			"self": map[string]any{
+				"Name": xssPayload,
+				"Addr": "127.0.0.1",
+				"Port": "9094",
+			},
+			"members": []map[string]any{
+				{"Name": xssPayload, "Addr": "127.0.0.1:9094"},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	content := buf.String()
+	require.NotContains(t, content, xssPayload, "XSS payload must be escaped by html/template")
+	require.Contains(t, content, "&lt;script&gt;", "HTML special characters must be escaped")
+}
+
 func TestMultitenantAlertmanager_GetStatusHandler(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	var peer *cluster.Peer
 	{
-		logger := log.NewNopLogger()
+		logger := promslog.NewNopLogger()
 		createPeer := func(peers []string) (*cluster.Peer, error) {
 			return cluster.Create(
 				logger,
@@ -29,10 +54,14 @@ func TestMultitenantAlertmanager_GetStatusHandler(t *testing.T) {
 				true,
 				cluster.DefaultPushPullInterval,
 				cluster.DefaultGossipInterval,
-				cluster.DefaultTcpTimeout,
+				cluster.DefaultTCPTimeout,
+				cluster.DefaultResolvePeersTimeout,
 				cluster.DefaultProbeTimeout,
 				cluster.DefaultProbeInterval,
 				nil,
+				false,
+				"",
+				"",
 			)
 		}
 
@@ -76,7 +105,7 @@ func TestMultitenantAlertmanager_GetStatusHandler(t *testing.T) {
 
 		resp := w.Result()
 		require.Equal(t, 200, w.Code)
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		content := string(body)
 		require.Contains(t, content, tt.content)
 		require.NotContains(t, content, tt.nocontent)

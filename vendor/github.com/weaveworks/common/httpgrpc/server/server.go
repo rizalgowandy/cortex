@@ -3,21 +3,19 @@ package server
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync"
 
-	"github.com/grpc-ecosystem/go-grpc-middleware"
 	otgrpc "github.com/opentracing-contrib/go-grpc"
 	"github.com/opentracing/opentracing-go"
-	"github.com/sercand/kuberesolver"
+	"github.com/sercand/kuberesolver/v5"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/balancer/roundrobin"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/logging"
@@ -72,12 +70,8 @@ func (s Server) Handle(ctx context.Context, r *httpgrpc.HTTPRequest) (*httpgrpc.
 
 // Client is a http.Handler that forwards the request over gRPC.
 type Client struct {
-	mtx       sync.RWMutex
-	service   string
-	namespace string
-	port      string
-	client    httpgrpc.HTTPClient
-	conn      *grpc.ClientConn
+	client httpgrpc.HTTPClient
+	conn   *grpc.ClientConn
 }
 
 // ParseURL deals with direct:// style URLs, as well as kubernetes:// urls.
@@ -108,9 +102,9 @@ func ParseURL(unparsed string) (string, error) {
 			return "", err
 		}
 		parts := strings.SplitN(host, ".", 3)
-		service, namespace, domain := parts[0], "default", ""
+		service, _, domain := parts[0], "default", ""
 		if len(parts) > 1 {
-			namespace = parts[1]
+			namespace := parts[1]
 			domain = "." + namespace
 		}
 		if len(parts) > 2 {
@@ -132,17 +126,18 @@ func NewClient(address string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	const grpcServiceConfig = `{"loadBalancingPolicy":"round_robin"}`
 
 	dialOptions := []grpc.DialOption{
-		grpc.WithBalancerName(roundrobin.Name),
-		grpc.WithInsecure(),
-		grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(
+		grpc.WithDefaultServiceConfig(grpcServiceConfig),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(
 			otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 			middleware.ClientUserHeaderInterceptor,
-		)),
+		),
 	}
 
-	conn, err := grpc.Dial(address, dialOptions...)
+	conn, err := grpc.NewClient(address, dialOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +150,7 @@ func NewClient(address string) (*Client, error) {
 
 // HTTPRequest wraps an ordinary HTTPRequest with a gRPC one
 func HTTPRequest(r *http.Request) (*httpgrpc.HTTPRequest, error) {
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +174,9 @@ func WriteResponse(w http.ResponseWriter, resp *httpgrpc.HTTPResponse) error {
 func WriteError(w http.ResponseWriter, err error) {
 	resp, ok := httpgrpc.HTTPResponseFromError(err)
 	if ok {
-		WriteResponse(w, resp)
+		if err := WriteResponse(w, resp); err != nil {
+			logging.Global().Errorf("Failed to write response: %v", err)
+		}
 	} else {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}

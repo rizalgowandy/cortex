@@ -9,15 +9,17 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/services"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
+	"github.com/cortexproject/cortex/pkg/storage/bucket"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/util/testutil"
 )
 
 func TestLoader_GetIndex_ShouldLazyLoadBucketIndex(t *testing.T) {
@@ -61,8 +63,8 @@ func TestLoader_GetIndex_ShouldLazyLoadBucketIndex(t *testing.T) {
 	))
 
 	// Request the index multiple times.
-	for i := 0; i < 10; i++ {
-		actualIdx, err := loader.GetIndex(ctx, "user-1")
+	for range 10 {
+		actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 		require.NoError(t, err)
 		assert.Equal(t, idx, actualIdx)
 	}
@@ -101,8 +103,8 @@ func TestLoader_GetIndex_ShouldCacheError(t *testing.T) {
 	require.NoError(t, bkt.Upload(ctx, path.Join("user-1", IndexCompressedFilename), strings.NewReader("invalid!}")))
 
 	// Request the index multiple times.
-	for i := 0; i < 10; i++ {
-		_, err := loader.GetIndex(ctx, "user-1")
+	for range 10 {
+		_, _, err := loader.GetIndex(ctx, "user-1")
 		require.Equal(t, ErrIndexCorrupted, err)
 	}
 
@@ -137,8 +139,8 @@ func TestLoader_GetIndex_ShouldCacheIndexNotFoundError(t *testing.T) {
 	})
 
 	// Request the index multiple times.
-	for i := 0; i < 10; i++ {
-		_, err := loader.GetIndex(ctx, "user-1")
+	for range 10 {
+		_, _, err := loader.GetIndex(ctx, "user-1")
 		require.Equal(t, ErrIndexNotFound, err)
 	}
 
@@ -158,6 +160,46 @@ func TestLoader_GetIndex_ShouldCacheIndexNotFoundError(t *testing.T) {
 		"cortex_bucket_index_load_failures_total",
 		"cortex_bucket_index_loaded",
 	))
+}
+
+func TestLoader_ShouldNotCacheContextCancelled(t *testing.T) {
+	ctx := context.Background()
+	reg := prometheus.NewPedanticRegistry()
+	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
+
+	// Create a bucket index.
+	idx := &Index{
+		Version: IndexVersion1,
+		Blocks: Blocks{
+			{ID: ulid.MustNew(1, nil), MinTime: 10, MaxTime: 20},
+		},
+		BlockDeletionMarks: nil,
+		UpdatedAt:          time.Now().Unix(),
+	}
+	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
+
+	// Create the loader.
+	cfg := LoaderConfig{
+		CheckInterval:         time.Second,
+		UpdateOnStaleInterval: time.Second,
+		UpdateOnErrorInterval: time.Hour, // Intentionally high to not hit it.
+		IdleTimeout:           time.Hour, // Intentionally high to not hit it.
+	}
+
+	loader := NewLoader(cfg, bkt, nil, log.NewNopLogger(), reg)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, loader))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
+	})
+
+	cancelledContext, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, _, err := loader.GetIndex(cancelledContext, "user-1")
+	require.ErrorIs(t, err, context.Canceled)
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
+	require.NoError(t, err)
+	assert.Equal(t, idx, actualIdx)
 }
 
 func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousLoadSuccess(t *testing.T) {
@@ -190,7 +232,7 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousLoadSuccess(t *testing.T)
 		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
 	})
 
-	actualIdx, err := loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -199,15 +241,15 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousLoadSuccess(t *testing.T)
 	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
 
 	// Wait until the index has been updated in background.
-	test.Poll(t, 3*time.Second, 2, func() interface{} {
-		actualIdx, err := loader.GetIndex(ctx, "user-1")
+	test.Poll(t, 3*time.Second, 2, func() any {
+		actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 		if err != nil {
 			return 0
 		}
 		return len(actualIdx.Blocks)
 	})
 
-	actualIdx, err = loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err = loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -247,7 +289,7 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousLoadFailure(t *testing.T)
 		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
 	})
 
-	_, err := loader.GetIndex(ctx, "user-1")
+	_, _, err := loader.GetIndex(ctx, "user-1")
 	assert.Equal(t, ErrIndexCorrupted, err)
 
 	// Upload the bucket index.
@@ -262,12 +304,12 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousLoadFailure(t *testing.T)
 	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
 
 	// Wait until the index has been updated in background.
-	test.Poll(t, 3*time.Second, nil, func() interface{} {
-		_, err := loader.GetIndex(ctx, "user-1")
+	test.Poll(t, 3*time.Second, nil, func() any {
+		_, _, err := loader.GetIndex(ctx, "user-1")
 		return err
 	})
 
-	actualIdx, err := loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -300,7 +342,7 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousIndexNotFound(t *testing.
 		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
 	})
 
-	_, err := loader.GetIndex(ctx, "user-1")
+	_, _, err := loader.GetIndex(ctx, "user-1")
 	assert.Equal(t, ErrIndexNotFound, err)
 
 	// Upload the bucket index.
@@ -315,12 +357,12 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousIndexNotFound(t *testing.
 	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
 
 	// Wait until the index has been updated in background.
-	test.Poll(t, 3*time.Second, nil, func() interface{} {
-		_, err := loader.GetIndex(ctx, "user-1")
+	test.Poll(t, 3*time.Second, nil, func() any {
+		_, _, err := loader.GetIndex(ctx, "user-1")
 		return err
 	})
 
-	actualIdx, err := loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -364,7 +406,7 @@ func TestLoader_ShouldNotCacheCriticalErrorOnBackgroundUpdates(t *testing.T) {
 		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
 	})
 
-	actualIdx, err := loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -372,11 +414,11 @@ func TestLoader_ShouldNotCacheCriticalErrorOnBackgroundUpdates(t *testing.T) {
 	require.NoError(t, bkt.Upload(ctx, path.Join("user-1", IndexCompressedFilename), strings.NewReader("invalid!}")))
 
 	// Wait until the first failure has been tracked.
-	test.Poll(t, 3*time.Second, true, func() interface{} {
+	test.Poll(t, 3*time.Second, true, func() any {
 		return testutil.ToFloat64(loader.loadFailures) > 0
 	})
 
-	actualIdx, err = loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err = loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -420,7 +462,7 @@ func TestLoader_ShouldCacheIndexNotFoundOnBackgroundUpdates(t *testing.T) {
 		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
 	})
 
-	actualIdx, err := loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -429,22 +471,25 @@ func TestLoader_ShouldCacheIndexNotFoundOnBackgroundUpdates(t *testing.T) {
 
 	// Wait until the next index load attempt occurs.
 	prevLoads := testutil.ToFloat64(loader.loadAttempts)
-	test.Poll(t, 3*time.Second, true, func() interface{} {
+	test.Poll(t, 3*time.Second, true, func() any {
 		return testutil.ToFloat64(loader.loadAttempts) > prevLoads
 	})
 
+	// Wait until the index is offloaded (metrics becomes 0).
 	// We expect the bucket index is not considered loaded because of the error.
-	assert.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+	test.Poll(t, 3*time.Second, true, func() any {
+		err := testutil.GatherAndCompare(reg, bytes.NewBufferString(`
 			# HELP cortex_bucket_index_loaded Number of bucket indexes currently loaded in-memory.
 			# TYPE cortex_bucket_index_loaded gauge
 			cortex_bucket_index_loaded 0
-		`),
-		"cortex_bucket_index_loaded",
-	))
+		`), "cortex_bucket_index_loaded")
+
+		return err == nil
+	})
 
 	// Try to get the index again. We expect no load attempt because the error has been cached.
 	prevLoads = testutil.ToFloat64(loader.loadAttempts)
-	actualIdx, err = loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err = loader.GetIndex(ctx, "user-1")
 	assert.Equal(t, ErrIndexNotFound, err)
 	assert.Nil(t, actualIdx)
 	assert.Equal(t, prevLoads, testutil.ToFloat64(loader.loadAttempts))
@@ -480,7 +525,7 @@ func TestLoader_ShouldOffloadIndexIfNotFoundDuringBackgroundUpdates(t *testing.T
 		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
 	})
 
-	actualIdx, err := loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -488,11 +533,11 @@ func TestLoader_ShouldOffloadIndexIfNotFoundDuringBackgroundUpdates(t *testing.T
 	require.NoError(t, DeleteIndex(ctx, bkt, "user-1", nil))
 
 	// Wait until the index is offloaded.
-	test.Poll(t, 3*time.Second, float64(0), func() interface{} {
+	test.Poll(t, 3*time.Second, float64(0), func() any {
 		return testutil.ToFloat64(loader.loaded)
 	})
 
-	_, err = loader.GetIndex(ctx, "user-1")
+	_, _, err = loader.GetIndex(ctx, "user-1")
 	require.Equal(t, ErrIndexNotFound, err)
 
 	// Ensure metrics have been updated accordingly.
@@ -535,12 +580,12 @@ func TestLoader_ShouldOffloadIndexIfIdleTimeoutIsReachedDuringBackgroundUpdates(
 		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
 	})
 
-	actualIdx, err := loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
 	// Wait until the index is offloaded.
-	test.Poll(t, 3*time.Second, float64(0), func() interface{} {
+	test.Poll(t, 3*time.Second, float64(0), func() any {
 		return testutil.ToFloat64(loader.loaded)
 	})
 
@@ -558,7 +603,7 @@ func TestLoader_ShouldOffloadIndexIfIdleTimeoutIsReachedDuringBackgroundUpdates(
 	))
 
 	// Load it again.
-	actualIdx, err = loader.GetIndex(ctx, "user-1")
+	actualIdx, _, err = loader.GetIndex(ctx, "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, idx, actualIdx)
 
@@ -569,6 +614,138 @@ func TestLoader_ShouldOffloadIndexIfIdleTimeoutIsReachedDuringBackgroundUpdates(
 		cortex_bucket_index_loads_total 2
 	`),
 		"cortex_bucket_index_loads_total",
+	))
+}
+
+func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousKeyAccessDenied(t *testing.T) {
+	user := "user-1"
+	ctx := context.Background()
+	reg := prometheus.NewPedanticRegistry()
+	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
+
+	// Create the loader.
+	cfg := LoaderConfig{
+		CheckInterval:         time.Hour, // Intentionally high to not hit it.
+		UpdateOnStaleInterval: time.Hour, // Intentionally high to not hit it.
+		UpdateOnErrorInterval: 0,
+		IdleTimeout:           time.Hour, // Intentionally high to not hit it.
+	}
+
+	mockedBkt := &cortex_testutil.MockBucketFailure{
+		Bucket: bkt,
+		GetFailures: map[string]error{
+			path.Join(user, "bucket-index.json.gz"): cortex_testutil.ErrKeyAccessDeniedError,
+		},
+	}
+
+	loader := NewLoader(cfg, mockedBkt, nil, log.NewNopLogger(), reg)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, loader))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
+	})
+
+	_, ss, err := loader.GetIndex(ctx, user)
+	require.True(t, errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied))
+	// SyncStatus does not exists
+	require.Equal(t, Unknown, ss.Status)
+
+	// Verify is the index sync status is being returned
+	ss.Status = CustomerManagedKeyError
+	ss.NonQueryableReason = CustomerManagedKeyError
+	WriteSyncStatus(ctx, bkt, user, ss, log.NewNopLogger())
+
+	// Update the index with the new sync status
+	require.NoError(t, loader.checkCachedIndexes(ctx))
+	_, ss, err = loader.GetIndex(ctx, user)
+	require.True(t, errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied))
+	require.Equal(t, CustomerManagedKeyError, ss.Status)
+
+	// Check cached
+	require.NoError(t, loader.checkCachedIndexes(ctx))
+
+	_, ss, err = loader.GetIndex(ctx, user)
+	require.True(t, errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied))
+	require.Equal(t, CustomerManagedKeyError, ss.Status)
+
+	loader.bkt = bkt
+
+	// Upload the bucket index.
+	idx := &Index{
+		Version: IndexVersion1,
+		Blocks: Blocks{
+			{ID: ulid.MustNew(1, nil), MinTime: 10, MaxTime: 20},
+		},
+		BlockDeletionMarks: nil,
+		UpdatedAt:          time.Now().Unix(),
+	}
+	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
+
+	// Wait until the index has been updated in background.
+	test.Poll(t, 3*time.Second, nil, func() any {
+		_, _, err := loader.GetIndex(ctx, "user-1")
+		// Check cached
+		require.NoError(t, loader.checkCachedIndexes(ctx))
+		return err
+	})
+
+	actualIdx, _, err := loader.GetIndex(ctx, "user-1")
+	require.NoError(t, err)
+	assert.Equal(t, idx, actualIdx)
+
+	// Ensure metrics have been updated accordingly.
+	assert.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+		# HELP cortex_bucket_index_load_failures_total Total number of bucket index loading failures.
+		# TYPE cortex_bucket_index_load_failures_total counter
+		cortex_bucket_index_load_failures_total 0
+		# HELP cortex_bucket_index_loaded Number of bucket indexes currently loaded in-memory.
+		# TYPE cortex_bucket_index_loaded gauge
+		cortex_bucket_index_loaded 1
+	`),
+		"cortex_bucket_index_loaded", "cortex_bucket_index_load_failures_total",
+	))
+}
+
+func TestLoader_GetIndex_ShouldCacheKeyDeniedErrors(t *testing.T) {
+	user := "user-1"
+	ctx := context.Background()
+	reg := prometheus.NewPedanticRegistry()
+	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
+
+	bkt = &cortex_testutil.MockBucketFailure{
+		Bucket: bkt,
+		GetFailures: map[string]error{
+			path.Join(user, "bucket-index.json.gz"): cortex_testutil.ErrKeyAccessDeniedError,
+		},
+	}
+
+	// Create the loader.
+	loader := NewLoader(prepareLoaderConfig(), bkt, nil, log.NewNopLogger(), reg)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, loader))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
+	})
+
+	// Request the index multiple times.
+	for range 10 {
+		_, _, err := loader.GetIndex(ctx, "user-1")
+		require.True(t, errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied))
+	}
+
+	// Ensure metrics have been updated accordingly.
+	assert.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+		# HELP cortex_bucket_index_load_failures_total Total number of bucket index loading failures.
+		# TYPE cortex_bucket_index_load_failures_total counter
+		cortex_bucket_index_load_failures_total 0
+		# HELP cortex_bucket_index_loaded Number of bucket indexes currently loaded in-memory.
+		# TYPE cortex_bucket_index_loaded gauge
+		cortex_bucket_index_loaded 0
+		# HELP cortex_bucket_index_loads_total Total number of bucket index loading attempts.
+		# TYPE cortex_bucket_index_loads_total counter
+		cortex_bucket_index_loads_total 1
+	`),
+		"cortex_bucket_index_loads_total",
+		"cortex_bucket_index_load_failures_total",
+		"cortex_bucket_index_loaded",
 	))
 }
 

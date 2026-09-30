@@ -7,15 +7,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/objstore"
 
-	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/util/testutil"
 )
 
 func TestBlockDeletionMarkFilepath(t *testing.T) {
@@ -49,12 +49,14 @@ func TestMigrateBlockDeletionMarksToGlobalLocation(t *testing.T) {
 	block1 := ulid.MustNew(1, nil)
 	block2 := ulid.MustNew(2, nil)
 	block3 := ulid.MustNew(3, nil)
+	block4 := ulid.MustNew(4, nil)
 	require.NoError(t, bkt.Upload(ctx, path.Join("user-1", block1.String(), metadata.DeletionMarkFilename), strings.NewReader("{}")))
 	require.NoError(t, bkt.Upload(ctx, path.Join("user-1", block3.String(), metadata.DeletionMarkFilename), strings.NewReader("{}")))
+	require.NoError(t, bkt.Upload(ctx, path.Join("user-1", block4.String(), metadata.NoCompactMarkFilename), strings.NewReader("{}")))
 
 	t.Run("doesn't increase thanos_objstore_bucket_operation_failures_total for NotFound deletion markers", func(t *testing.T) {
 		reg := prometheus.NewPedanticRegistry()
-		bkt = objstore.BucketWithMetrics("", bkt, reg)
+		bkt = objstore.WrapWithMetrics(bkt, prometheus.WrapRegistererWithPrefix("thanos_", reg), "")
 		require.NoError(t, bkt.Upload(ctx, path.Join("user-1", block2.String(), metadata.MetaFilename), strings.NewReader("{}")))
 		require.NoError(t, MigrateBlockDeletionMarksToGlobalLocation(ctx, bkt, "user-1", nil))
 
@@ -77,14 +79,16 @@ func TestMigrateBlockDeletionMarksToGlobalLocation(t *testing.T) {
 
 		// Ensure deletion marks have been copied.
 		for _, tc := range []struct {
-			blockID        ulid.ULID
-			expectedExists bool
+			blockID            ulid.ULID
+			expectedExists     bool
+			globalFilePathFunc func(ulid.ULID) string
 		}{
-			{block1, true},
-			{block2, false},
-			{block3, true},
+			{block1, true, BlockDeletionMarkFilepath},
+			{block2, false, BlockDeletionMarkFilepath},
+			{block3, true, BlockDeletionMarkFilepath},
+			{block4, true, NoCompactMarkFilenameMarkFilepath},
 		} {
-			ok, err := bkt.Exists(ctx, path.Join("user-1", BlockDeletionMarkFilepath(tc.blockID)))
+			ok, err := bkt.Exists(ctx, path.Join("user-1", tc.globalFilePathFunc(tc.blockID)))
 			require.NoError(t, err)
 			require.Equal(t, tc.expectedExists, ok)
 		}

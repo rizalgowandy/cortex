@@ -5,6 +5,9 @@ import (
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 )
@@ -24,8 +27,8 @@ func ToQueryRequest(from, to model.Time, matchers []*labels.Matcher) (*QueryRequ
 }
 
 // FromQueryRequest unpacks a QueryRequest proto.
-func FromQueryRequest(req *QueryRequest) (model.Time, model.Time, []*labels.Matcher, error) {
-	matchers, err := FromLabelMatchers(req.Matchers)
+func FromQueryRequest(cache storecache.MatchersCache, req *QueryRequest) (model.Time, model.Time, []*labels.Matcher, error) {
+	matchers, err := FromLabelMatchers(cache, req.Matchers)
 	if err != nil {
 		return 0, 0, nil, err
 	}
@@ -53,10 +56,10 @@ func ToExemplarQueryRequest(from, to model.Time, matchers ...[]*labels.Matcher) 
 }
 
 // FromExemplarQueryRequest unpacks a ExemplarQueryRequest proto.
-func FromExemplarQueryRequest(req *ExemplarQueryRequest) (int64, int64, [][]*labels.Matcher, error) {
+func FromExemplarQueryRequest(cache storecache.MatchersCache, req *ExemplarQueryRequest) (int64, int64, [][]*labels.Matcher, error) {
 	var result [][]*labels.Matcher
 	for _, m := range req.Matchers {
-		matchers, err := FromLabelMatchers(m.Matchers)
+		matchers, err := FromLabelMatchers(cache, m.Matchers)
 		if err != nil {
 			return 0, 0, nil, err
 		}
@@ -66,46 +69,34 @@ func FromExemplarQueryRequest(req *ExemplarQueryRequest) (int64, int64, [][]*lab
 	return req.StartTimestampMs, req.EndTimestampMs, result, nil
 }
 
-// ToQueryResponse builds a QueryResponse proto.
-func ToQueryResponse(matrix model.Matrix) *QueryResponse {
-	resp := &QueryResponse{}
-	for _, ss := range matrix {
-		ts := cortexpb.TimeSeries{
-			Labels:  cortexpb.FromMetricsToLabelAdapters(ss.Metric),
-			Samples: make([]cortexpb.Sample, 0, len(ss.Values)),
-		}
-		for _, s := range ss.Values {
-			ts.Samples = append(ts.Samples, cortexpb.Sample{
-				Value:       float64(s.Value),
-				TimestampMs: int64(s.Timestamp),
-			})
-		}
-		resp.Timeseries = append(resp.Timeseries, ts)
-	}
-	return resp
-}
-
-// FromQueryResponse unpacks a QueryResponse proto.
-func FromQueryResponse(resp *QueryResponse) model.Matrix {
-	m := make(model.Matrix, 0, len(resp.Timeseries))
-	for _, ts := range resp.Timeseries {
+// MatrixFromSeriesSet unpacks a SeriesSet to a model.Matrix.
+func MatrixFromSeriesSet(set storage.SeriesSet) (model.Matrix, error) {
+	m := make(model.Matrix, 0)
+	for set.Next() {
+		s := set.At()
 		var ss model.SampleStream
-		ss.Metric = cortexpb.FromLabelAdaptersToMetric(ts.Labels)
-		ss.Values = make([]model.SamplePair, 0, len(ts.Samples))
-		for _, s := range ts.Samples {
+		ss.Metric = cortexpb.FromLabelAdaptersToMetric(cortexpb.FromLabelsToLabelAdapters(s.Labels()))
+		ss.Values = make([]model.SamplePair, 0)
+		it := s.Iterator(nil)
+		for it.Next() != chunkenc.ValNone {
+			t, v := it.At()
 			ss.Values = append(ss.Values, model.SamplePair{
-				Value:     model.SampleValue(s.Value),
-				Timestamp: model.Time(s.TimestampMs),
+				Value:     model.SampleValue(v),
+				Timestamp: model.Time(t),
 			})
 		}
+		if it.Err() != nil {
+			return nil, it.Err()
+		}
+
 		m = append(m, &ss)
 	}
 
-	return m
+	return m, set.Err()
 }
 
 // ToMetricsForLabelMatchersRequest builds a MetricsForLabelMatchersRequest proto
-func ToMetricsForLabelMatchersRequest(from, to model.Time, matchers []*labels.Matcher) (*MetricsForLabelMatchersRequest, error) {
+func ToMetricsForLabelMatchersRequest(from, to model.Time, limit int, matchers []*labels.Matcher) (*MetricsForLabelMatchersRequest, error) {
 	ms, err := toLabelMatchers(matchers)
 	if err != nil {
 		return nil, err
@@ -115,35 +106,73 @@ func ToMetricsForLabelMatchersRequest(from, to model.Time, matchers []*labels.Ma
 		StartTimestampMs: int64(from),
 		EndTimestampMs:   int64(to),
 		MatchersSet:      []*LabelMatchers{{Matchers: ms}},
+		Limit:            int64(limit),
 	}, nil
 }
 
+// SeriesSetToQueryResponse builds a QueryResponse proto
+func SeriesSetToQueryResponse(s storage.SeriesSet) (*QueryResponse, error) {
+	result := &QueryResponse{}
+
+	var it chunkenc.Iterator
+	for s.Next() {
+		series := s.At()
+		samples := []cortexpb.Sample{}
+		histograms := []cortexpb.WrappedHistogram{}
+		it = series.Iterator(it)
+		for valType := it.Next(); valType != chunkenc.ValNone; valType = it.Next() {
+			switch valType {
+			case chunkenc.ValFloat:
+				t, v := it.At()
+				samples = append(samples, cortexpb.Sample{
+					TimestampMs: t,
+					Value:       v,
+				})
+			case chunkenc.ValHistogram:
+				t, v := it.AtHistogram(nil)
+				histograms = append(histograms, cortexpb.WrappedHistogram{Histogram: cortexpb.HistogramToHistogramProto(t, v)})
+			case chunkenc.ValFloatHistogram:
+				t, v := it.AtFloatHistogram(nil)
+				histograms = append(histograms, cortexpb.WrappedHistogram{Histogram: cortexpb.FloatHistogramToHistogramProto(t, v)})
+			default:
+				panic("unhandled default case")
+			}
+		}
+		if err := it.Err(); err != nil {
+			return nil, err
+		}
+		ts := cortexpb.TimeSeries{
+			Labels: cortexpb.FromLabelsToLabelAdapters(series.Labels()),
+		}
+		if len(samples) > 0 {
+			ts.Samples = samples
+		}
+		if len(histograms) > 0 {
+			ts.Histograms = histograms
+		}
+		result.Timeseries = append(result.Timeseries, ts)
+	}
+
+	return result, s.Err()
+}
+
 // FromMetricsForLabelMatchersRequest unpacks a MetricsForLabelMatchersRequest proto
-func FromMetricsForLabelMatchersRequest(req *MetricsForLabelMatchersRequest) (model.Time, model.Time, [][]*labels.Matcher, error) {
+func FromMetricsForLabelMatchersRequest(cache storecache.MatchersCache, req *MetricsForLabelMatchersRequest) (model.Time, model.Time, int, [][]*labels.Matcher, error) {
 	matchersSet := make([][]*labels.Matcher, 0, len(req.MatchersSet))
 	for _, matchers := range req.MatchersSet {
-		matchers, err := FromLabelMatchers(matchers.Matchers)
+		matchers, err := FromLabelMatchers(cache, matchers.Matchers)
 		if err != nil {
-			return 0, 0, nil, err
+			return 0, 0, 0, nil, err
 		}
 		matchersSet = append(matchersSet, matchers)
 	}
 	from := model.Time(req.StartTimestampMs)
 	to := model.Time(req.EndTimestampMs)
-	return from, to, matchersSet, nil
-}
-
-// FromMetricsForLabelMatchersResponse unpacks a MetricsForLabelMatchersResponse proto
-func FromMetricsForLabelMatchersResponse(resp *MetricsForLabelMatchersResponse) []model.Metric {
-	metrics := []model.Metric{}
-	for _, m := range resp.Metric {
-		metrics = append(metrics, cortexpb.FromLabelAdaptersToMetric(m.Labels))
-	}
-	return metrics
+	return from, to, int(req.Limit), matchersSet, nil
 }
 
 // ToLabelValuesRequest builds a LabelValuesRequest proto
-func ToLabelValuesRequest(labelName model.LabelName, from, to model.Time, matchers []*labels.Matcher) (*LabelValuesRequest, error) {
+func ToLabelValuesRequest(labelName model.LabelName, from, to model.Time, limit int, matchers []*labels.Matcher) (*LabelValuesRequest, error) {
 	ms, err := toLabelMatchers(matchers)
 	if err != nil {
 		return nil, err
@@ -154,22 +183,53 @@ func ToLabelValuesRequest(labelName model.LabelName, from, to model.Time, matche
 		StartTimestampMs: int64(from),
 		EndTimestampMs:   int64(to),
 		Matchers:         &LabelMatchers{Matchers: ms},
+		Limit:            int64(limit),
 	}, nil
 }
 
 // FromLabelValuesRequest unpacks a LabelValuesRequest proto
-func FromLabelValuesRequest(req *LabelValuesRequest) (string, int64, int64, []*labels.Matcher, error) {
+func FromLabelValuesRequest(cache storecache.MatchersCache, req *LabelValuesRequest) (string, int64, int64, int, []*labels.Matcher, error) {
 	var err error
 	var matchers []*labels.Matcher
 
 	if req.Matchers != nil {
-		matchers, err = FromLabelMatchers(req.Matchers.Matchers)
+		matchers, err = FromLabelMatchers(cache, req.Matchers.Matchers)
 		if err != nil {
-			return "", 0, 0, nil, err
+			return "", 0, 0, 0, nil, err
 		}
 	}
 
-	return req.LabelName, req.StartTimestampMs, req.EndTimestampMs, matchers, nil
+	return req.LabelName, req.StartTimestampMs, req.EndTimestampMs, int(req.Limit), matchers, nil
+}
+
+// ToLabelNamesRequest builds a LabelNamesRequest proto
+func ToLabelNamesRequest(from, to model.Time, limit int, matchers []*labels.Matcher) (*LabelNamesRequest, error) {
+	ms, err := toLabelMatchers(matchers)
+	if err != nil {
+		return nil, err
+	}
+
+	return &LabelNamesRequest{
+		StartTimestampMs: int64(from),
+		EndTimestampMs:   int64(to),
+		Matchers:         &LabelMatchers{Matchers: ms},
+		Limit:            int64(limit),
+	}, nil
+}
+
+// FromLabelNamesRequest unpacks a LabelNamesRequest proto
+func FromLabelNamesRequest(cache storecache.MatchersCache, req *LabelNamesRequest) (int64, int64, int, []*labels.Matcher, error) {
+	var err error
+	var matchers []*labels.Matcher
+
+	if req.Matchers != nil {
+		matchers, err = FromLabelMatchers(cache, req.Matchers.Matchers)
+		if err != nil {
+			return 0, 0, 0, nil, err
+		}
+	}
+
+	return req.StartTimestampMs, req.EndTimestampMs, int(req.Limit), matchers, nil
 }
 
 func toLabelMatchers(matchers []*labels.Matcher) ([]*LabelMatcher, error) {
@@ -197,27 +257,31 @@ func toLabelMatchers(matchers []*labels.Matcher) ([]*LabelMatcher, error) {
 	return result, nil
 }
 
-func FromLabelMatchers(matchers []*LabelMatcher) ([]*labels.Matcher, error) {
+func FromLabelMatchers(cache storecache.MatchersCache, matchers []*LabelMatcher) ([]*labels.Matcher, error) {
 	result := make([]*labels.Matcher, 0, len(matchers))
 	for _, matcher := range matchers {
-		var mtype labels.MatchType
-		switch matcher.Type {
-		case EQUAL:
-			mtype = labels.MatchEqual
-		case NOT_EQUAL:
-			mtype = labels.MatchNotEqual
-		case REGEX_MATCH:
-			mtype = labels.MatchRegexp
-		case REGEX_NO_MATCH:
-			mtype = labels.MatchNotRegexp
-		default:
-			return nil, fmt.Errorf("invalid matcher type")
-		}
-		matcher, err := labels.NewMatcher(mtype, matcher.Name, matcher.Value)
+		m, err := cache.GetOrSet(matcher, func() (*labels.Matcher, error) {
+			var mtype labels.MatchType
+			switch matcher.Type {
+			case EQUAL:
+				mtype = labels.MatchEqual
+			case NOT_EQUAL:
+				mtype = labels.MatchNotEqual
+			case REGEX_MATCH:
+				mtype = labels.MatchRegexp
+			case REGEX_NO_MATCH:
+				mtype = labels.MatchNotRegexp
+			default:
+				return nil, fmt.Errorf("invalid matcher type")
+			}
+			return labels.NewMatcher(mtype, matcher.GetName(), matcher.GetValue())
+		})
+
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, matcher)
+
+		result = append(result, m)
 	}
 	return result, nil
 }
@@ -237,18 +301,6 @@ func FastFingerprint(ls []cortexpb.LabelAdapter) model.Fingerprint {
 		result ^= sum
 	}
 	return model.Fingerprint(result)
-}
-
-// Fingerprint runs the same algorithm as Prometheus labelSetToFingerprint()
-func Fingerprint(labels labels.Labels) model.Fingerprint {
-	sum := hashNew()
-	for _, label := range labels {
-		sum = hashAddString(sum, label.Name)
-		sum = hashAddByte(sum, model.SeparatorByte)
-		sum = hashAddString(sum, label.Value)
-		sum = hashAddByte(sum, model.SeparatorByte)
-	}
-	return model.Fingerprint(sum)
 }
 
 // LabelsToKeyString is used to form a string to be used as

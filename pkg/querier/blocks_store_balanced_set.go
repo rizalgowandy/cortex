@@ -4,20 +4,20 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/ring/client"
-	"github.com/grafana/dskit/services"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
 	"github.com/thanos-io/thanos/pkg/extprom"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/ring/client"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 // BlocksStoreSet implementation used when the blocks are not sharded in the store-gateway
@@ -54,13 +54,13 @@ func (s *blocksStoreBalancedSet) starting(ctx context.Context) error {
 }
 
 func (s *blocksStoreBalancedSet) resolve(ctx context.Context) error {
-	if err := s.dnsProvider.Resolve(ctx, s.serviceAddresses); err != nil {
+	if err := s.dnsProvider.Resolve(ctx, s.serviceAddresses, true); err != nil {
 		level.Error(s.logger).Log("msg", "failed to resolve store-gateway addresses", "err", err, "addresses", s.serviceAddresses)
 	}
 	return nil
 }
 
-func (s *blocksStoreBalancedSet) GetClientsFor(_ string, blockIDs []ulid.ULID, exclude map[ulid.ULID][]string) (map[BlocksStoreClient][]ulid.ULID, error) {
+func (s *blocksStoreBalancedSet) GetClientsFor(_ string, blockIDs []ulid.ULID, exclude map[ulid.ULID][]string, _ map[ulid.ULID]map[string]int) (map[BlocksStoreClient][]ulid.ULID, error) {
 	addresses := s.dnsProvider.Addresses()
 	if len(addresses) == 0 {
 		return nil, fmt.Errorf("no address resolved for the store-gateway service addresses %s", strings.Join(s.serviceAddresses, ","))
@@ -94,7 +94,7 @@ func (s *blocksStoreBalancedSet) GetClientsFor(_ string, blockIDs []ulid.ULID, e
 
 func getFirstNonExcludedAddr(addresses, exclude []string) string {
 	for _, addr := range addresses {
-		if !util.StringsContain(exclude, addr) {
+		if !slices.Contains(exclude, addr) {
 			return addr
 		}
 	}

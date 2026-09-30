@@ -2,13 +2,13 @@ version: '3.4'
 services:
 
   consul:
-    image: consul
+    image: consul:1.15.4
     command: [ "agent", "-dev" ,"-client=0.0.0.0", "-log-level=info" ]
     ports:
       - 8500:8500
 
   minio:
-    image: minio/minio
+    image: docker.io/cortexproject/minio:RELEASE.2024-07-04T14-25-45Z
     command: [ "server", "/data" ]
     environment:
       - MINIO_ACCESS_KEY=cortex

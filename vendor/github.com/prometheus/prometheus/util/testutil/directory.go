@@ -16,7 +16,6 @@ package testutil
 import (
 	"crypto/sha256"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,7 +33,7 @@ const (
 	// NilCloser is a no-op Closer.
 	NilCloser = nilCloser(true)
 
-	// The number of times that a TemporaryDirectory will retry its removal
+	// The number of times that a TemporaryDirectory will retry its removal.
 	temporaryDirectoryRemoveRetries = 2
 )
 
@@ -73,12 +72,12 @@ type (
 	// the test flags, which we do not want in non-test binaries even if
 	// they make use of these utilities for some reason).
 	T interface {
-		Errorf(format string, args ...interface{})
+		Errorf(format string, args ...any)
 		FailNow()
 	}
 )
 
-func (c nilCloser) Close() {
+func (nilCloser) Close() {
 }
 
 func (c callbackCloser) Close() {
@@ -120,7 +119,7 @@ func NewTemporaryDirectory(name string, t T) (handler TemporaryDirectory) {
 		err       error
 	)
 
-	directory, err = ioutil.TempDir(defaultDirectory, name)
+	directory, err = os.MkdirTemp(defaultDirectory, name)
 	require.NoError(t, err)
 
 	handler = temporaryDirectory{
@@ -128,7 +127,7 @@ func NewTemporaryDirectory(name string, t T) (handler TemporaryDirectory) {
 		tester: t,
 	}
 
-	return
+	return handler
 }
 
 // DirHash returns a hash of all files attributes and their content within a directory.
@@ -156,7 +155,7 @@ func DirHash(t *testing.T, path string) []byte {
 		modTime, err := info.ModTime().GobEncode()
 		require.NoError(t, err)
 
-		_, err = io.WriteString(hash, string(modTime))
+		_, err = hash.Write(modTime)
 		require.NoError(t, err)
 		return nil
 	})

@@ -18,11 +18,13 @@ package web
 import (
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 
-	"github.com/go-kit/log"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 )
 
 // extraHTTPHeaders is a map of HTTP headers that can be added to HTTP
@@ -77,8 +79,9 @@ HeadersLoop:
 type webHandler struct {
 	tlsConfigPath string
 	handler       http.Handler
-	logger        log.Logger
+	logger        *slog.Logger
 	cache         *cache
+	limiter       *rate.Limiter
 	// bcryptMtx is there to ensure that bcrypt.CompareHashAndPassword is run
 	// only once in parallel as this is CPU intensive.
 	bcryptMtx sync.Mutex
@@ -87,8 +90,13 @@ type webHandler struct {
 func (u *webHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c, err := getConfig(u.tlsConfigPath)
 	if err != nil {
-		u.logger.Log("msg", "Unable to parse configuration", "err", err)
+		u.logger.Error("Unable to parse configuration", "err", err.Error())
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	if u.limiter != nil && !u.limiter.Allow() {
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 		return
 	}
 
@@ -113,7 +121,12 @@ func (u *webHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			hashedPassword = "$2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi"
 		}
 
-		cacheKey := hex.EncodeToString(append(append([]byte(user), []byte(hashedPassword)...), []byte(pass)...))
+		cacheKey := strings.Join(
+			[]string{
+				hex.EncodeToString([]byte(user)),
+				hex.EncodeToString([]byte(hashedPassword)),
+				hex.EncodeToString([]byte(pass)),
+			}, ":")
 		authOk, ok := u.cache.get(cacheKey)
 
 		if !ok {
@@ -122,7 +135,7 @@ func (u *webHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(pass))
 			u.bcryptMtx.Unlock()
 
-			authOk = err == nil
+			authOk = validUser && err == nil
 			u.cache.set(cacheKey, authOk)
 		}
 

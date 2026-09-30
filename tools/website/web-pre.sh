@@ -9,16 +9,32 @@ WEBSITE_DIR="website"
 ORIGINAL_CONTENT_DIR="docs"
 OUTPUT_CONTENT_DIR="${WEBSITE_DIR}/content/en/docs"
 
+# The interactive architecture diagram loads D3 from the pinned `d3` dependency
+# in website/package.json rather than a committed copy, so bail out before
+# touching anything if the dependency has not been installed.
+D3_DIST="${WEBSITE_DIR}/node_modules/d3/dist/d3.min.js"
+if [ ! -f "${D3_DIST}" ]; then
+	echo "${D3_DIST} is missing; run 'npm ci' in ${WEBSITE_DIR}/ first"
+	exit 255
+fi
+
 rm -rf ${OUTPUT_CONTENT_DIR} || true
 mkdir -p ${OUTPUT_CONTENT_DIR}
 
 # Copy original content.
 cp -r ${ORIGINAL_CONTENT_DIR}/* ${OUTPUT_CONTENT_DIR}
 cp -r code-of-conduct.md CHANGELOG.md ${OUTPUT_CONTENT_DIR}
-cp GOVERNANCE.md ${OUTPUT_CONTENT_DIR}/contributing/governance.md
+Maintainers=`cat MAINTAINERS.md` envsubst <  GOVERNANCE.md >> ${OUTPUT_CONTENT_DIR}/contributing/governance.md
 cp images/* ${WEBSITE_DIR}/static/images
 
-# Add headers to special CODE_OF_CONDUCT.md and CHANGELOG.md files.
+# Copy the interactive architecture diagram and the D3 build it loads.
+# tools/diagram/ is the single source of truth for the page; a diagrams/
+# subdirectory keeps d3.min.js out of the site root, and the page's relative
+# <script src> resolves in both places.
+mkdir -p ${WEBSITE_DIR}/static/diagrams
+cp tools/diagram/cortex-architecture.html "${D3_DIST}" ${WEBSITE_DIR}/static/diagrams/
+
+# Add headers to special CODE_OF_CONDUCT.md, CHANGELOG.md and README.md files.
 echo "$(cat <<EOT
 ---
 title: Code of Conduct
@@ -50,7 +66,25 @@ weight: 1
 ---
 EOT
 )" > ${OUTPUT_CONTENT_DIR}/contributing/governance.md
-tail -n +2 GOVERNANCE.md >> ${OUTPUT_CONTENT_DIR}/contributing/governance.md
+Maintainers=`cat MAINTAINERS.md` envsubst < GOVERNANCE.md | tail -n +2 >> ${OUTPUT_CONTENT_DIR}/contributing/governance.md
+
+echo "$(cat <<EOT
+---
+title: "Documentation"
+linkTitle: "Documentation"
+weight: 1
+menu:
+  main:
+    weight: 1
+---
+EOT
+)" > ${OUTPUT_CONTENT_DIR}/_index.md
+
+# Ignore the header and some of the badges.
+head -6 README.md | tail +2 >> ${OUTPUT_CONTENT_DIR}/_index.md
+
+# Ignore another header and write the rest of the file.
+tail +12 README.md >> ${OUTPUT_CONTENT_DIR}/_index.md
 
 ALL_DOC_CONTENT_FILES=`echo "${OUTPUT_CONTENT_DIR}/**/*.md ${OUTPUT_CONTENT_DIR}/*.md"`
 for file in $(find ${OUTPUT_CONTENT_DIR} -name '*.md')

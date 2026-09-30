@@ -13,7 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// mapper is designed to enusre the provided rule sets are identical
+// mapper is designed to ensure the provided rule sets are identical
 // to the on-disk rules tracked by the prometheus manager
 type mapper struct {
 	Path string // Path specifies the directory in which rule files will be mapped.
@@ -82,9 +82,7 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// write all rule configs to disk
 	for filename, groups := range ruleConfigs {
-		// Store the encoded file name to better handle `/` characters
-		encodedFileName := url.PathEscape(filename)
-		fullFileName := filepath.Join(path, encodedFileName)
+		fullFileName := m.ruleFilePath(user, filename)
 
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
 		if err != nil {
@@ -122,6 +120,12 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 	}
 
 	return anyUpdated, filenames, nil
+}
+
+// ruleFilePath returns the on-disk file holding the namespace rules of a user.
+// The namespace is path-escaped to better handle `/` characters.
+func (m *mapper) ruleFilePath(user, namespace string) string {
+	return filepath.Join(m.Path, user, url.PathEscape(namespace))
 }
 
 func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename string) (bool, error) {

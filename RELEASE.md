@@ -4,7 +4,7 @@ This page describes the release process and the currently planned schedule for u
 
 ## Release schedule
 
-Our goal is to provide a new minor release every 6 weeks. This is a new process and everything in this document is subject to change.
+Our goal is to provide a new minor release every 6 months. This is a new process and everything in this document is subject to change.
 
 | release series | date of first pre-release (year-month-day) | release shepherd                            |
 |----------------|--------------------------------------------|---------------------------------------------|
@@ -27,7 +27,17 @@ Our goal is to provide a new minor release every 6 weeks. This is a new process 
 | v1.9.0         | 2021-04-29                                 | Goutham Veeramachaneni (@gouthamve)         |
 | v1.10.0        | 2021-06-25                                 | Bryan Boreham (@bboreham)                   |
 | v1.11.0        | 2021-08-06                                 | Marco Pracucci (@pracucci)                  |
-| v1.12.0        | 2021-09-17                                 |                                             |
+| v1.12.0        | 2022-02-17                                 | _Abandoned_                                 |
+| v1.13.0        | 2022-06-23                                 | Alvin Lin (@alvinlin123)                    |
+| v1.14.0        | 2022-11-15                                 | Alan Protasio (@alanprot)                   |
+| v1.15.0        | 2023-03-27                                 | Ben Ye (@yeya24)                            |
+| v1.16.0        | 2023-11-05                                 | Ben Ye (@yeya24)                            |
+| v1.17.0        | 2024-04-25                                 | Ben Ye (@yeya24)                            |
+| v1.18.0        | 2024-08-16                                 | Daniel Blando (@danielblando)               |
+| v1.19.0        | 2025-01-22                                 | Charlie Le (@charlietle)                    |
+| v1.20.0        | 2025-10-31                                 | Ben Ye (@yeya24)                            |
+| v1.21.0        | 2026-03-12                                 | Friedrich Gonzalez (@friedrichg)            |
+| v1.22.0        | 2026-09-12                                 | Charlie Le (@charlietle)                    |
 
 ## Release shepherd responsibilities
 
@@ -35,7 +45,7 @@ The release shepherd is responsible for the entire release series of a minor rel
 
 * We aim to keep the master branch in a working state at all times. In principle, it should be possible to cut a release from master at any time. In practice, things might not work out as nicely. A few days before the pre-release is scheduled, the shepherd should check the state of master. Following their best judgement, the shepherd should try to expedite bug fixes that are still in progress but should make it into the release. On the other hand, the shepherd may hold back merging last-minute invasive and risky changes that are better suited for the next minor release.
 * On the date listed in the table above, the release shepherd cuts the first pre-release (using the suffix `-rc.0`) and creates a new branch called  `release-<major>.<minor>` starting at the commit tagged for the pre-release. In general, a pre-release is considered a release candidate (that's what `rc` stands for) and should therefore not contain any known bugs that are planned to be fixed in the final release.
-* With the pre-release, the release shepherd is responsible for coordinating or running the release candidate in any [end user](https://github.com/cortexproject/cortex/blob/master/ADOPTERS.md) production environment  for 3 days. This is typically done in Grafana Labs or Weaveworks but we are looking for more volunteers!
+* With the pre-release, the release shepherd is responsible for coordinating or running the release candidate in any [end user](https://github.com/cortexproject/cortex/blob/master/ADOPTERS.md) production environment for 3 days.
 * If regressions or critical bugs are detected, they need to get fixed before cutting a new pre-release (called `-rc.1`, `-rc.2`, etc.).
 
 See the next section for details on cutting an individual release.
@@ -81,7 +91,7 @@ To prepare release branch, first create new release branch (release-X.Y) in Cort
      * `[BUGFIX]`
    - Run `./tools/release/check-changelog.sh LAST-RELEASE-TAG...master` and add any missing PR which includes user-facing changes
 
-Once your PR with release prepartion is approved, merge it to "release-X.Y" branch, and continue with publishing.
+Once your PR with release preparation is approved, merge it to "release-X.Y" branch, and continue with publishing.
 
 ### Publish a release candidate
 
@@ -93,8 +103,9 @@ To publish a release candidate:
 1. Wait until CI pipeline succeeded (once a tag is created, the release process through GitHub actions will be triggered for this tag)
 1. Create a pre-release in GitHub
    - Write the release notes (including a copy-paste of the changelog)
-   - Build binaries with `make dist` and attach them to the release
-   - Build packages with `make packages`, test them with `make test-packages` and attach them to the release
+   - Download binaries from the `Dist Binaries` artifact in the [distribution](https://github.com/cortexproject/cortex/actions/workflows/distribution.yml) GitHub Actions workflow for the tag and attach them to the release
+   - Download packages from the `Packages` artifact in the [distribution](https://github.com/cortexproject/cortex/actions/workflows/distribution.yml) GitHub Actions workflow for the tag and attach them to the release
+1. [Sign the artifact and generate SBOM for the release](#sing-and-sbom)
 
 ### Publish a stable release
 
@@ -103,14 +114,15 @@ To publish a stable release:
 1. Do not change the release branch directly; make a PR to the release-X.Y branch with VERSION and any CHANGELOG changes.
    1. Ensure the `VERSION` file has **no** `-rc.X` suffix
    1. Update the Cortex version in the following locations:
-      - Kubernetes manifests located at `k8s/`
-      - Documentation located at `docs/`
+      - `docs/getting-started/.env`
+      - Bump version in cortex-helm-chart via PR, for example https://github.com/cortexproject/cortex-helm-chart/pull/501
 1. After merging your PR to release branch, `git tag` the new release (see [How to tag a release](#how-to-tag-a-release)) from release branch.
 1. Wait until CI pipeline succeeded (once a tag is created, the release process through GitHub actions will be triggered for this tag)
 1. Create a release in GitHub
    - Write the release notes (including a copy-paste of the changelog)
-   - Build binaries with `make dist` and attach them to the release
-   - Build packages with `make packages`, test them with `make test-packages` and attach them to the release
+   - Download binaries from the `Dist Binaries` artifact in the [distribution](https://github.com/cortexproject/cortex/actions/workflows/distribution.yml) GitHub Actions workflow for the tag and attach them to the release
+   - Download packages from the `Packages` artifact in the [distribution](https://github.com/cortexproject/cortex/actions/workflows/distribution.yml) GitHub Actions workflow for the tag and attach them to the release
+1. [Sign the artifact and generate SBOM for the release](#sing-and-sbom)
 1. Merge the release branch `release-x.y` to `master`
    - Create `merge-release-X.Y-to-master` branch **from `release-X.Y` branch** locally
    - Merge upstream `master` branch into your `merge-release-X.Y-to-master` and resolve conflicts
@@ -119,6 +131,27 @@ To publish a stable release:
      - This can either be done by temporarily enabling "Allow merge commits" option in "Settings > Options".
      - Alternatively, this can be done locally by merging `merge-release-X.Y-to-master` branch into `master`, and pushing resulting `master` to upstream repository. This doesn't break `master` branch protection, since PR has been approved already, and it also doesn't require removing the protection.
 1. Open a PR to add the new version to the backward compatibility integration test (`integration/backward_compatibility_test.go`)
+
+### <a name="sing-and-sbom"></a>Sign the release artifacts and generate SBOM
+1. Make sure you have the release branch checked out, and you don't have any local modifications
+1. Generate SBOMs using the provided script (requires https://github.com/kubernetes-sigs/bom):
+   ```bash
+   ./tools/generate-sbom.sh /path/to/cortex
+   ```
+   This generates SBOMs for the Go modules and all container images (cortex, query-tee, test-exporter, thanosconvert) and packages them into `dist/sbom.tar.gz`.
+1. Download the artifacts attached to the published release
+   ```bash
+   curl -H "Authorization: Bearer <your GitHub API token>" -s https://api.github.com/repos/cortexproject/cortex/releases/tags/<release tag> \
+   | grep "browser_download_url" \
+   | cut -d: -f2- \
+   | tr -d "\"" \
+   | wget -qi -
+   ```
+1. Sign the files with your PGP key: `find . -maxdepth 1 -type f | xargs -L 1 gpg --armor --detach-sign`
+1. Attach `sbom.tar.gz` to the release
+1. Attach the generated `.asc` files to the release
+1. Attach `sign.pub` which contains the public key of the PGP key you used to sign the binaries
+   * You can get the public key by doing `gpg --armor --export <your@email.address>`
 
 ### How to tag a release
 

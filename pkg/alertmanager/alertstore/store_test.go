@@ -2,23 +2,23 @@ package alertstore
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/alertmanager/cluster/clusterpb"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
+	googleproto "google.golang.org/protobuf/proto"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
-	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/objectclient"
-	"github.com/cortexproject/cortex/pkg/chunk"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 func TestAlertStore_ListAllUsers(t *testing.T) {
-	runForEachAlertStore(t, func(t *testing.T, store AlertStore, client interface{}) {
+	runForEachAlertStore(t, func(t *testing.T, store AlertStore, m *MockBucket, client any) {
 		ctx := context.Background()
 		user1Cfg := alertspb.AlertConfigDesc{User: "user-1", RawConfig: "content-1"}
 		user2Cfg := alertspb.AlertConfigDesc{User: "user-2", RawConfig: "content-2"}
@@ -39,11 +39,20 @@ func TestAlertStore_ListAllUsers(t *testing.T) {
 			require.NoError(t, err)
 			assert.ElementsMatch(t, []string{"user-1", "user-2"}, users)
 		}
+
+		{
+			// delete user-1 alertmanager config
+			require.NoError(t, store.DeleteAlertConfig(ctx, "user-1"))
+
+			users, err := store.ListAllUsers(ctx)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, []string{"user-2"}, users)
+		}
 	})
 }
 
 func TestAlertStore_SetAndGetAlertConfig(t *testing.T) {
-	runForEachAlertStore(t, func(t *testing.T, store AlertStore, client interface{}) {
+	runForEachAlertStore(t, func(t *testing.T, store AlertStore, m *MockBucket, client any) {
 		ctx := context.Background()
 		user1Cfg := alertspb.AlertConfigDesc{User: "user-1", RawConfig: "content-1"}
 		user2Cfg := alertspb.AlertConfigDesc{User: "user-2", RawConfig: "content-2"}
@@ -81,7 +90,7 @@ func TestAlertStore_SetAndGetAlertConfig(t *testing.T) {
 }
 
 func TestStore_GetAlertConfigs(t *testing.T) {
-	runForEachAlertStore(t, func(t *testing.T, store AlertStore, client interface{}) {
+	runForEachAlertStore(t, func(t *testing.T, store AlertStore, m *MockBucket, client any) {
 		ctx := context.Background()
 		user1Cfg := alertspb.AlertConfigDesc{User: "user-1", RawConfig: "content-1"}
 		user2Cfg := alertspb.AlertConfigDesc{User: "user-2", RawConfig: "content-2"}
@@ -91,6 +100,15 @@ func TestStore_GetAlertConfigs(t *testing.T) {
 			configs, err := store.GetAlertConfigs(ctx, []string{"user-1", "user-2"})
 			require.NoError(t, err)
 			assert.Empty(t, configs)
+		}
+
+		// Treat Access denied as empty.
+		{
+			m.err = errAccessDenied
+			configs, err := store.GetAlertConfigs(ctx, []string{"user-1", "user-2"})
+			require.NoError(t, err)
+			assert.Empty(t, configs)
+			m.err = nil
 		}
 
 		// The storage contains some configs.
@@ -117,7 +135,7 @@ func TestStore_GetAlertConfigs(t *testing.T) {
 }
 
 func TestAlertStore_DeleteAlertConfig(t *testing.T) {
-	runForEachAlertStore(t, func(t *testing.T, store AlertStore, client interface{}) {
+	runForEachAlertStore(t, func(t *testing.T, store AlertStore, m *MockBucket, client any) {
 		ctx := context.Background()
 		user1Cfg := alertspb.AlertConfigDesc{User: "user-1", RawConfig: "content-1"}
 		user2Cfg := alertspb.AlertConfigDesc{User: "user-2", RawConfig: "content-2"}
@@ -135,6 +153,12 @@ func TestAlertStore_DeleteAlertConfig(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, user2Cfg, config)
 
+		// Ensure we capture access denied error
+		m.err = errAccessDenied
+		_, err = store.GetAlertConfig(ctx, "user-1")
+		assert.Equal(t, alertspb.ErrAccessDenied, err)
+		m.err = nil
+
 		// Delete the config for user-1.
 		require.NoError(t, store.DeleteAlertConfig(ctx, "user-1"))
 
@@ -151,41 +175,30 @@ func TestAlertStore_DeleteAlertConfig(t *testing.T) {
 	})
 }
 
-func runForEachAlertStore(t *testing.T, testFn func(t *testing.T, store AlertStore, client interface{})) {
-	legacyClient := chunk.NewMockStorage()
-	legacyStore := objectclient.NewAlertStore(legacyClient, log.NewNopLogger())
-
+func runForEachAlertStore(t *testing.T, testFn func(t *testing.T, store AlertStore, b *MockBucket, client any)) {
 	bucketClient := objstore.NewInMemBucket()
-	bucketStore := bucketclient.NewBucketAlertStore(bucketClient, nil, log.NewNopLogger())
+	mBucketClient := &MockBucket{Bucket: bucketClient}
+	usersScannerConfig := users.UsersScannerConfig{Strategy: users.UserScanStrategyList}
+	reg := prometheus.NewPedanticRegistry()
+	bucketStore, err := bucketclient.NewBucketAlertStore(mBucketClient, usersScannerConfig, nil, log.NewNopLogger(), reg)
+	assert.NoError(t, err)
 
 	stores := map[string]struct {
 		store  AlertStore
-		client interface{}
+		client any
 	}{
-		"legacy": {store: legacyStore, client: legacyClient},
-		"bucket": {store: bucketStore, client: bucketClient},
+		"bucket": {store: bucketStore, client: mBucketClient},
 	}
 
 	for name, data := range stores {
 		t.Run(name, func(t *testing.T) {
-			testFn(t, data.store, data.client)
+			testFn(t, data.store, mBucketClient, data.client)
 		})
 	}
 }
 
-func objectExists(bucketClient interface{}, key string) (bool, error) {
-	if typed, ok := bucketClient.(*chunk.MockStorage); ok {
-		_, err := typed.GetObject(context.Background(), key)
-		if errors.Is(err, chunk.ErrStorageObjectNotFound) {
-			return false, nil
-		}
-		if err == nil {
-			return true, nil
-		}
-		return false, err
-	}
-
-	if typed, ok := bucketClient.(*objstore.InMemBucket); ok {
+func objectExists(bucketClient any, key string) (bool, error) {
+	if typed, ok := bucketClient.(objstore.Bucket); ok {
 		return typed.Exists(context.Background(), key)
 	}
 
@@ -195,7 +208,7 @@ func objectExists(bucketClient interface{}, key string) (bool, error) {
 func makeTestFullState(content string) alertspb.FullStateDesc {
 	return alertspb.FullStateDesc{
 		State: &clusterpb.FullState{
-			Parts: []clusterpb.Part{
+			Parts: []*clusterpb.Part{
 				{
 					Key:  "key",
 					Data: []byte(content),
@@ -205,9 +218,18 @@ func makeTestFullState(content string) alertspb.FullStateDesc {
 	}
 }
 
+func assertFullStateEqual(t *testing.T, expected, actual alertspb.FullStateDesc) {
+	t.Helper()
+	assert.True(t, googleproto.Equal(expected.State, actual.State), "FullState mismatch:\nexpected: %v\nactual:   %v", expected.State, actual.State)
+}
+
 func TestBucketAlertStore_GetSetDeleteFullState(t *testing.T) {
 	bucket := objstore.NewInMemBucket()
-	store := bucketclient.NewBucketAlertStore(bucket, nil, log.NewNopLogger())
+	mBucketClient := &MockBucket{Bucket: bucket}
+	usersScannerConfig := users.UsersScannerConfig{Strategy: users.UserScanStrategyList}
+	reg := prometheus.NewPedanticRegistry()
+	store, err := bucketclient.NewBucketAlertStore(mBucketClient, usersScannerConfig, nil, log.NewNopLogger(), reg)
+	assert.NoError(t, err)
 	ctx := context.Background()
 
 	state1 := makeTestFullState("one")
@@ -226,6 +248,18 @@ func TestBucketAlertStore_GetSetDeleteFullState(t *testing.T) {
 		assert.ElementsMatch(t, []string{}, users)
 	}
 
+	// Test Access Denied
+	{
+		mBucketClient.err = errAccessDenied
+		_, err := store.GetFullState(ctx, "user-1")
+		assert.Equal(t, alertspb.ErrAccessDenied, err)
+
+		users, err := store.ListUsersWithFullState(ctx)
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, []string{}, users)
+		mBucketClient.err = nil
+	}
+
 	// The storage contains users.
 	{
 		require.NoError(t, store.SetFullState(ctx, "user-1", state1))
@@ -233,11 +267,11 @@ func TestBucketAlertStore_GetSetDeleteFullState(t *testing.T) {
 
 		res, err := store.GetFullState(ctx, "user-1")
 		require.NoError(t, err)
-		assert.Equal(t, state1, res)
+		assertFullStateEqual(t, state1, res)
 
 		res, err = store.GetFullState(ctx, "user-2")
 		require.NoError(t, err)
-		assert.Equal(t, state2, res)
+		assertFullStateEqual(t, state2, res)
 
 		// Ensure the config is stored at the expected location. Without this check
 		// we have no guarantee that the objects are stored at the expected location.
@@ -264,7 +298,7 @@ func TestBucketAlertStore_GetSetDeleteFullState(t *testing.T) {
 
 		res, err := store.GetFullState(ctx, "user-2")
 		require.NoError(t, err)
-		assert.Equal(t, state2, res)
+		assertFullStateEqual(t, state2, res)
 
 		users, err := store.ListUsersWithFullState(ctx)
 		assert.NoError(t, err)

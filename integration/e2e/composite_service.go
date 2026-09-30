@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/grafana/dskit/backoff"
 	"github.com/pkg/errors"
+
+	"github.com/cortexproject/cortex/pkg/util/backoff"
 )
 
 // CompositeHTTPService abstract an higher-level service composed, under the hood,
@@ -83,7 +84,7 @@ func (s *CompositeHTTPService) SumMetrics(metricNames []string, opts ...MetricsO
 			return nil, fmt.Errorf("unexpected mismatching sum metrics results (got %d, expected %d)", len(partials), len(sums))
 		}
 
-		for i := 0; i < len(sums); i++ {
+		for i := range sums {
 			sums[i] += partials[i]
 		}
 	}

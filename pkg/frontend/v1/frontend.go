@@ -9,19 +9,19 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/services"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/httpgrpc"
 
+	"github.com/cortexproject/cortex/pkg/frontend/transport"
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
-	"github.com/cortexproject/cortex/pkg/tenant"
-	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/users"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -31,19 +31,34 @@ var (
 
 // Config for a Frontend.
 type Config struct {
-	MaxOutstandingPerTenant int           `yaml:"max_outstanding_per_tenant"`
-	QuerierForgetDelay      time.Duration `yaml:"querier_forget_delay"`
+	QuerierForgetDelay time.Duration `yaml:"querier_forget_delay"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.IntVar(&cfg.MaxOutstandingPerTenant, "querier.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per frontend; requests beyond this error with HTTP 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-frontend.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-frontend will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
 }
 
 type Limits interface {
 	// Returns max queriers to use per tenant, or 0 if shuffle sharding is disabled.
-	MaxQueriersPerUser(user string) int
+	MaxQueriersPerUser(user string) float64
+
+	queue.Limits
+}
+
+// MockLimits implements the Limits interface. Used in tests only.
+type MockLimits struct {
+	Queriers      float64
+	queryPriority validation.QueryPriority
+	queue.MockLimits
+}
+
+func (l MockLimits) MaxQueriersPerUser(_ string) float64 {
+	return l.Queriers
+}
+
+func (l MockLimits) QueryPriority(_ string) validation.QueryPriority {
+	return l.queryPriority
 }
 
 // Frontend queues HTTP requests, dispatches them to backends, and handles retries
@@ -54,9 +69,10 @@ type Frontend struct {
 	cfg    Config
 	log    log.Logger
 	limits Limits
+	retry  *transport.Retry
 
 	requestQueue *queue.RequestQueue
-	activeUsers  *util.ActiveUsersCleanupService
+	activeUsers  *users.ActiveUsersCleanupService
 
 	// Subservices manager.
 	subservices        *services.Manager
@@ -79,29 +95,42 @@ type request struct {
 	response chan *httpgrpc.HTTPResponse
 }
 
+func (r request) Priority() int64 {
+	priority, ok := stats.FromContext(r.originalCtx).LoadPriority()
+	if !ok {
+		return 0
+	}
+
+	return priority
+}
+
 // New creates a new frontend. Frontend implements service, and must be started and stopped.
-func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Registerer) (*Frontend, error) {
+func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Registerer, retry *transport.Retry) (*Frontend, error) {
 	f := &Frontend{
 		cfg:    cfg,
 		log:    log,
 		limits: limits,
+		retry:  retry,
 		queueLength: promauto.With(registerer).NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cortex_query_frontend_queue_length",
 			Help: "Number of queries in the queue.",
-		}, []string{"user"}),
+		}, []string{"user", "priority", "type"}),
 		discardedRequests: promauto.With(registerer).NewCounterVec(prometheus.CounterOpts{
 			Name: "cortex_query_frontend_discarded_requests_total",
 			Help: "Total number of query requests discarded.",
-		}, []string{"user"}),
+		}, []string{"user", "priority"}),
 		queueDuration: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
-			Name:    "cortex_query_frontend_queue_duration_seconds",
-			Help:    "Time spend by requests queued.",
-			Buckets: prometheus.DefBuckets,
+			Name:                            "cortex_query_frontend_queue_duration_seconds",
+			Help:                            "Time spend by requests queued.",
+			Buckets:                         []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30, 60},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
 		}),
 	}
 
-	f.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, f.queueLength, f.discardedRequests)
-	f.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(f.cleanupInactiveUserMetrics)
+	f.requestQueue = queue.NewRequestQueue(cfg.QuerierForgetDelay, f.queueLength, f.discardedRequests, f.limits, registerer)
+	f.activeUsers = users.NewActiveUsersCleanupWithDefaultValues(f.cleanupInactiveUserMetrics)
 
 	var err error
 	f.subservices, err = services.NewManager(f.requestQueue, f.activeUsers)
@@ -145,8 +174,13 @@ func (f *Frontend) stopping(_ error) error {
 }
 
 func (f *Frontend) cleanupInactiveUserMetrics(user string) {
-	f.queueLength.DeleteLabelValues(user)
-	f.discardedRequests.DeleteLabelValues(user)
+	f.queueLength.DeletePartialMatch(prometheus.Labels{
+		"user": user,
+	})
+	f.discardedRequests.DeletePartialMatch(prometheus.Labels{
+		"user": user,
+	})
+	f.requestQueue.CleanupInactiveUserMetrics(user)
 }
 
 // RoundTripGRPC round trips a proto (instead of a HTTP request).
@@ -161,31 +195,33 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *httpgrpc.HTTPRequest)
 		}
 	}
 
-	request := request{
-		request:     req,
-		originalCtx: ctx,
+	return f.retry.Do(ctx, func() (*httpgrpc.HTTPResponse, error) {
+		request := request{
+			request:     req,
+			originalCtx: ctx,
 
-		// Buffer of 1 to ensure response can be written by the server side
-		// of the Process stream, even if this goroutine goes away due to
-		// client context cancellation.
-		err:      make(chan error, 1),
-		response: make(chan *httpgrpc.HTTPResponse, 1),
-	}
+			// Buffer of 1 to ensure response can be written by the server side
+			// of the Process stream, even if this goroutine goes away due to
+			// client context cancellation.
+			err:      make(chan error, 1),
+			response: make(chan *httpgrpc.HTTPResponse, 1),
+		}
 
-	if err := f.queueRequest(ctx, &request); err != nil {
-		return nil, err
-	}
+		if err := f.queueRequest(ctx, &request); err != nil {
+			return nil, err
+		}
 
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
 
-	case resp := <-request.response:
-		return resp, nil
+		case resp := <-request.response:
+			return resp, nil
 
-	case err := <-request.err:
-		return nil, err
-	}
+		case err := <-request.err:
+			return nil, err
+		}
+	})
 }
 
 // Process allows backends to pull requests from the frontend.
@@ -316,7 +352,7 @@ func getQuerierID(server frontendv1pb.Frontend_ProcessServer) (string, error) {
 }
 
 func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
-	tenantIDs, err := tenant.TenantIDs(ctx)
+	tenantIDs, err := users.TenantIDs(ctx)
 	if err != nil {
 		return err
 	}
@@ -326,9 +362,9 @@ func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
 	req.queueSpan, _ = opentracing.StartSpanFromContext(ctx, "queued")
 
 	// aggregate the max queriers limit in the case of a multi tenant query
-	maxQueriers := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, f.limits.MaxQueriersPerUser)
+	maxQueriers := validation.SmallestPositiveNonZeroFloat64PerTenant(tenantIDs, f.limits.MaxQueriersPerUser)
 
-	joinedTenantID := tenant.JoinTenantIDs(tenantIDs)
+	joinedTenantID := users.JoinTenantIDs(tenantIDs)
 	f.activeUsers.UpdateUserTimestamp(joinedTenantID, now)
 
 	err = f.requestQueue.EnqueueRequest(joinedTenantID, req, maxQueriers, nil)

@@ -3,14 +3,15 @@ package local
 import (
 	"context"
 	"flag"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/model"
 	promRules "github.com/prometheus/prometheus/rules"
 
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 const (
@@ -27,26 +28,29 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 }
 
 // Client expects to load already existing rules located at:
-//  cfg.Directory / userID / namespace
+//
+//	cfg.Directory / userID / namespace
 type Client struct {
-	cfg    Config
-	loader promRules.GroupLoader
+	cfg                  Config
+	loader               promRules.GroupLoader
+	nameValidationScheme model.ValidationScheme
 }
 
-func NewLocalRulesClient(cfg Config, loader promRules.GroupLoader) (*Client, error) {
+func NewLocalRulesClient(cfg Config, loader promRules.GroupLoader, nameValidationScheme model.ValidationScheme) (*Client, error) {
 	if cfg.Directory == "" {
 		return nil, errors.New("directory required for local rules config")
 	}
 
 	return &Client{
-		cfg:    cfg,
-		loader: loader,
+		cfg:                  cfg,
+		loader:               loader,
+		nameValidationScheme: nameValidationScheme,
 	}, nil
 }
 
 func (l *Client) ListAllUsers(ctx context.Context) ([]string, error) {
 	root := l.cfg.Directory
-	infos, err := ioutil.ReadDir(root)
+	infos, err := os.ReadDir(root)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to read dir %s", root)
 	}
@@ -56,15 +60,17 @@ func (l *Client) ListAllUsers(ctx context.Context) ([]string, error) {
 		// After resolving link, info.Name() may be different than user, so keep original name.
 		user := info.Name()
 
-		if info.Mode()&os.ModeSymlink != 0 {
-			// ioutil.ReadDir only returns result of LStat. Calling Stat resolves symlink.
-			info, err = os.Stat(filepath.Join(root, info.Name()))
+		isDir := info.IsDir()
+		if info.Type()&os.ModeSymlink != 0 {
+			// os.ReadDir only returns result of LStat. Calling Stat resolves symlink.
+			deRefInfo, err := os.Stat(filepath.Join(root, info.Name()))
 			if err != nil {
 				return nil, err
 			}
+			isDir = deRefInfo.IsDir()
 		}
 
-		if info.IsDir() {
+		if isDir {
 			result = append(result, user)
 		}
 	}
@@ -101,9 +107,9 @@ func (l *Client) ListRuleGroupsForUserAndNamespace(ctx context.Context, userID s
 	return l.loadAllRulesGroupsForUser(ctx, userID)
 }
 
-func (l *Client) LoadRuleGroups(_ context.Context, _ map[string]rulespb.RuleGroupList) error {
+func (l *Client) LoadRuleGroups(_ context.Context, load map[string]rulespb.RuleGroupList) (map[string]rulespb.RuleGroupList, error) {
 	// This Client already loads the rules in its List methods, there is nothing left to do here.
-	return nil
+	return load, nil
 }
 
 // GetRuleGroup implements RuleStore
@@ -121,6 +127,10 @@ func (l *Client) DeleteRuleGroup(ctx context.Context, userID, namespace string, 
 	return errors.New("DeleteRuleGroup unsupported in rule local store")
 }
 
+func (l *Client) GetUserIndexUpdater() *users.UserIndexUpdater {
+	return nil
+}
+
 // DeleteNamespace implements RulerStore
 func (l *Client) DeleteNamespace(ctx context.Context, userID, namespace string) error {
 	return errors.New("DeleteNamespace unsupported in rule local store")
@@ -130,25 +140,27 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 	var allLists rulespb.RuleGroupList
 
 	root := filepath.Join(l.cfg.Directory, userID)
-	infos, err := ioutil.ReadDir(root)
+	dirEntries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to read rule dir %s", root)
 	}
 
-	for _, info := range infos {
+	for _, info := range dirEntries {
 		// After resolving link, info.Name() may be different than namespace, so keep original name.
 		namespace := info.Name()
+		isDir := info.IsDir()
 
-		if info.Mode()&os.ModeSymlink != 0 {
-			// ioutil.ReadDir only returns result of LStat. Calling Stat resolves symlink.
+		if info.Type()&os.ModeSymlink != 0 {
+			// os.ReadDir only returns result of LStat. Calling Stat resolves symlink.
 			path := filepath.Join(root, info.Name())
-			info, err = os.Stat(path)
+			deRefInfo, err := os.Stat(path)
 			if err != nil {
 				return nil, errors.Wrapf(err, "unable to stat rule file %s", path)
 			}
+			isDir = deRefInfo.IsDir()
 		}
 
-		if info.IsDir() {
+		if isDir {
 			continue
 		}
 
@@ -166,7 +178,7 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
 	filename := filepath.Join(l.cfg.Directory, userID, namespace)
 
-	rulegroups, allErrors := l.loader.Load(filename)
+	rulegroups, allErrors := l.loader.Load(filename, false, l.nameValidationScheme)
 	if len(allErrors) > 0 {
 		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
 	}
@@ -174,7 +186,7 @@ func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID
 	var list rulespb.RuleGroupList
 
 	for _, group := range rulegroups.Groups {
-		desc := rulespb.ToProto(userID, namespace, group)
+		desc := rulespb.ToProto(userID, namespace, rulespb.RuleGroup{RuleGroup: group})
 		list = append(list, desc)
 	}
 

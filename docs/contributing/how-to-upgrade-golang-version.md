@@ -5,17 +5,10 @@ weight: 4
 slug: how-to-upgrade-golang-version
 ---
 
-To upgrade the Golang version:
+To upgrade the Go runtime version:
 
-1. Upgrade build image version
-   - Upgrade Golang version in `build-image/Dockerfile`
-   - Build new image `make build-image/.uptodate`
-   - Publish the new image to `quay.io` (requires a maintainer)
-   - Update the Docker image tag in `.github/workflows/*`
-2. Upgrade integration tests version
-   - Update the Golang version installed in the `integration` job in `.github/workflows/*`
-3. Upgrade the reference to the latest build image called `LATEST_BUILD_IMAGE_TAG` in `Makefile`
+1. Upgrade build image version with golang version as described [here](./how-to-update-the-build-image.md)
 
-If the minimum support Golang version should be upgraded as well:
+If the minimum supported Go language version should be upgraded as well:
 
 1. Upgrade `go` version in `go.mod`

@@ -1,5 +1,235 @@
 ## Changelog
 
+
+## v2.38.0
+
+- XADD TRIM (thanks @evan-choi)
+- update XINFO STREAM (thanks @TomBailey167)
+- lua fix (thanks @infastin)
+- partial support for DELEX
+
+
+## v2.37.0
+
+- support HEXPIRE (thanks @mojixcoder)
+
+
+## v2.36.1
+
+- support CLUSTER SHARDS (thanks @dadrus)
+
+
+## v2.36.0
+
+- return actual server address by CLUSTER NODES (thanks @nastik-kum)
+- support DUMP and RESTORE (thanks @alyssaruth)
+- support EVALRO (thanks @max-frank)
+- add WAIT command as no-op (thanks @aroullet)
+- support info stats (thanks @destinyoooo)
+- add "<timestamp>-*" keys
+- compare against Redis 8.4.0
+
+
+## v2.35.0
+
+- add Lua redis.setresp({2,3})
+- embed gopher-json package
+- fix XAUTOCLAIM (thanks @kgunning)
+- fix writeXpending (thanks @gnpaone)
+- fix BLMOVE TTL special case
+- constants for key types @alyssaruth
+
+
+### v2.34.0
+
+- fix ZINTERSTORE where target is one of the source sets
+- added support for ZRank and ZRevRank with score (thanks Jeff Howell)
+- fix MEMORY subcommand casing (thanks @joshaber)
+- use streamCmp in Xtrim (thanks @daniel-cohere)
+
+
+### v2.33.0
+
+- minimum Go version is now 1.17
+- fix integer overflow (thanks @wszaranski)
+- test against the last BSD redis (7.2.4)
+- ignore 'redis.set_repl()' call (thanks @TingluoHuang)
+- various build fixes (thanks @wszaranski)
+- add StartAddrTLS function (thanks @agriffaut)
+- support for the NOMKSTREAM option for XADD (thanks @Jahaja)
+- return empty array for SRANDMEMBER on nonexistent key (thanks @WKBae)
+
+
+### v2.32.1
+
+- support for SINTERCARD (thanks @s-barr-fetch)
+- support for EXPIRETIME and PEXPIRETIME (thanks @wszaranski)
+- fix GEO* units to be case insensitive
+
+
+### v2.31.1
+
+- support COUNT in SCAN and ZSCAN (thanks @BarakSilverfort)
+- support for OBJECT IDLETIME (thanks @nerd2)
+- support for HRANDFIELD (thanks @sejin-P)
+
+
+### v2.31.0
+
+- support for MEMORY USAGE (thanks @davidroman0O)
+- test against Redis 7.2.0
+- support for CLIENT SETNAME/GETNAME (thanks @mr-karan)
+- fix very small numbers (thanks @zsh1995)
+- use the same float-to-string logic real Redis uses
+
+
+### v2.30.5
+
+- support SMISMEMBER (thanks @sandyharvie)
+
+
+### v2.30.4
+
+- fix ZADD LT/LG (thanks @sejin-P)
+- fix COPY (thanks @jerargus)
+- quicker SPOP
+
+
+### v2.30.3
+
+- fix lua error_reply (thanks @pkierski)
+- fix use of blocking functions in lua
+- support for ZMSCORE (thanks @lsgndln)
+- lua cache (thanks @tonyhb)
+
+
+### v2.30.2
+
+- support MINID in XADD  (thanks @nathan-cormier)
+- support BLMOVE (thanks @sevein)
+- fix COMMAND (thanks @pje)
+- fix 'XREAD ... $' on a non-existing stream
+
+
+### v2.30.1
+
+- support SET NX GET special case
+
+
+### v2.30.0
+
+- implement redis 7.0.x (from 6.X). Main changes:
+   - test against 7.0.7
+   - update error messages
+   - support nx|xx|gt|lt options in [P]EXPIRE[AT]
+   - update how deleted items are processed in pending queues in streams
+
+
+### v2.23.1
+
+- resolve $ to latest ID in XREAD (thanks @josh-hook)
+- handle disconnect in blocking functions (thanks @jgirtakovskis)
+- fix type conversion bug in redisToLua (thanks Sandy Harvie)
+- BRPOP{LPUSH} timeout can be float since 6.0
+
+
+### v2.23.0
+
+- basic INFO support (thanks @kirill-a-belov)
+- support COUNT in SSCAN (thanks @Abdi-dd)
+- test and support Go 1.19
+- support LPOS (thanks @ianstarz)
+- support XPENDING, XGROUP {CREATECONSUMER,DESTROY,DELCONSUMER}, XINFO {CONSUMERS,GROUPS}, XCLAIM (thanks @sandyharvie)
+
+
+### v2.22.0
+
+- set miniredis.DumpMaxLineLen to get more Dump() info (thanks @afjoseph)
+- fix invalid resposne of COMMAND (thanks @zsh1995)
+- fix possibility to generate duplicate IDs in XADD (thanks @readams)
+- adds support for XAUTOCLAIM min-idle parameter (thanks @readams)
+
+
+### v2.21.0
+
+- support for GETEX (thanks @dntj)
+- support for GT and LT in ZADD (thanks @lsgndln)
+- support for XAUTOCLAIM (thanks @randall-fulton)
+
+
+### v2.20.0
+
+- back to support Go >= 1.14 (thanks @ajatprabha and @marcind)
+
+
+### v2.19.0
+
+- support for TYPE in SCAN (thanks @0xDiddi)
+- update BITPOS (thanks @dirkm)
+- fix a lua redis.call() return value (thanks @mpetronic)
+- update ZRANGE (thanks @valdemarpereira)
+
+
+### v2.18.0
+
+- support for ZUNION (thanks @propan)
+- support for COPY (thanks @matiasinsaurralde and @rockitbaby)
+- support for LMOVE (thanks @btwear)
+
+
+### v2.17.0
+
+- added miniredis.RunT(t)
+
+
+### v2.16.1
+
+- fix ZINTERSTORE with sets (thanks @lingjl2010 and @okhowang)
+- fix exclusive ranges in XRANGE (thanks @joseotoro)
+
+
+### v2.16.0
+
+- simplify some code (thanks @zonque)
+- support for EXAT/PXAT in SET
+- support for XTRIM (thanks @joseotoro)
+- support for ZRANDMEMBER
+- support for redis.log() in lua (thanks @dirkm)
+
+
+### v2.15.2
+
+- Fix race condition in blocking code (thanks @zonque and @robx)
+- XREAD accepts '$' as ID (thanks @bradengroom)
+
+
+### v2.15.1
+
+- EVAL should cache the script (thanks @guoshimin)
+
+
+### v2.15.0
+
+- target redis 6.2 and added new args to various commands
+- support for all hyperlog commands (thanks @ilbaktin)
+- support for GETDEL (thanks @wszaranski)
+
+
+### v2.14.5
+
+- added XPENDING
+- support for BLOCK option in XREAD and XREADGROUP
+
+
+### v2.14.4
+
+- fix BITPOS error (thanks @xiaoyuzdy)
+- small fixes for XREAD, XACK, and XDEL. Mostly error cases.
+- fix empty EXEC return type (thanks @ashanbrown)
+- fix XDEL (thanks @svakili and @yvesf)
+- fix FLUSHALL for streams (thanks @svakili)
+
+
 ### v2.14.3
 
 - fix problem where Lua code didn't set the selected DB

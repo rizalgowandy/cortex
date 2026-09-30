@@ -2,13 +2,17 @@ package queue
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/atomic"
+
+	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 const (
@@ -41,7 +45,9 @@ func FirstUser() UserIndex {
 }
 
 // Request stored into the queue.
-type Request interface{}
+type Request interface {
+	util.PriorityOp
+}
 
 // RequestQueue holds incoming requests in per-user queues. It also assigns each user specified number of queriers,
 // and when querier asks for next request to handle (using GetNextRequestForQuerier), it returns requests
@@ -56,16 +62,19 @@ type RequestQueue struct {
 	queues  *queues
 	stopped bool
 
-	queueLength       *prometheus.GaugeVec   // Per user and reason.
-	discardedRequests *prometheus.CounterVec // Per user.
+	totalRequests     *prometheus.CounterVec // Per user and priority.
+	discardedRequests *prometheus.CounterVec // Per user and priority.
 }
 
-func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
+func NewRequestQueue(forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec, limits Limits, registerer prometheus.Registerer) *RequestQueue {
 	q := &RequestQueue{
-		queues:                  newUserQueues(maxOutstandingPerTenant, forgetDelay),
+		queues:                  newUserQueues(forgetDelay, limits, queueLength),
 		connectedQuerierWorkers: atomic.NewInt32(0),
-		queueLength:             queueLength,
-		discardedRequests:       discardedRequests,
+		totalRequests: promauto.With(registerer).NewCounterVec(prometheus.CounterOpts{
+			Name: "cortex_request_queue_requests_total",
+			Help: "Total number of query requests going to the request queue.",
+		}, []string{"user", "priority"}),
+		discardedRequests: discardedRequests,
 	}
 
 	q.cond = sync.NewCond(&q.mtx)
@@ -79,7 +88,7 @@ func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, que
 // between calls.
 //
 // If request is successfully enqueued, successFn is called with the lock held, before any querier can receive the request.
-func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers int, successFn func()) error {
+func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers float64, successFn func()) error {
 	q.mtx.Lock()
 	defer q.mtx.Unlock()
 
@@ -87,25 +96,30 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 		return ErrStopped
 	}
 
-	queue := q.queues.getOrAddQueue(userID, maxQueriers)
+	maxQuerierCount := util.DynamicShardSize(maxQueriers, len(q.queues.queriers))
+	queue := q.queues.getOrAddQueue(userID, maxQuerierCount)
+	maxOutstandingRequests := q.queues.limits.MaxOutstandingPerTenant(userID)
+	priority := strconv.FormatInt(req.Priority(), 10)
+
 	if queue == nil {
 		// This can only happen if userID is "".
 		return errors.New("no queue found")
 	}
 
-	select {
-	case queue <- req:
-		q.queueLength.WithLabelValues(userID).Inc()
-		q.cond.Broadcast()
-		// Call this function while holding a lock. This guarantees that no querier can fetch the request before function returns.
-		if successFn != nil {
-			successFn()
-		}
-		return nil
-	default:
-		q.discardedRequests.WithLabelValues(userID).Inc()
+	q.totalRequests.WithLabelValues(userID, priority).Inc()
+
+	if queue.length() >= maxOutstandingRequests {
+		q.discardedRequests.WithLabelValues(userID, priority).Inc()
 		return ErrTooManyRequests
 	}
+
+	queue.enqueueRequest(req)
+	q.cond.Broadcast()
+	// Call this function while holding a lock. This guarantees that no querier can fetch the request before function returns.
+	if successFn != nil {
+		successFn()
+	}
+	return nil
 }
 
 // GetNextRequestForQuerier find next user queue and takes the next request off of it. Will block if there are no requests.
@@ -141,12 +155,17 @@ FindQueue:
 
 		// Pick next request from the queue.
 		for {
-			request := <-queue
-			if len(queue) == 0 {
-				q.queues.deleteQueue(userID)
+			minPriority, matchMinPriority := q.getPriorityForQuerier(userID, querierID)
+			request := queue.dequeueRequest(minPriority, matchMinPriority)
+			if request == nil {
+				// The queue does not contain request with the priority, wait for more requests
+				querierWait = true
+				goto FindQueue
 			}
 
-			q.queueLength.WithLabelValues(userID).Dec()
+			if queue.length() == 0 {
+				q.queues.deleteQueue(userID)
+			}
 
 			// Tell close() we've processed a request.
 			q.cond.Broadcast()
@@ -159,6 +178,13 @@ FindQueue:
 	// and wait for more requests.
 	querierWait = true
 	goto FindQueue
+}
+
+func (q *RequestQueue) getPriorityForQuerier(userID string, querierID string) (int64, bool) {
+	if priority, ok := q.queues.userQueues[userID].reservedQueriers[querierID]; ok {
+		return priority, true
+	}
+	return 0, false
 }
 
 func (q *RequestQueue) forgetDisconnectedQueriers(_ context.Context) error {
@@ -220,4 +246,8 @@ func (q *RequestQueue) QuerierDisconnecting() {
 
 func (q *RequestQueue) GetConnectedQuerierWorkersMetric() float64 {
 	return float64(q.connectedQuerierWorkers.Load())
+}
+
+func (q *RequestQueue) CleanupInactiveUserMetrics(user string) {
+	q.totalRequests.DeletePartialMatch(prometheus.Labels{"user": user})
 }

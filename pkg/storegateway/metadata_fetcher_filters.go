@@ -5,18 +5,18 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/go-kit/log/level"
+	"github.com/oklog/ulid/v2"
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/extprom"
-	"github.com/thanos-io/thanos/pkg/objstore"
 
 	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketindex"
 )
 
 type MetadataFilterWithBucketIndex interface {
 	// FilterWithBucketIndex is like Thanos MetadataFilter.Filter() but it provides in input the bucket index too.
-	FilterWithBucketIndex(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, idx *bucketindex.Index, synced *extprom.TxGaugeVec) error
+	FilterWithBucketIndex(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, idx *bucketindex.Index, synced block.GaugeVec) error
 }
 
 // IgnoreDeletionMarkFilter is like the Thanos IgnoreDeletionMarkFilter, but it also implements
@@ -48,12 +48,12 @@ func (f *IgnoreDeletionMarkFilter) DeletionMarkBlocks() map[ulid.ULID]*metadata.
 }
 
 // Filter implements block.MetadataFilter.
-func (f *IgnoreDeletionMarkFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
-	return f.upstream.Filter(ctx, metas, synced)
+func (f *IgnoreDeletionMarkFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced block.GaugeVec, modified block.GaugeVec) error {
+	return f.upstream.Filter(ctx, metas, synced, modified)
 }
 
 // FilterWithBucketIndex implements MetadataFilterWithBucketIndex.
-func (f *IgnoreDeletionMarkFilter) FilterWithBucketIndex(_ context.Context, metas map[ulid.ULID]*metadata.Meta, idx *bucketindex.Index, synced *extprom.TxGaugeVec) error {
+func (f *IgnoreDeletionMarkFilter) FilterWithBucketIndex(_ context.Context, metas map[ulid.ULID]*metadata.Meta, idx *bucketindex.Index, synced block.GaugeVec) error {
 	// Build a map of block deletion marks
 	marks := make(map[ulid.ULID]*metadata.DeletionMark, len(idx.BlockDeletionMarks))
 	for _, mark := range idx.BlockDeletionMarks {
@@ -71,6 +71,35 @@ func (f *IgnoreDeletionMarkFilter) FilterWithBucketIndex(_ context.Context, meta
 		if time.Since(time.Unix(mark.DeletionTime, 0)).Seconds() > f.delay.Seconds() {
 			synced.WithLabelValues(block.MarkedForDeletionMeta).Inc()
 			delete(metas, mark.ID)
+		}
+	}
+
+	return nil
+}
+
+func NewIgnoreNonQueryableBlocksFilter(logger log.Logger, ignoreWithin time.Duration) *IgnoreNonQueryableBlocksFilter {
+	return &IgnoreNonQueryableBlocksFilter{
+		logger:       logger,
+		ignoreWithin: ignoreWithin,
+	}
+}
+
+// IgnoreNonQueryableBlocksFilter ignores blocks that are too new be queried.
+// This has be used in conjunction with `-querier.query-store-after` with some buffer.
+type IgnoreNonQueryableBlocksFilter struct {
+	// Blocks that were created since `now() - ignoreWithin` will not be synced.
+	ignoreWithin time.Duration
+	logger       log.Logger
+}
+
+// Filter implements block.MetadataFilter.
+func (f *IgnoreNonQueryableBlocksFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced block.GaugeVec, modified block.GaugeVec) error {
+	ignoreWithin := time.Now().Add(-f.ignoreWithin).UnixMilli()
+
+	for id, m := range metas {
+		if m.MinTime > ignoreWithin {
+			level.Debug(f.logger).Log("msg", "ignoring block because it won't be queried", "id", id)
+			delete(metas, id)
 		}
 	}
 

@@ -12,15 +12,15 @@ import (
 	"time"
 
 	"github.com/go-kit/log/level"
-	dstls "github.com/grafana/dskit/crypto/tls"
-	"github.com/grafana/dskit/flagext"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/version"
 	"github.com/weaveworks/common/instrument"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	tls_cfg "github.com/cortexproject/cortex/pkg/util/tls"
 )
 
 var (
@@ -29,9 +29,9 @@ var (
 
 // Config says where we can find the ruler userconfig.
 type Config struct {
-	ConfigsAPIURL flagext.URLValue   `yaml:"configs_api_url"`
-	ClientTimeout time.Duration      `yaml:"client_timeout"` // HTTP timeout duration for requests made to the Weave Cloud configs service.
-	TLS           dstls.ClientConfig `yaml:",inline"`
+	ConfigsAPIURL flagext.URLValue     `yaml:"configs_api_url"`
+	ClientTimeout time.Duration        `yaml:"client_timeout"` // HTTP timeout duration for requests made to the Weave Cloud configs service.
+	TLS           tls_cfg.ClientConfig `yaml:",inline"`
 }
 
 // RegisterFlagsWithPrefix adds the flags required to config this to the given FlagSet
@@ -42,10 +42,13 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 }
 
 var configsRequestDuration = instrument.NewHistogramCollector(promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Namespace: "cortex",
-	Name:      "configs_request_duration_seconds",
-	Help:      "Time spent requesting userconfig.",
-	Buckets:   prometheus.DefBuckets,
+	Namespace:                       "cortex",
+	Name:                            "configs_request_duration_seconds",
+	Help:                            "Time spent requesting userconfig.",
+	Buckets:                         prometheus.DefBuckets,
+	NativeHistogramBucketFactor:     1.1,
+	NativeHistogramMaxBucketNumber:  100,
+	NativeHistogramMinResetDuration: time.Hour,
 }, []string{"operation", "status_code"}))
 
 // Client is what the ruler and altermanger needs from a config store to process rules.
@@ -150,7 +153,7 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Invalid response from configs server: %v", resp.StatusCode)
+		return nil, fmt.Errorf("invalid response from configs server: %v", resp.StatusCode)
 	}
 
 	var config ConfigsResponse

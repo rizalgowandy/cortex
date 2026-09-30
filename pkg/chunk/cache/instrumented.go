@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"time"
 
 	ot "github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
@@ -19,8 +20,11 @@ func Instrument(name string, cache Cache, reg prometheus.Registerer) Cache {
 		// Cached chunks are generally in the KBs, but cached index can
 		// get big.  Histogram goes from 1KB to 4MB.
 		// 1024 * 4^(7-1) = 4MB
-		Buckets:     prometheus.ExponentialBuckets(1024, 4, 7),
-		ConstLabels: prometheus.Labels{"name": name},
+		Buckets:                         prometheus.ExponentialBuckets(1024, 4, 7),
+		ConstLabels:                     prometheus.Labels{"name": name},
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"method"})
 
 	return &instrumentedCache{
@@ -32,20 +36,23 @@ func Instrument(name string, cache Cache, reg prometheus.Registerer) Cache {
 			Name:      "cache_request_duration_seconds",
 			Help:      "Total time spent in seconds doing cache requests.",
 			// Cache requests are very quick: smallest bucket is 16us, biggest is 1s.
-			Buckets:     prometheus.ExponentialBuckets(0.000016, 4, 8),
-			ConstLabels: prometheus.Labels{"name": name},
+			Buckets:                         prometheus.ExponentialBuckets(0.000016, 4, 8),
+			ConstLabels:                     prometheus.Labels{"name": name},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
 		}, []string{"method", "status_code"})),
 
 		fetchedKeys: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Namespace:   "cortex",
-			Name:        "cache_fetched_keys",
+			Name:        "cache_fetched_keys_total",
 			Help:        "Total count of keys requested from cache.",
 			ConstLabels: prometheus.Labels{"name": name},
 		}),
 
 		hits: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Namespace:   "cortex",
-			Name:        "cache_hits",
+			Name:        "cache_hits_total",
 			Help:        "Total count of keys found in cache.",
 			ConstLabels: prometheus.Labels{"name": name},
 		}),
@@ -64,7 +71,7 @@ type instrumentedCache struct {
 	requestDuration                   *instr.HistogramCollector
 }
 
-func (i *instrumentedCache) Store(ctx context.Context, keys []string, bufs [][]byte) {
+func (i *instrumentedCache) Store(ctx context.Context, keys []string, bufs [][]byte, ttl time.Duration) {
 	for j := range bufs {
 		i.storedValueSize.Observe(float64(len(bufs[j])))
 	}
@@ -73,12 +80,12 @@ func (i *instrumentedCache) Store(ctx context.Context, keys []string, bufs [][]b
 	_ = instr.CollectedRequest(ctx, method, i.requestDuration, instr.ErrorCode, func(ctx context.Context) error {
 		sp := ot.SpanFromContext(ctx)
 		sp.LogFields(otlog.Int("keys", len(keys)))
-		i.Cache.Store(ctx, keys, bufs)
+		i.Cache.Store(ctx, keys, bufs, ttl)
 		return nil
 	})
 }
 
-func (i *instrumentedCache) Fetch(ctx context.Context, keys []string) ([]string, [][]byte, []string) {
+func (i *instrumentedCache) Fetch(ctx context.Context, keys []string, ttl time.Duration) ([]string, [][]byte, []string) {
 	var (
 		found   []string
 		bufs    [][]byte
@@ -90,7 +97,7 @@ func (i *instrumentedCache) Fetch(ctx context.Context, keys []string) ([]string,
 		sp := ot.SpanFromContext(ctx)
 		sp.LogFields(otlog.Int("keys requested", len(keys)))
 
-		found, bufs, missing = i.Cache.Fetch(ctx, keys)
+		found, bufs, missing = i.Cache.Fetch(ctx, keys, ttl)
 		sp.LogFields(otlog.Int("keys found", len(found)), otlog.Int("keys missing", len(keys)-len(found)))
 		return nil
 	})

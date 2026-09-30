@@ -14,22 +14,24 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/kv"
-	"github.com/grafana/dskit/kv/consul"
-	"github.com/grafana/dskit/ring"
-	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
+	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 func TestDistributor_DistributeRequest(t *testing.T) {
@@ -39,6 +41,7 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 		replicationFactor   int
 		isRead              bool
 		isDelete            bool
+		isTenantDisabled    bool
 		expStatusCode       int
 		expectedTotalCalls  int
 		headersNotPreserved bool
@@ -56,6 +59,16 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 			expectedTotalCalls: 3,
 			route:              "/alerts",
 		}, {
+			name:                "Write /alerts, Simple AM request, all AM healthy, not allowed",
+			numAM:               4,
+			numHappyAM:          4,
+			replicationFactor:   3,
+			expStatusCode:       http.StatusUnauthorized,
+			expectedTotalCalls:  0,
+			route:               "/alerts",
+			headersNotPreserved: true,
+			isTenantDisabled:    true,
+		}, {
 			name:                "Write /alerts, Less than quorum AM available",
 			numAM:               1,
 			numHappyAM:          1,
@@ -72,16 +85,6 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 			expStatusCode:      http.StatusInternalServerError,
 			expectedTotalCalls: 3,
 			route:              "/alerts",
-		}, {
-			name:               "Read /v1/alerts is sent to 3 AMs",
-			numAM:              5,
-			numHappyAM:         5,
-			replicationFactor:  3,
-			isRead:             true,
-			expStatusCode:      http.StatusOK,
-			expectedTotalCalls: 3,
-			route:              "/v1/alerts",
-			responseBody:       []byte(`{"status":"success","data":[]}`),
 		}, {
 			name:               "Read /v2/alerts is sent to 3 AMs",
 			numAM:              5,
@@ -121,16 +124,6 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 			headersNotPreserved: true,
 			route:               "/alerts/groups",
 		}, {
-			name:               "Read /v1/silences is sent to 3 AMs",
-			numAM:              5,
-			numHappyAM:         5,
-			replicationFactor:  3,
-			isRead:             true,
-			expStatusCode:      http.StatusOK,
-			expectedTotalCalls: 3,
-			route:              "/v1/silences",
-			responseBody:       []byte(`{"status":"success","data":[]}`),
-		}, {
 			name:               "Read /v2/silences is sent to 3 AMs",
 			numAM:              5,
 			numHappyAM:         5,
@@ -148,16 +141,6 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 			expStatusCode:      http.StatusOK,
 			expectedTotalCalls: 1,
 			route:              "/silences",
-		}, {
-			name:               "Read /v1/silence/id is sent to 3 AMs",
-			numAM:              5,
-			numHappyAM:         5,
-			replicationFactor:  3,
-			isRead:             true,
-			expStatusCode:      http.StatusOK,
-			expectedTotalCalls: 3,
-			route:              "/v1/silence/id",
-			responseBody:       []byte(`{"status":"success","data":{"id":"aaa","updatedAt":"2020-01-01T00:00:00Z"}}`),
 		}, {
 			name:               "Read /v2/silence/id is sent to 3 AMs",
 			numAM:              5,
@@ -188,6 +171,24 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 			expectedTotalCalls: 1,
 			route:              "/silence/id",
 		}, {
+			name:               "Delete /silence/id should try all alert managers on error",
+			numAM:              3,
+			numHappyAM:         0,
+			replicationFactor:  3,
+			isDelete:           true,
+			expStatusCode:      http.StatusInternalServerError,
+			expectedTotalCalls: 3,
+			route:              "/silence/id",
+		}, {
+			name:               "Delete /silence/id is sent to 3 AM when 2 are not happy",
+			numAM:              3,
+			numHappyAM:         1,
+			replicationFactor:  3,
+			isDelete:           true,
+			expStatusCode:      http.StatusOK,
+			expectedTotalCalls: 3,
+			route:              "/silence/id",
+		}, {
 			name:               "Read /status is sent to only 1 AM",
 			numAM:              5,
 			numHappyAM:         5,
@@ -195,6 +196,24 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 			isRead:             true,
 			expStatusCode:      http.StatusOK,
 			expectedTotalCalls: 1,
+			route:              "/status",
+		}, {
+			name:               "Read /status should try all alert managers on error",
+			numAM:              3,
+			numHappyAM:         0,
+			replicationFactor:  3,
+			isRead:             true,
+			expStatusCode:      http.StatusInternalServerError,
+			expectedTotalCalls: 3,
+			route:              "/status",
+		}, {
+			name:               "Read /status is sent to 3 AM when 2 are not happy",
+			numAM:              3,
+			numHappyAM:         1,
+			replicationFactor:  3,
+			isRead:             true,
+			expStatusCode:      http.StatusOK,
+			expectedTotalCalls: 3,
 			route:              "/status",
 		}, {
 			name:                "Write /status not supported",
@@ -243,9 +262,13 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 				req.Method = http.MethodDelete
 			}
 			req.RequestURI = url
+			var allowedTenants *users.AllowedTenants
+			if c.isTenantDisabled {
+				allowedTenants = users.NewAllowedTenants(nil, []string{"1"})
+			}
 
 			w := httptest.NewRecorder()
-			d.DistributeRequest(w, req)
+			d.DistributeRequest(w, req, allowedTenants)
 			resp := w.Result()
 			require.Equal(t, c.expStatusCode, resp.StatusCode)
 
@@ -264,7 +287,7 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 			// Since the response is sent as soon as the quorum is reached, when we
 			// reach this point the 3rd AM may not have received the request yet.
 			// To avoid flaky test we retry until we hit the desired state within a reasonable timeout.
-			test.Poll(t, time.Second, c.expectedTotalCalls, func() interface{} {
+			test.Poll(t, time.Second, c.expectedTotalCalls, func() any {
 				totalReqCount := 0
 				for _, a := range ams {
 					reqCount := a.requestsCount(route)
@@ -280,46 +303,11 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 
 }
 
-func TestDistributor_IsPathSupported(t *testing.T) {
-	supported := map[string]bool{
-		"/alertmanager/api/v1/alerts":           true,
-		"/alertmanager/api/v1/alerts/groups":    false,
-		"/alertmanager/api/v1/silences":         true,
-		"/alertmanager/api/v1/silence/id":       true,
-		"/alertmanager/api/v1/silence/anything": true,
-		"/alertmanager/api/v1/silence/really":   true,
-		"/alertmanager/api/v1/status":           true,
-		"/alertmanager/api/v1/receivers":        true,
-		"/alertmanager/api/v1/other":            false,
-		"/alertmanager/api/v2/alerts":           true,
-		"/alertmanager/api/v2/alerts/groups":    true,
-		"/alertmanager/api/v2/silences":         true,
-		"/alertmanager/api/v2/silence/id":       true,
-		"/alertmanager/api/v2/silence/anything": true,
-		"/alertmanager/api/v2/silence/really":   true,
-		"/alertmanager/api/v2/status":           true,
-		"/alertmanager/api/v2/receivers":        true,
-		"/alertmanager/api/v2/other":            false,
-		"/alertmanager/other":                   false,
-		"/other":                                false,
-	}
-
-	for path, isSupported := range supported {
-		t.Run(path, func(t *testing.T) {
-			d, _, cleanup := prepare(t, 1, 1, 1, []byte{})
-			t.Cleanup(cleanup)
-			require.Equal(t, isSupported, d.IsPathSupported(path))
-		})
-	}
-}
-
 func prepare(t *testing.T, numAM, numHappyAM, replicationFactor int, responseBody []byte) (*Distributor, []*mockAlertmanager, func()) {
 	ams := []*mockAlertmanager{}
-	for i := 0; i < numHappyAM; i++ {
-		ams = append(ams, newMockAlertmanager(i, true, responseBody))
-	}
-	for i := numHappyAM; i < numAM; i++ {
-		ams = append(ams, newMockAlertmanager(i, false, responseBody))
+	remainingFailure := atomic.NewInt32(int32(numAM - numHappyAM))
+	for i := range numAM {
+		ams = append(ams, newMockAlertmanager(i, remainingFailure, responseBody))
 	}
 
 	// Use a real ring with a mock KV store to test ring RF logic.
@@ -341,7 +329,7 @@ func prepare(t *testing.T, numAM, numHappyAM, replicationFactor int, responseBod
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 	err := kvStore.CAS(context.Background(), RingKey,
-		func(_ interface{}) (interface{}, bool, error) {
+		func(_ any) (any, bool, error) {
 			return &ring.Desc{
 				Ingesters: amDescs,
 			}, true, nil
@@ -358,14 +346,15 @@ func prepare(t *testing.T, numAM, numHappyAM, replicationFactor int, responseBod
 	}, RingNameForServer, RingKey, nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), amRing))
-	test.Poll(t, time.Second, numAM, func() interface{} {
+	test.Poll(t, time.Second, numAM, func() any {
 		return amRing.InstancesCount()
 	})
 
 	cfg := &MultitenantAlertmanagerConfig{}
 	flagext.DefaultValues(cfg)
+	cfg.ShardingRing.DisableReplicaSetExtension = false
 
-	d, err := NewDistributor(cfg.AlertmanagerClient, cfg.MaxRecvMsgSize, amRing, newMockAlertmanagerClientFactory(amByAddr), util_log.Logger, prometheus.NewRegistry())
+	d, err := NewDistributor(cfg.AlertmanagerClient, cfg.MaxRecvMsgSize, amRing, newMockAlertmanagerClientFactory(amByAddr), cfg.ShardingRing, util_log.Logger, prometheus.NewRegistry())
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), d))
 
@@ -381,15 +370,15 @@ type mockAlertmanager struct {
 	receivedRequests map[string]map[int]int
 	mtx              sync.Mutex
 	myAddr           string
-	happy            bool
+	remainingError   *atomic.Int32
 	responseBody     []byte
 }
 
-func newMockAlertmanager(idx int, happy bool, responseBody []byte) *mockAlertmanager {
+func newMockAlertmanager(idx int, remainingError *atomic.Int32, responseBody []byte) *mockAlertmanager {
 	return &mockAlertmanager{
 		receivedRequests: make(map[string]map[int]int),
 		myAddr:           fmt.Sprintf("127.0.0.1:%05d", 10000+idx),
-		happy:            happy,
+		remainingError:   remainingError,
 		responseBody:     responseBody,
 	}
 }
@@ -409,7 +398,7 @@ func (am *mockAlertmanager) HandleRequest(_ context.Context, in *httpgrpc.HTTPRe
 		am.receivedRequests[path] = m
 	}
 
-	if am.happy {
+	if am.remainingError.Dec() < 0 {
 		m[http.StatusOK]++
 		return &httpgrpc.HTTPResponse{
 			Code: http.StatusOK,

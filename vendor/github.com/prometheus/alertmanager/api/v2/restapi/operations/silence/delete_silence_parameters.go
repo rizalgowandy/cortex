@@ -29,7 +29,8 @@ import (
 )
 
 // NewDeleteSilenceParams creates a new DeleteSilenceParams object
-// no default values defined in spec.
+//
+// There are no default values defined in the spec.
 func NewDeleteSilenceParams() DeleteSilenceParams {
 
 	return DeleteSilenceParams{}
@@ -40,7 +41,6 @@ func NewDeleteSilenceParams() DeleteSilenceParams {
 //
 // swagger:parameters deleteSilence
 type DeleteSilenceParams struct {
-
 	// HTTP Request Object
 	HTTPRequest *http.Request `json:"-"`
 
@@ -64,7 +64,6 @@ func (o *DeleteSilenceParams) BindRequest(r *http.Request, route *middleware.Mat
 	if err := o.bindSilenceID(rSilenceID, rhkSilenceID, route.Formats); err != nil {
 		res = append(res, err)
 	}
-
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
@@ -95,7 +94,7 @@ func (o *DeleteSilenceParams) bindSilenceID(rawData []string, hasKey bool, forma
 	return nil
 }
 
-// validateSilenceID carries on validations for parameter SilenceID
+// validateSilenceID carries out validations for parameter SilenceID
 func (o *DeleteSilenceParams) validateSilenceID(formats strfmt.Registry) error {
 
 	if err := validate.FormatOf("silenceID", "path", "uuid", o.SilenceID.String(), formats); err != nil {

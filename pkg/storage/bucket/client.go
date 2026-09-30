@@ -5,18 +5,21 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/tracing/opentracing"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket/azure"
 	"github.com/cortexproject/cortex/pkg/storage/bucket/filesystem"
 	"github.com/cortexproject/cortex/pkg/storage/bucket/gcs"
+	"github.com/cortexproject/cortex/pkg/storage/bucket/oci"
 	"github.com/cortexproject/cortex/pkg/storage/bucket/s3"
 	"github.com/cortexproject/cortex/pkg/storage/bucket/swift"
-	"github.com/cortexproject/cortex/pkg/util"
 )
 
 const (
@@ -32,14 +35,19 @@ const (
 	// Swift is the value for the Openstack Swift storage backend.
 	Swift = "swift"
 
+	// OCI is the value for the Oracle Cloud Infrastructure storage backend.
+	OCI = "oci"
+
 	// Filesystem is the value for the filesystem storage backend.
 	Filesystem = "filesystem"
 )
 
 var (
-	SupportedBackends = []string{S3, GCS, Azure, Swift, Filesystem}
+	SupportedBackends = []string{S3, GCS, Azure, Swift, OCI, Filesystem}
 
 	ErrUnsupportedStorageBackend = errors.New("unsupported storage backend")
+
+	ErrCustomerManagedKeyAccessDenied = errors.New("access denied: customer key")
 )
 
 // Config holds configuration for accessing long-term storage.
@@ -50,11 +58,12 @@ type Config struct {
 	GCS        gcs.Config        `yaml:"gcs"`
 	Azure      azure.Config      `yaml:"azure"`
 	Swift      swift.Config      `yaml:"swift"`
+	OCI        oci.Config        `yaml:"oci"`
 	Filesystem filesystem.Config `yaml:"filesystem"`
 
 	// Not used internally, meant to allow callers to wrap Buckets
 	// created using this config
-	Middlewares []func(objstore.Bucket) (objstore.Bucket, error) `yaml:"-"`
+	Middlewares []func(objstore.InstrumentedBucket) (objstore.InstrumentedBucket, error) `yaml:"-"`
 
 	// Used to inject additional backends into the config. Allows for this config to
 	// be embedded in multiple contexts and support non-object storage based backends.
@@ -72,17 +81,22 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 }
 
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
+	cfg.RegisterFlagsWithPrefixAndBackend(prefix, f, S3)
+}
+
+func (cfg *Config) RegisterFlagsWithPrefixAndBackend(prefix string, f *flag.FlagSet, defaultBackend string) {
 	cfg.S3.RegisterFlagsWithPrefix(prefix, f)
 	cfg.GCS.RegisterFlagsWithPrefix(prefix, f)
 	cfg.Azure.RegisterFlagsWithPrefix(prefix, f)
 	cfg.Swift.RegisterFlagsWithPrefix(prefix, f)
+	cfg.OCI.RegisterFlagsWithPrefix(prefix, f)
 	cfg.Filesystem.RegisterFlagsWithPrefix(prefix, f)
 
-	f.StringVar(&cfg.Backend, prefix+"backend", S3, fmt.Sprintf("Backend storage to use. Supported backends are: %s.", strings.Join(cfg.supportedBackends(), ", ")))
+	f.StringVar(&cfg.Backend, prefix+"backend", defaultBackend, fmt.Sprintf("Backend storage to use. Supported backends are: %s.", strings.Join(cfg.supportedBackends(), ", ")))
 }
 
 func (cfg *Config) Validate() error {
-	if !util.StringsContain(cfg.supportedBackends(), cfg.Backend) {
+	if !slices.Contains(cfg.supportedBackends(), cfg.Backend) {
 		return ErrUnsupportedStorageBackend
 	}
 
@@ -96,16 +110,19 @@ func (cfg *Config) Validate() error {
 }
 
 // NewClient creates a new bucket client based on the configured backend
-func NewClient(ctx context.Context, cfg Config, name string, logger log.Logger, reg prometheus.Registerer) (client objstore.Bucket, err error) {
+func NewClient(ctx context.Context, cfg Config, hedgedRoundTripper func(rt http.RoundTripper) http.RoundTripper, name string, logger log.Logger, reg prometheus.Registerer) (bucket objstore.InstrumentedBucket, err error) {
+	var client objstore.Bucket
 	switch cfg.Backend {
 	case S3:
-		client, err = s3.NewBucketClient(cfg.S3, name, logger)
+		client, err = s3.NewBucketClient(cfg.S3, hedgedRoundTripper, name, logger)
 	case GCS:
-		client, err = gcs.NewBucketClient(ctx, cfg.GCS, name, logger)
+		client, err = gcs.NewBucketClient(ctx, cfg.GCS, hedgedRoundTripper, name, logger)
 	case Azure:
-		client, err = azure.NewBucketClient(cfg.Azure, name, logger)
+		client, err = azure.NewBucketClient(cfg.Azure, hedgedRoundTripper, name, logger)
 	case Swift:
-		client, err = swift.NewBucketClient(cfg.Swift, name, logger)
+		client, err = swift.NewBucketClient(cfg.Swift, hedgedRoundTripper, name, logger)
+	case OCI:
+		client, err = oci.NewBucketClient(cfg.OCI, hedgedRoundTripper, name, logger)
 	case Filesystem:
 		client, err = filesystem.NewBucketClient(cfg.Filesystem)
 	default:
@@ -116,17 +133,17 @@ func NewClient(ctx context.Context, cfg Config, name string, logger log.Logger, 
 		return nil, err
 	}
 
-	client = objstore.NewTracingBucket(bucketWithMetrics(client, name, reg))
+	iClient := opentracing.WrapWithTraces(bucketWithMetrics(client, name, reg))
 
 	// Wrap the client with any provided middleware
 	for _, wrap := range cfg.Middlewares {
-		client, err = wrap(client)
+		iClient, err = wrap(iClient)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return client, nil
+	return iClient, nil
 }
 
 func bucketWithMetrics(bucketClient objstore.Bucket, name string, reg prometheus.Registerer) objstore.Bucket {
@@ -134,8 +151,9 @@ func bucketWithMetrics(bucketClient objstore.Bucket, name string, reg prometheus
 		return bucketClient
 	}
 
-	return objstore.BucketWithMetrics(
-		"", // bucket label value
+	return objstore.WrapWithMetrics(
 		bucketClient,
-		prometheus.WrapRegistererWith(prometheus.Labels{"component": name}, reg))
+		prometheus.WrapRegistererWith(prometheus.Labels{"component": name}, prometheus.WrapRegistererWithPrefix("thanos_", reg)),
+		"", // bucket label value
+	)
 }

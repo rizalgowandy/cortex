@@ -12,14 +12,23 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
+	"unique"
 	"unsafe"
 
+	"github.com/VictoriaMetrics/easyproto"
 	"github.com/cespare/xxhash/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 )
 
-var sep = []byte{'\xff'}
+var (
+	ErrOutOfOrderLabels = errors.New("out of order labels")
+	ErrEmptyLabels      = errors.New("label set contains a label with empty name or value")
+	ErrDuplicateLabels  = errors.New("label set contains duplicate label names")
+
+	sep = []byte{'\xff'}
+)
 
 func noAllocString(buf []byte) string {
 	return *(*string)(unsafe.Pointer(&buf))
@@ -43,25 +52,16 @@ func ZLabelsToPromLabels(lset []ZLabel) labels.Labels {
 	return *(*labels.Labels)(unsafe.Pointer(&lset))
 }
 
-// ReAllocZLabelsStrings re-allocates all underlying bytes for string, detaching it from bigger memory pool.
+// ReAllocAndInternZLabelsStrings re-allocates all underlying bytes for string, detaching it from bigger memory pool.
+// It interns the given strings - if they are already in memory, they do not get copied.
+//
+// This is primarily intended to be used before labels are written into TSDB which can hold label strings in the memory long term.
 func ReAllocZLabelsStrings(lset *[]ZLabel) {
 	for j, l := range *lset {
-		// NOTE: This trick converts from string to byte without copy, but copy when creating string.
-		(*lset)[j].Name = string(noAllocBytes(l.Name))
-		(*lset)[j].Value = string(noAllocBytes(l.Value))
+		(*lset)[j].Name = unique.Make(l.Name).Value()
+		(*lset)[j].Value = unique.Make(l.Value).Value()
 	}
-}
 
-// LabelsFromPromLabels converts Prometheus labels to slice of labelpb.ZLabel in type unsafe manner.
-// It reuses the same memory. Caller should abort using passed labels.Labels.
-func LabelsFromPromLabels(lset labels.Labels) []Label {
-	return *(*[]Label)(unsafe.Pointer(&lset))
-}
-
-// LabelsToPromLabels convert slice of labelpb.ZLabel to Prometheus labels in type unsafe manner.
-// It reuses the same memory. Caller should abort using passed []Label.
-func LabelsToPromLabels(lset []Label) labels.Labels {
-	return *(*labels.Labels)(unsafe.Pointer(&lset))
 }
 
 // ZLabelSetsToPromLabelSets converts slice of labelpb.ZLabelSet to slice of Prometheus labels.
@@ -71,6 +71,25 @@ func ZLabelSetsToPromLabelSets(lss ...ZLabelSet) []labels.Labels {
 		res = append(res, ls.PromLabels())
 	}
 	return res
+}
+
+// ZLabelSetsFromPromLabels converts []labels.labels to []labelpb.ZLabelSet.
+func ZLabelSetsFromPromLabels(lss ...labels.Labels) []ZLabelSet {
+	sets := make([]ZLabelSet, 0, len(lss))
+	for _, ls := range lss {
+		set := ZLabelSet{
+			Labels: make([]ZLabel, 0, ls.Len()),
+		}
+		ls.Range(func(lbl labels.Label) {
+			set.Labels = append(set.Labels, ZLabel{
+				Name:  lbl.Name,
+				Value: lbl.Value,
+			})
+		})
+		sets = append(sets, set)
+	}
+
+	return sets
 }
 
 // ZLabel is a Label (also easily transformable to Prometheus labels.Labels) that can be unmarshalled from protobuf
@@ -253,31 +272,15 @@ func (m *ZLabel) Compare(other ZLabel) int {
 // The type conversion is done safely, which means we don't modify extend labels underlying array.
 //
 // In case of existing labels already present in given label set, it will be overwritten by external one.
-// NOTE: Labels and extend has to be sorted.
 func ExtendSortedLabels(lset, extend labels.Labels) labels.Labels {
-	ret := make(labels.Labels, 0, len(lset)+len(extend))
-
-	// Inject external labels in place.
-	for len(lset) > 0 && len(extend) > 0 {
-		d := strings.Compare(lset[0].Name, extend[0].Name)
-		if d == 0 {
-			// Duplicate, prefer external labels.
-			// NOTE(fabxc): Maybe move it to a prefixed version to still ensure uniqueness of series?
-			ret = append(ret, extend[0])
-			lset, extend = lset[1:], extend[1:]
-		} else if d < 0 {
-			ret = append(ret, lset[0])
-			lset = lset[1:]
-		} else if d > 0 {
-			ret = append(ret, extend[0])
-			extend = extend[1:]
-		}
+	if extend.IsEmpty() {
+		return lset.Copy()
 	}
-
-	// Append all remaining elements.
-	ret = append(ret, lset...)
-	ret = append(ret, extend...)
-	return ret
+	b := labels.NewBuilder(lset)
+	extend.Range(func(l labels.Label) {
+		b.Set(l.Name, l.Value)
+	})
+	return b.Labels()
 }
 
 func PromLabelSetsToString(lsets []labels.Labels) string {
@@ -294,7 +297,6 @@ func (m *ZLabelSet) UnmarshalJSON(entry []byte) error {
 	if err := lbls.UnmarshalJSON(entry); err != nil {
 		return errors.Wrapf(err, "labels: labels field unmarshal: %v", string(entry))
 	}
-	sort.Sort(lbls)
 	m.Labels = ZLabelsFromPromLabels(lbls)
 	return nil
 }
@@ -346,6 +348,40 @@ func HashWithPrefix(prefix string, lbls []ZLabel) uint64 {
 	return xxhash.Sum64(b)
 }
 
+// ValidateLabels validates label names and values (checks for empty
+// names and values, out of order labels and duplicate label names)
+// Returns appropriate error if validation fails on a label.
+func ValidateLabels(lbls []ZLabel) error {
+	if len(lbls) == 0 {
+		return ErrEmptyLabels
+	}
+
+	// Check first label.
+	l0 := lbls[0]
+	if l0.Name == "" || l0.Value == "" {
+		return ErrEmptyLabels
+	}
+
+	// Iterate over the rest, check each for empty / duplicates and
+	// check lexicographical (alphabetically) ordering.
+	for _, l := range lbls[1:] {
+		if l.Name == "" || l.Value == "" {
+			return ErrEmptyLabels
+		}
+
+		if l.Name == l0.Name {
+			return ErrDuplicateLabels
+		}
+
+		if l.Name < l0.Name {
+			return ErrOutOfOrderLabels
+		}
+		l0 = l
+	}
+
+	return nil
+}
+
 // ZLabelSets is a sortable list of ZLabelSet. It assumes the label pairs in each ZLabelSet element are already sorted.
 type ZLabelSets []ZLabelSet
 
@@ -369,4 +405,68 @@ func (z ZLabelSets) Less(i, j int) bool {
 	}
 
 	return l == lenI
+}
+
+type CustomLabelset labels.Labels
+
+var builderPool = &sync.Pool{
+	New: func() any {
+		b := labels.NewScratchBuilder(8)
+		return &b
+	},
+}
+
+func (l *CustomLabelset) UnmarshalProtobuf(src []byte) (err error) {
+	b := builderPool.Get().(*labels.ScratchBuilder)
+	b.Reset()
+
+	defer builderPool.Put(b)
+
+	var fc easyproto.FieldContext
+
+	for len(src) > 0 {
+		src, err = fc.NextField(src)
+		if err != nil {
+			return errors.Wrap(err, "unmarshal next field")
+		}
+
+		if fc.FieldNum != 1 {
+			return fmt.Errorf("expected field 1, got %d", fc.FieldNum)
+		}
+
+		dat, ok := fc.MessageData()
+		if !ok {
+			return fmt.Errorf("expected message data for field %d", fc.FieldNum)
+		}
+
+		var n, v string
+		var msgFc easyproto.FieldContext
+		for len(dat) > 0 {
+			dat, err = msgFc.NextField(dat)
+			if err != nil {
+				return errors.Wrap(err, "unmarshal next field in message")
+			}
+
+			switch msgFc.FieldNum {
+			case 1:
+				n, ok = msgFc.String()
+				if !ok {
+					return fmt.Errorf("expected string data for field %d", msgFc.FieldNum)
+				}
+			case 2:
+				v, ok = msgFc.String()
+				if !ok {
+					return fmt.Errorf("expected string data for field %d", msgFc.FieldNum)
+				}
+			default:
+				return fmt.Errorf("unexpected field %d in label message", msgFc.FieldNum)
+			}
+		}
+
+		b.Add(n, v)
+
+	}
+
+	*l = CustomLabelset(b.Labels())
+	return nil
 }

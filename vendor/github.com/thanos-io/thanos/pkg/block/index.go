@@ -16,7 +16,8 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -25,12 +26,13 @@ import (
 	"github.com/prometheus/prometheus/tsdb/index"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 // VerifyIndex does a full run over a block index and verifies that it fulfills the order invariants.
-func VerifyIndex(logger log.Logger, fn string, minTime, maxTime int64) error {
-	stats, err := GatherIndexHealthStats(logger, fn, minTime, maxTime)
+func VerifyIndex(ctx context.Context, logger log.Logger, fn string, minTime, maxTime int64) error {
+	stats, err := GatherIndexHealthStats(ctx, logger, fn, minTime, maxTime)
 	if err != nil {
 		return err
 	}
@@ -85,6 +87,10 @@ type HealthStats struct {
 	ChunkAvgSize int64
 	ChunkMaxSize int64
 
+	SeriesMinSize int64
+	SeriesAvgSize int64
+	SeriesMaxSize int64
+
 	SingleSampleSeries int64
 	SingleSampleChunks int64
 
@@ -92,10 +98,10 @@ type HealthStats struct {
 	MetricLabelValuesCount int64
 }
 
-// PrometheusIssue5372Err returns an error if the HealthStats object indicates
+// OutOfOrderLabelsErr returns an error if the HealthStats object indicates
 // postings with out of order labels.  This is corrected by Prometheus Issue
 // #5372 and affects Prometheus versions 2.8.0 and below.
-func (i HealthStats) PrometheusIssue5372Err() error {
+func (i HealthStats) OutOfOrderLabelsErr() error {
 	if i.OutOfOrderLabels > 0 {
 		return errors.Errorf("index contains %d postings with out of order labels",
 			i.OutOfOrderLabels)
@@ -157,7 +163,7 @@ func (i HealthStats) AnyErr() error {
 		errMsg = append(errMsg, err.Error())
 	}
 
-	if err := i.PrometheusIssue5372Err(); err != nil {
+	if err := i.OutOfOrderLabelsErr(); err != nil {
 		errMsg = append(errMsg, err.Error())
 	}
 
@@ -209,69 +215,91 @@ func (n *minMaxSumInt64) Avg() int64 {
 // helps to assess index health.
 // It considers https://github.com/prometheus/tsdb/issues/347 as something that Thanos can handle.
 // See HealthStats.Issue347OutsideChunks for details.
-func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64) (stats HealthStats, err error) {
-	r, err := index.NewFileReader(fn)
+func GatherIndexHealthStats(ctx context.Context, logger log.Logger, fn string, minTime, maxTime int64) (stats HealthStats, err error) {
+	r, err := index.NewFileReader(fn, index.DecodePostingsRaw)
 	if err != nil {
 		return stats, errors.Wrap(err, "open index file")
 	}
 	defer runutil.CloseWithErrCapture(&err, r, "gather index issue file reader")
 
-	p, err := r.Postings(index.AllPostingsKey())
+	key, value := index.AllPostingsKey()
+	p, err := r.Postings(ctx, key, value)
 	if err != nil {
 		return stats, errors.Wrap(err, "get all postings")
 	}
 	var (
-		lastLset labels.Labels
 		lset     labels.Labels
-		chks     []chunks.Meta
+		prevLset labels.Labels
+		builder  labels.ScratchBuilder
+
+		chks []chunks.Meta
 
 		seriesLifeDuration                          = newMinMaxSumInt64()
 		seriesLifeDurationWithoutSingleSampleSeries = newMinMaxSumInt64()
 		seriesChunks                                = newMinMaxSumInt64()
 		chunkDuration                               = newMinMaxSumInt64()
 		chunkSize                                   = newMinMaxSumInt64()
+		seriesSize                                  = newMinMaxSumInt64()
 	)
 
-	lnames, err := r.LabelNames()
+	lnames, err := r.LabelNames(ctx)
 	if err != nil {
 		return stats, errors.Wrap(err, "label names")
 	}
 	stats.LabelNamesCount = int64(len(lnames))
 
-	lvals, err := r.LabelValues("__name__")
+	lvals, err := r.LabelValues(ctx, "__name__", nil)
 	if err != nil {
 		return stats, errors.Wrap(err, "metric label values")
 	}
 	stats.MetricLabelValuesCount = int64(len(lvals))
 
+	// As of version two all series entries are 16 byte padded. All references
+	// we get have to account for that to get the correct offset.
+	offsetMultiplier := 1
+	version := r.Version()
+	if version >= 2 {
+		offsetMultiplier = 16
+	}
+
 	// Per series.
+	var prevId storage.SeriesRef
 	for p.Next() {
-		lastLset = append(lastLset[:0], lset...)
+		prevLset.CopyFrom(lset)
 
 		id := p.At()
+		if prevId != 0 {
+			// Approximate size.
+			seriesSize.Add(int64(id-prevId) * int64(offsetMultiplier))
+		}
+		prevId = id
 		stats.TotalSeries++
 
-		if err := r.Series(id, &lset, &chks); err != nil {
+		if err := r.Series(id, &builder, &chks); err != nil {
 			return stats, errors.Wrap(err, "read series")
 		}
-		if len(lset) == 0 {
+		lset = builder.Labels()
+		if lset.IsEmpty() {
 			return stats, errors.Errorf("empty label set detected for series %d", id)
 		}
-		if lastLset != nil && labels.Compare(lastLset, lset) >= 0 {
-			return stats, errors.Errorf("series %v out of order; previous %v", lset, lastLset)
+		if !prevLset.IsEmpty() && labels.Compare(prevLset, lset) >= 0 {
+			return stats, errors.Errorf("series %v out of order; previous %v", lset, prevLset)
 		}
-		l0 := lset[0]
-		for _, l := range lset[1:] {
-			if l.Name < l0.Name {
-				stats.OutOfOrderLabels++
-				level.Warn(logger).Log("msg",
-					"out-of-order label set: known bug in Prometheus 2.8.0 and below",
-					"labelset", lset.String(),
-					"series", fmt.Sprintf("%d", id),
-				)
+		var l0 *labels.Label
+		lset.Range(func(l labels.Label) {
+			if l0 != nil {
+				if l.Name < l0.Name {
+					stats.OutOfOrderLabels++
+					level.Warn(logger).Log("msg",
+						"out-of-order label set: known bug in Prometheus 2.8.0 and below",
+						"labelset", lset.String(),
+						"series", fmt.Sprintf("%d", id),
+					)
+				}
 			}
-			l0 = l
-		}
+			l0 = &l
+		})
+
 		if len(chks) == 0 {
 			return stats, errors.Errorf("empty chunks for series %d", id)
 		}
@@ -291,7 +319,12 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 
 			// Approximate size.
 			if i < len(chks)-2 {
-				chunkSize.Add(int64(chks[i+1].Ref - c.Ref))
+				sgmIndex, chkStart := chunks.BlockChunkRef(c.Ref).Unpack()
+				sgmIndex2, chkStart2 := chunks.BlockChunkRef(chks[i+1].Ref).Unpack()
+				// Skip the case where two chunks are spread into 2 files.
+				if sgmIndex == sgmIndex2 {
+					chunkSize.Add(int64(chkStart2 - chkStart))
+				}
 			}
 
 			// Chunk vs the block ranges.
@@ -340,7 +373,7 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 			seriesLifeDurationWithoutSingleSampleSeries.Add(seriesLifeTimeMs)
 		}
 	}
-	if p.Err() != nil {
+	if err := p.Err(); err != nil {
 		return stats, errors.Wrap(err, "walk postings")
 	}
 
@@ -360,6 +393,10 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 	stats.ChunkAvgSize = chunkSize.Avg()
 	stats.ChunkMinSize = chunkSize.min
 
+	stats.SeriesMaxSize = seriesSize.max
+	stats.SeriesAvgSize = seriesSize.Avg()
+	stats.SeriesMinSize = seriesSize.min
+
 	stats.ChunkMaxDuration = time.Duration(chunkDuration.max) * time.Millisecond
 	stats.ChunkAvgDuration = time.Duration(chunkDuration.Avg()) * time.Millisecond
 	stats.ChunkMinDuration = time.Duration(chunkDuration.min) * time.Millisecond
@@ -375,7 +412,7 @@ type ignoreFnType func(mint, maxt int64, prev *chunks.Meta, curr *chunks.Meta) (
 // - removes all near "complete" outside chunks introduced by https://github.com/prometheus/tsdb/issues/347.
 // Fixable inconsistencies are resolved in the new block.
 // TODO(bplotka): https://github.com/thanos-io/thanos/issues/378.
-func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceType, ignoreChkFns ...ignoreFnType) (resid ulid.ULID, err error) {
+func Repair(ctx context.Context, logger log.Logger, dir string, id ulid.ULID, source metadata.SourceType, ignoreChkFns ...ignoreFnType) (resid ulid.ULID, err error) {
 	if len(ignoreChkFns) == 0 {
 		return resid, errors.New("no ignore chunk function specified")
 	}
@@ -392,7 +429,7 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 		return resid, errors.New("cannot repair downsampled block")
 	}
 
-	b, err := tsdb.OpenBlock(logger, bdir, nil)
+	b, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), bdir, nil, nil)
 	if err != nil {
 		return resid, errors.Wrap(err, "open block")
 	}
@@ -431,7 +468,7 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 	resmeta.Stats = tsdb.BlockStats{} // Reset stats.
 	resmeta.Thanos.Source = source    // Update source.
 
-	if err := rewrite(logger, indexr, chunkr, indexw, chunkw, &resmeta, ignoreChkFns); err != nil {
+	if err := rewrite(ctx, logger, indexr, chunkr, indexw, chunkw, &resmeta, ignoreChkFns); err != nil {
 		return resid, errors.Wrap(err, "rewrite block")
 	}
 	resmeta.Thanos.SegmentFiles = GetSegmentFiles(resdir)
@@ -537,6 +574,7 @@ type seriesRepair struct {
 // rewrite writes all data from the readers back into the writers while cleaning
 // up mis-ordered and duplicated chunks.
 func rewrite(
+	ctx context.Context,
 	logger log.Logger,
 	indexr tsdb.IndexReader, chunkr tsdb.ChunkReader,
 	indexw tsdb.IndexWriter, chunkw tsdb.ChunkWriter,
@@ -553,7 +591,8 @@ func rewrite(
 		return errors.Wrap(symbols.Err(), "next symbol")
 	}
 
-	all, err := indexr.Postings(index.AllPostingsKey())
+	key, value := index.AllPostingsKey()
+	all, err := indexr.Postings(ctx, key, value)
 	if err != nil {
 		return errors.Wrap(err, "postings")
 	}
@@ -567,19 +606,20 @@ func rewrite(
 		series   = []seriesRepair{}
 	)
 
-	var lset labels.Labels
+	var builder labels.ScratchBuilder
 	var chks []chunks.Meta
 	for all.Next() {
 		id := all.At()
 
-		if err := indexr.Series(id, &lset, &chks); err != nil {
+		if err := indexr.Series(id, &builder, &chks); err != nil {
 			return errors.Wrap(err, "series")
 		}
 		// Make sure labels are in sorted order.
-		sort.Sort(lset)
+		builder.Sort()
 
 		for i, c := range chks {
-			chks[i].Chunk, err = chunkr.Chunk(c.Ref)
+			// Ignore iterable as it should be nil.
+			chks[i].Chunk, _, err = chunkr.ChunkOrIterable(c)
 			if err != nil {
 				return errors.Wrap(err, "chunk read")
 			}
@@ -595,7 +635,7 @@ func rewrite(
 		}
 
 		series = append(series, seriesRepair{
-			lset: lset,
+			lset: builder.Labels(),
 			chks: chks,
 		})
 	}
@@ -640,14 +680,14 @@ func rewrite(
 			meta.Stats.NumSamples += uint64(chk.Chunk.NumSamples())
 		}
 
-		for _, l := range s.lset {
+		s.lset.Range(func(l labels.Label) {
 			valset, ok := values[l.Name]
 			if !ok {
 				valset = stringset{}
 				values[l.Name] = valset
 			}
 			valset.set(l.Value)
-		}
+		})
 		postings.Add(i, s.lset)
 		i++
 		lastSet = s.lset

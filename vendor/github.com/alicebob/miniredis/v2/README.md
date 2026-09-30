@@ -25,7 +25,7 @@ import "github.com/alicebob/miniredis/v2"
 
 Implemented commands:
 
- - Connection (complete)
+ - Connection
    - AUTH -- see RequireAuth()
    - ECHO
    - HELLO -- see RequireUserAuth()
@@ -34,25 +34,31 @@ Implemented commands:
    - SWAPDB
    - QUIT
  - Key
+   - COPY
    - DEL
+   - DUMP -- partly, only handles string keys
    - EXISTS
    - EXPIRE
    - EXPIREAT
+   - EXPIRETIME
    - KEYS
    - MOVE
    - PERSIST
    - PEXPIRE
    - PEXPIREAT
+   - PEXPIRETIME
    - PTTL
+   - RANDOMKEY -- see m.Seed(...)
    - RENAME
    - RENAMENX
-   - RANDOMKEY -- see m.Seed(...)
+   - RESTORE -- partly, only handles string keys
    - SCAN
    - TOUCH
    - TTL
    - TYPE
    - UNLINK
- - Transactions (complete)
+   - WAIT -- no-op
+ - Transactions
    - DISCARD
    - EXEC
    - MULTI
@@ -63,15 +69,20 @@ Implemented commands:
    - FLUSHALL
    - FLUSHDB
    - TIME -- returns time.Now() or value set by SetTime()
- - String keys (complete)
+   - COMMAND -- partly
+   - INFO -- partly, returns only "clients" section with one field "connected_clients"
+ - String keys
    - APPEND
    - BITCOUNT
    - BITOP
    - BITPOS
    - DECR
    - DECRBY
+   - DELEX -- partly
    - GET
    - GETBIT
+   - GETDEL
+   - GETEX
    - GETRANGE
    - GETSET
    - INCR
@@ -87,7 +98,7 @@ Implemented commands:
    - SETNX
    - SETRANGE
    - STRLEN
- - Hash keys (complete)
+ - Hash keys
    - HDEL
    - HEXISTS
    - HGET
@@ -98,12 +109,13 @@ Implemented commands:
    - HLEN
    - HMGET
    - HMSET
+   - HRANDFIELD
    - HSET
    - HSETNX
    - HSTRLEN
    - HVALS
    - HSCAN
- - List keys (complete)
+ - List keys
    - BLPOP
    - BRPOP
    - BRPOPLPUSH
@@ -121,38 +133,44 @@ Implemented commands:
    - RPOPLPUSH
    - RPUSH
    - RPUSHX
- - Pub/Sub (complete)
+   - LMOVE
+   - BLMOVE
+ - Pub/Sub
    - PSUBSCRIBE
    - PUBLISH
    - PUBSUB
    - PUNSUBSCRIBE
    - SUBSCRIBE
    - UNSUBSCRIBE
- - Set keys (complete)
+ - Set keys
    - SADD
    - SCARD
    - SDIFF
    - SDIFFSTORE
    - SINTER
    - SINTERSTORE
+   - SINTERCARD
    - SISMEMBER
    - SMEMBERS
+   - SMISMEMBER
    - SMOVE
    - SPOP -- see m.Seed(...)
    - SRANDMEMBER -- see m.Seed(...)
    - SREM
+   - SSCAN
    - SUNION
    - SUNIONSTORE
-   - SSCAN
- - Sorted Set keys (complete)
+ - Sorted Set keys
    - ZADD
    - ZCARD
    - ZCOUNT
    - ZINCRBY
+   - ZINTER
    - ZINTERSTORE
    - ZLEXCOUNT
    - ZPOPMIN
    - ZPOPMAX
+   - ZRANDMEMBER
    - ZRANGE
    - ZRANGEBYLEX
    - ZRANGEBYSCORE
@@ -166,19 +184,29 @@ Implemented commands:
    - ZREVRANGEBYSCORE
    - ZREVRANK
    - ZSCORE
+   - ZUNION
    - ZUNIONSTORE
    - ZSCAN
  - Stream keys
    - XACK
    - XADD
+   - XAUTOCLAIM
+   - XCLAIM
    - XDEL
    - XGROUP CREATE
+   - XGROUP CREATECONSUMER
+   - XGROUP DESTROY
+   - XGROUP DELCONSUMER
    - XINFO STREAM -- partly
+   - XINFO GROUPS
+   - XINFO CONSUMERS -- partly
    - XLEN
    - XRANGE
-   - XREAD -- partly
-   - XREADGROUP -- partly
+   - XREAD
+   - XREADGROUP
    - XREVRANGE
+   - XPENDING
+   - XTRIM
  - Scripting
    - EVAL
    - EVALSHA
@@ -194,12 +222,15 @@ Implemented commands:
    - GEORADIUS_RO
    - GEORADIUSBYMEMBER
    - GEORADIUSBYMEMBER_RO
- - Server
-   - COMMAND -- partly
  - Cluster
    - CLUSTER SLOTS
    - CLUSTER KEYSLOT
    - CLUSTER NODES
+   - CLUSTER SHARDS
+ - HyperLogLog
+   - PFADD
+   - PFCOUNT
+   - PFMERGE
 
 
 ## TTLs, key expiration, and time
@@ -238,11 +269,7 @@ import (
 )
 
 func TestSomething(t *testing.T) {
-	s, err := miniredis.Run()
-	if err != nil {
-		panic(err)
-	}
-	defer s.Close()
+	s := miniredis.RunT(t)
 
 	// Optionally set some keys your code expects:
 	s.Set("foo", "bar")
@@ -278,17 +305,12 @@ Commands which will probably not be implemented:
     - ~~CLUSTER *~~
     - ~~READONLY~~
     - ~~READWRITE~~
- - HyperLogLog (all) -- unless someone needs these
-    - ~~PFADD~~
-    - ~~PFCOUNT~~
-    - ~~PFMERGE~~
  - Key
-    - ~~DUMP~~
     - ~~MIGRATE~~
     - ~~OBJECT~~
-    - ~~RESTORE~~
-    - ~~WAIT~~
  - Scripting
+    - ~~FCALL / FCALL_RO *~~
+    - ~~FUNCTION *~~
     - ~~SCRIPT DEBUG~~
     - ~~SCRIPT KILL~~
  - Server
@@ -297,7 +319,6 @@ Commands which will probably not be implemented:
     - ~~CLIENT *~~
     - ~~CONFIG *~~
     - ~~DEBUG *~~
-    - ~~INFO~~
     - ~~LASTSAVE~~
     - ~~MONITOR~~
     - ~~ROLE~~
@@ -310,7 +331,7 @@ Commands which will probably not be implemented:
 
 ## &c.
 
-Integration tests are run against Redis 6.0.10. The [./integration](./integration/) subdir
+Integration tests are run against Redis 8.4.0. The [./integration](./integration/) subdir
 compares miniredis against a real redis instance.
 
 The Redis 6 RESP3 protocol is supported. If there are problems, please open
@@ -320,5 +341,4 @@ If you want to test Redis Sentinel have a look at [minisentinel](https://github.
 
 A changelog is kept at [CHANGELOG.md](https://github.com/alicebob/miniredis/blob/master/CHANGELOG.md).
 
-[![Build Status](https://travis-ci.org/alicebob/miniredis.svg?branch=master)](https://travis-ci.org/alicebob/miniredis)
 [![Go Reference](https://pkg.go.dev/badge/github.com/alicebob/miniredis/v2.svg)](https://pkg.go.dev/github.com/alicebob/miniredis/v2)

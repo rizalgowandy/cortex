@@ -3,56 +3,55 @@
 
 // Package runutil provides helpers to advanced function scheduling control like repeat or retry.
 //
-// It's very often the case when you need to excutes some code every fixed intervals or have it retried automatically.
+// It's very often the case when you need to executes some code every fixed intervals or have it retried automatically.
 // To make it reliably with proper timeout, you need to carefully arrange some boilerplate for this.
 // Below function does it for you.
 //
 // For repeat executes, use Repeat:
 //
-// 	err := runutil.Repeat(10*time.Second, stopc, func() error {
-// 		// ...
-// 	})
+//	err := runutil.Repeat(10*time.Second, stopc, func() error {
+//		// ...
+//	})
 //
 // Retry starts executing closure function f until no error is returned from f:
 //
-// 	err := runutil.Retry(10*time.Second, stopc, func() error {
-// 		// ...
-// 	})
+//	err := runutil.Retry(10*time.Second, stopc, func() error {
+//		// ...
+//	})
 //
 // For logging an error on each f error, use RetryWithLog:
 //
-// 	err := runutil.RetryWithLog(logger, 10*time.Second, stopc, func() error {
-// 		// ...
-// 	})
+//	err := runutil.RetryWithLog(logger, 10*time.Second, stopc, func() error {
+//		// ...
+//	})
 //
 // Another use case for runutil package is when you want to close a `Closer` interface. As we all know, we should close all implements of `Closer`, such as *os.File. Commonly we will use:
 //
-// 	defer closer.Close()
+//	defer closer.Close()
 //
 // The problem is that Close() usually can return important error e.g for os.File the actual file flush might happen (and fail) on `Close` method. It's important to *always* check error. Thanos provides utility functions to log every error like those, allowing to put them in convenient `defer`:
 //
-// 	defer runutil.CloseWithLogOnErr(logger, closer, "log format message")
+//	defer runutil.CloseWithLogOnErr(logger, closer, "log format message")
 //
 // For capturing error, use CloseWithErrCapture:
 //
-// 	var err error
-// 	defer runutil.CloseWithErrCapture(&err, closer, "log format message")
+//	var err error
+//	defer runutil.CloseWithErrCapture(&err, closer, "log format message")
 //
-// 	// ...
+//	// ...
 //
 // If Close() returns error, err will capture it and return by argument.
 //
 // The rununtil.Exhaust* family of functions provide the same functionality but
 // they take an io.ReadCloser and they exhaust the whole reader before closing
 // them. They are useful when trying to use http keep-alive connections because
-// for the same connection to be re-used the whole response body needs to be
+// for the same connection to be reused the whole response body needs to be
 // exhausted.
 package runutil
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,6 +63,23 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/errutil"
 )
+
+// RepeatInfinitely executes f every interval seconds until stopc is closed or f returns an error.
+func RepeatInfinitely(logger log.Logger, interval time.Duration, stopc <-chan struct{}, f func() error) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	for {
+		if err := f(); err != nil {
+			level.Error(logger).Log("msg", "function failed. Retrying in next tick", "err", err)
+		}
+		select {
+		case <-stopc:
+			return
+		case <-tick.C:
+		}
+	}
+}
 
 // Repeat executes f every interval seconds until stopc is closed or f returns an error.
 // It executes f once right after being called.
@@ -108,7 +124,7 @@ func RetryWithLog(logger log.Logger, interval time.Duration, stopc <-chan struct
 }
 
 // CloseWithLogOnErr is making sure we log every error, even those from best effort tiny closers.
-func CloseWithLogOnErr(logger log.Logger, closer io.Closer, format string, a ...interface{}) {
+func CloseWithLogOnErr(logger log.Logger, closer io.Closer, format string, a ...any) {
 	err := closer.Close()
 	if err == nil {
 		return
@@ -127,8 +143,8 @@ func CloseWithLogOnErr(logger log.Logger, closer io.Closer, format string, a ...
 }
 
 // ExhaustCloseWithLogOnErr closes the io.ReadCloser with a log message on error but exhausts the reader before.
-func ExhaustCloseWithLogOnErr(logger log.Logger, r io.ReadCloser, format string, a ...interface{}) {
-	_, err := io.Copy(ioutil.Discard, r)
+func ExhaustCloseWithLogOnErr(logger log.Logger, r io.ReadCloser, format string, a ...any) {
+	_, err := io.Copy(io.Discard, r)
 	if err != nil {
 		level.Warn(logger).Log("msg", "failed to exhaust reader, performance may be impeded", "err", err)
 	}
@@ -136,9 +152,8 @@ func ExhaustCloseWithLogOnErr(logger log.Logger, r io.ReadCloser, format string,
 	CloseWithLogOnErr(logger, r, format, a...)
 }
 
-// CloseWithErrCapture runs function and on error return error by argument including the given error (usually
-// from caller function).
-func CloseWithErrCapture(err *error, closer io.Closer, format string, a ...interface{}) {
+// CloseWithErrCapture closes closer, wraps any error with message from fmt and args, and stores this in err.
+func CloseWithErrCapture(err *error, closer io.Closer, format string, a ...any) {
 	merr := errutil.MultiError{}
 
 	merr.Add(*err)
@@ -148,8 +163,8 @@ func CloseWithErrCapture(err *error, closer io.Closer, format string, a ...inter
 }
 
 // ExhaustCloseWithErrCapture closes the io.ReadCloser with error capture but exhausts the reader before.
-func ExhaustCloseWithErrCapture(err *error, r io.ReadCloser, format string, a ...interface{}) {
-	_, copyErr := io.Copy(ioutil.Discard, r)
+func ExhaustCloseWithErrCapture(err *error, r io.ReadCloser, format string, a ...any) {
+	_, copyErr := io.Copy(io.Discard, r)
 
 	CloseWithErrCapture(err, r, format, a...)
 
@@ -165,7 +180,7 @@ func ExhaustCloseWithErrCapture(err *error, r io.ReadCloser, format string, a ..
 // dir except for the ignoreDirs directories.
 // NOTE: DeleteAll is not idempotent.
 func DeleteAll(dir string, ignoreDirs ...string) error {
-	entries, err := ioutil.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
 	}

@@ -28,7 +28,8 @@ import (
 // PostAlertsOKCode is the HTTP code returned for type PostAlertsOK
 const PostAlertsOKCode int = 200
 
-/*PostAlertsOK Create alerts response
+/*
+PostAlertsOK Create alerts response
 
 swagger:response postAlertsOK
 */
@@ -44,7 +45,7 @@ func NewPostAlertsOK() *PostAlertsOK {
 // WriteResponse to the client
 func (o *PostAlertsOK) WriteResponse(rw http.ResponseWriter, producer runtime.Producer) {
 
-	rw.Header().Del(runtime.HeaderContentType) //Remove Content-Type on empty responses
+	rw.Header().Del(runtime.HeaderContentType) // Remove Content-Type on empty responses
 
 	rw.WriteHeader(200)
 }
@@ -52,7 +53,8 @@ func (o *PostAlertsOK) WriteResponse(rw http.ResponseWriter, producer runtime.Pr
 // PostAlertsBadRequestCode is the HTTP code returned for type PostAlertsBadRequest
 const PostAlertsBadRequestCode int = 400
 
-/*PostAlertsBadRequest Bad request
+/*
+PostAlertsBadRequest Bad request
 
 swagger:response postAlertsBadRequest
 */
@@ -94,7 +96,8 @@ func (o *PostAlertsBadRequest) WriteResponse(rw http.ResponseWriter, producer ru
 // PostAlertsInternalServerErrorCode is the HTTP code returned for type PostAlertsInternalServerError
 const PostAlertsInternalServerErrorCode int = 500
 
-/*PostAlertsInternalServerError Internal server error
+/*
+PostAlertsInternalServerError Internal server error
 
 swagger:response postAlertsInternalServerError
 */

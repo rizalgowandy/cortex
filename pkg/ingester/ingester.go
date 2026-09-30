@@ -4,8 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"html"
+	"io"
+	"math"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -13,34 +21,77 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
-	"github.com/grafana/dskit/ring"
-	"github.com/grafana/dskit/services"
+	"github.com/oklog/ulid/v2"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
-	tsdb_record "github.com/prometheus/prometheus/tsdb/record"
+	"github.com/prometheus/prometheus/util/compression"
+	"github.com/prometheus/prometheus/util/zeropool"
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/shipper"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
-	"golang.org/x/time/rate"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 
-	cortex_chunk "github.com/cortexproject/cortex/pkg/chunk"
+	"github.com/cortexproject/cortex/pkg/chunk/encoding"
+	"github.com/cortexproject/cortex/pkg/configs"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/storage/tsdb"
-	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/querysharding"
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/storage/bucket"
+	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketindex"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/extract"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	logutil "github.com/cortexproject/cortex/pkg/util/log"
 	util_math "github.com/cortexproject/cortex/pkg/util/math"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
+	"github.com/cortexproject/cortex/pkg/util/resource"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/users"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 const (
+	// RingKey is the key under which we store the ingesters ring in the KVStore.
+	RingKey = "ring"
+)
+
+const (
+	errTSDBCreateIncompatibleState = "cannot create a new TSDB while the ingester is not in active state (current state: %s)"
+	errTSDBIngestWithTimestamp     = "err: %v. series=%s"               // Using error.Wrap puts the message before the error and if the series is too long, its truncated.
+	errTSDBIngest                  = "err: %v. timestamp=%s, series=%s" // Using error.Wrap puts the message before the error and if the series is too long, its truncated.
+	errTSDBIngestWithHeadMaxTime   = "err: %v. timestamp=%s, tsdbHeadMaxTimestamp=%s, series=%s"
+	errTSDBIngestExemplar          = "err: %v. timestamp=%s, series=%s, exemplar=%s"
+
+	// Jitter applied to the idle timeout to prevent compaction in all ingesters concurrently.
+	compactionIdleTimeoutJitter = 0.25
+
+	instanceIngestionRateTickInterval = time.Second
+
 	// Number of timeseries to return in each batch of a QueryStream.
-	queryStreamBatchSize = 128
+	queryStreamBatchSize    = 128
+	metadataStreamBatchSize = 128
 
 	// Discarded Metadata metric labels.
 	perUserMetadataLimit   = "per_user_metadata_limit"
@@ -48,49 +99,55 @@ const (
 
 	// Period at which to attempt purging metadata from memory.
 	metadataPurgePeriod = 5 * time.Minute
+
+	// Period at which we should reset the max inflight query requests counter.
+	maxInflightRequestResetPeriod = 1 * time.Minute
+
+	labelSetMetricsTickInterval = 30 * time.Second
 )
 
 var (
-	// This is initialised if the WAL is enabled and the records are fetched from this pool.
-	recordPool sync.Pool
-
+	errExemplarRef      = errors.New("exemplars not ingested because series not already present")
 	errIngesterStopping = errors.New("ingester stopping")
+	errNoUserDb         = errors.New("no user db")
+	errLabelsOutOfOrder = errors.New("labels out of order")
+	errTsdbShipping     = errors.New("tsdb is in state activeShipping")
+
+	tsChunksPool zeropool.Pool[[]client.TimeSeriesChunk]
+
+	distributorWorkerOrgIDRe = regexp.MustCompile(`^ingester-.+-stream-push-worker-\d+$`)
 )
 
 // Config for an Ingester.
 type Config struct {
-	WALConfig        WALConfig             `yaml:"walconfig" doc:"description=Configures the Write-Ahead Log (WAL) for the Cortex chunks storage. This config is ignored when running the Cortex blocks storage."`
 	LifecyclerConfig ring.LifecyclerConfig `yaml:"lifecycler"`
-
-	// Config for transferring chunks. Zero or negative = no retries.
-	MaxTransferRetries int `yaml:"max_transfer_retries"`
-
-	// Config for chunk flushing.
-	FlushCheckPeriod  time.Duration `yaml:"flush_period"`
-	RetainPeriod      time.Duration `yaml:"retain_period"`
-	MaxChunkIdle      time.Duration `yaml:"max_chunk_idle_time"`
-	MaxStaleChunkIdle time.Duration `yaml:"max_stale_chunk_idle_time"`
-	FlushOpTimeout    time.Duration `yaml:"flush_op_timeout"`
-	MaxChunkAge       time.Duration `yaml:"max_chunk_age"`
-	ChunkAgeJitter    time.Duration `yaml:"chunk_age_jitter"`
-	ConcurrentFlushes int           `yaml:"concurrent_flushes"`
-	SpreadFlushes     bool          `yaml:"spread_flushes"`
 
 	// Config for metadata purging.
 	MetadataRetainPeriod time.Duration `yaml:"metadata_retain_period"`
 
-	RateUpdatePeriod time.Duration `yaml:"rate_update_period"`
+	RateUpdatePeriod            time.Duration `yaml:"rate_update_period"`
+	UserTSDBConfigsUpdatePeriod time.Duration `yaml:"user_tsdb_configs_update_period"`
 
 	ActiveSeriesMetricsEnabled      bool          `yaml:"active_series_metrics_enabled"`
 	ActiveSeriesMetricsUpdatePeriod time.Duration `yaml:"active_series_metrics_update_period"`
 	ActiveSeriesMetricsIdleTimeout  time.Duration `yaml:"active_series_metrics_idle_timeout"`
 
+	ActiveQueriedSeriesMetricsEnabled        bool                     `yaml:"active_queried_series_metrics_enabled"`
+	ActiveQueriedSeriesMetricsUpdatePeriod   time.Duration            `yaml:"active_queried_series_metrics_update_period"`
+	ActiveQueriedSeriesMetricsWindowDuration time.Duration            `yaml:"active_queried_series_metrics_window_duration"`
+	ActiveQueriedSeriesMetricsSampleRate     float64                  `yaml:"active_queried_series_metrics_sample_rate"`
+	ActiveQueriedSeriesMetricsWindows        cortex_tsdb.DurationList `yaml:"active_queried_series_metrics_windows"`
+
+	HeadQueriedSeriesMetricsEnabled        bool                     `yaml:"head_queried_series_metrics_enabled"`
+	HeadQueriedSeriesMetricsWindowDuration time.Duration            `yaml:"head_queried_series_metrics_window_duration"`
+	HeadQueriedSeriesMetricsSampleRate     float64                  `yaml:"head_queried_series_metrics_sample_rate"`
+	HeadQueriedSeriesMetricsWindows        cortex_tsdb.DurationList `yaml:"head_queried_series_metrics_windows"`
+
 	// Use blocks storage.
-	BlocksStorageEnabled        bool                     `yaml:"-"`
-	BlocksStorageConfig         tsdb.BlocksStorageConfig `yaml:"-"`
-	StreamChunksWhenUsingBlocks bool                     `yaml:"-"`
-	// Runtime-override for type of streaming query to use (chunks or samples).
-	StreamTypeFn func() QueryStreamType `yaml:"-"`
+	BlocksStorageConfig cortex_tsdb.BlocksStorageConfig `yaml:"-"`
+
+	// UploadCompactedBlocksEnabled enables uploading compacted blocks.
+	UploadCompactedBlocksEnabled bool `yaml:"upload_compacted_blocks_enabled"`
 
 	// Injected at runtime and read from the distributor config, required
 	// to accurately apply global limits.
@@ -103,40 +160,120 @@ type Config struct {
 	IgnoreSeriesLimitForMetricNames string `yaml:"ignore_series_limit_for_metric_names"`
 
 	// For testing, you can override the address and ID of this ingester.
-	ingesterClientFactory func(addr string, cfg client.Config) (client.HealthAndIngesterClient, error)
+	ingesterClientFactory func(addr string, cfg client.Config, useStreamConnection bool) (client.HealthAndIngesterClient, error)
+
+	// For admin contact details
+	AdminLimitMessage string `yaml:"admin_limit_message"`
+
+	LabelsStringInterningEnabled bool `yaml:"labels_string_interning_enabled"`
+
+	// DisableChunkTrimming allows to disable trimming of matching series chunks based on query Start and End time.
+	// When disabled, the result may contain samples outside the queried time range but Select() performances
+	// may be improved.
+	DisableChunkTrimming bool `yaml:"disable_chunk_trimming"`
+
+	// Maximum number of entries in the matchers cache. 0 to disable.
+	MatchersCacheMaxItems int `yaml:"matchers_cache_max_items"`
+
+	// If enabled, the metadata API returns all metadata regardless of the limits.
+	SkipMetadataLimits bool `yaml:"skip_metadata_limits"`
+
+	// When enabled, matchers with low selectivity are applied lazily during series scanning
+	// instead of being used for postings selection.
+	EnableMatcherOptimization bool `yaml:"enable_matcher_optimization"`
+
+	// Enable regex matcher limits and metrics collection for unoptimized regex queries.
+	// When enabled, the ingester will track pattern length, label cardinality, and total value length
+	// for unoptimized regex matchers, and enforce per-tenant limits if configured.
+	EnableRegexMatcherLimits bool `yaml:"enable_regex_matcher_limits"`
+
+	QueryProtection configs.QueryProtection `yaml:"query_protection"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.LifecyclerConfig.RegisterFlags(f)
-	cfg.WALConfig.RegisterFlags(f)
-
-	f.IntVar(&cfg.MaxTransferRetries, "ingester.max-transfer-retries", 10, "Number of times to try and transfer chunks before falling back to flushing. Negative value or zero disables hand-over. This feature is supported only by the chunks storage.")
-
-	f.DurationVar(&cfg.FlushCheckPeriod, "ingester.flush-period", 1*time.Minute, "Period with which to attempt to flush chunks.")
-	f.DurationVar(&cfg.RetainPeriod, "ingester.retain-period", 5*time.Minute, "Period chunks will remain in memory after flushing.")
-	f.DurationVar(&cfg.MaxChunkIdle, "ingester.max-chunk-idle", 5*time.Minute, "Maximum chunk idle time before flushing.")
-	f.DurationVar(&cfg.MaxStaleChunkIdle, "ingester.max-stale-chunk-idle", 2*time.Minute, "Maximum chunk idle time for chunks terminating in stale markers before flushing. 0 disables it and a stale series is not flushed until the max-chunk-idle timeout is reached.")
-	f.DurationVar(&cfg.FlushOpTimeout, "ingester.flush-op-timeout", 1*time.Minute, "Timeout for individual flush operations.")
-	f.DurationVar(&cfg.MaxChunkAge, "ingester.max-chunk-age", 12*time.Hour, "Maximum chunk age before flushing.")
-	f.DurationVar(&cfg.ChunkAgeJitter, "ingester.chunk-age-jitter", 0, "Range of time to subtract from -ingester.max-chunk-age to spread out flushes")
-	f.IntVar(&cfg.ConcurrentFlushes, "ingester.concurrent-flushes", 50, "Number of concurrent goroutines flushing to dynamodb.")
-	f.BoolVar(&cfg.SpreadFlushes, "ingester.spread-flushes", true, "If true, spread series flushes across the whole period of -ingester.max-chunk-age.")
 
 	f.DurationVar(&cfg.MetadataRetainPeriod, "ingester.metadata-retain-period", 10*time.Minute, "Period at which metadata we have not seen will remain in memory before being deleted.")
 
 	f.DurationVar(&cfg.RateUpdatePeriod, "ingester.rate-update-period", 15*time.Second, "Period with which to update the per-user ingestion rates.")
+	f.DurationVar(&cfg.UserTSDBConfigsUpdatePeriod, "ingester.user-tsdb-configs-update-period", 15*time.Second, "Period with which to update the per-user tsdb config.")
 	f.BoolVar(&cfg.ActiveSeriesMetricsEnabled, "ingester.active-series-metrics-enabled", true, "Enable tracking of active series and export them as metrics.")
 	f.DurationVar(&cfg.ActiveSeriesMetricsUpdatePeriod, "ingester.active-series-metrics-update-period", 1*time.Minute, "How often to update active series metrics.")
 	f.DurationVar(&cfg.ActiveSeriesMetricsIdleTimeout, "ingester.active-series-metrics-idle-timeout", 10*time.Minute, "After what time a series is considered to be inactive.")
-	f.BoolVar(&cfg.StreamChunksWhenUsingBlocks, "ingester.stream-chunks-when-using-blocks", false, "Stream chunks when using blocks. This is experimental feature and not yet tested. Once ready, it will be made default and this config option removed.")
 
-	f.Float64Var(&cfg.DefaultLimits.MaxIngestionRate, "ingester.instance-limits.max-ingestion-rate", 0, "Max ingestion rate (samples/sec) that ingester will accept. This limit is per-ingester, not per-tenant. Additional push requests will be rejected. Current ingestion rate is computed as exponentially weighted moving average, updated every second. This limit only works when using blocks engine. 0 = unlimited.")
-	f.Int64Var(&cfg.DefaultLimits.MaxInMemoryTenants, "ingester.instance-limits.max-tenants", 0, "Max users that this ingester can hold. Requests from additional users will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
-	f.Int64Var(&cfg.DefaultLimits.MaxInMemorySeries, "ingester.instance-limits.max-series", 0, "Max series that this ingester can hold (across all tenants). Requests to create additional series will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
-	f.Int64Var(&cfg.DefaultLimits.MaxInflightPushRequests, "ingester.instance-limits.max-inflight-push-requests", 0, "Max inflight push requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
+	f.BoolVar(&cfg.ActiveQueriedSeriesMetricsEnabled, "ingester.active-queried-series-metrics-enabled", false, "Enable tracking of active queried series using probabilistic data structure and export them as metrics.")
+	f.DurationVar(&cfg.ActiveQueriedSeriesMetricsUpdatePeriod, "ingester.active-queried-series-metrics-update-period", 1*time.Minute, "How often to update active queried series metrics.")
+	f.DurationVar(&cfg.ActiveQueriedSeriesMetricsWindowDuration, "ingester.active-queried-series-metrics-window-duration", 15*time.Minute, "Duration of each sub-window for active queried series tracking (e.g., 1 minute). Used to divide the total tracking period into smaller windows.")
+	f.Float64Var(&cfg.ActiveQueriedSeriesMetricsSampleRate, "ingester.active-queried-series-metrics-sample-rate", 1.0, "Sampling rate for active queried series tracking (1.0 = 100% sampling, 0.1 = 10% sampling). By default, all queries are sampled.")
+	cfg.ActiveQueriedSeriesMetricsWindows = cortex_tsdb.DurationList{2 * time.Hour}
+	f.Var(&cfg.ActiveQueriedSeriesMetricsWindows, "ingester.active-queried-series-metrics-windows", "Time windows to expose queried series metric. Each window tracks queried series within that time period.")
 
+	f.BoolVar(&cfg.HeadQueriedSeriesMetricsEnabled, "ingester.head-queried-series-metrics-enabled", false, "Experimental: Enable tracking of series queried from head only and expose them as metrics.")
+	f.DurationVar(&cfg.HeadQueriedSeriesMetricsWindowDuration, "ingester.head-queried-series-metrics-window-duration", 15*time.Minute, "Duration of each sub-window for head queried series tracking.")
+	f.Float64Var(&cfg.HeadQueriedSeriesMetricsSampleRate, "ingester.head-queried-series-metrics-sample-rate", 1.0, "Sampling rate for head queried series tracking (1.0 = 100%%).")
+	cfg.HeadQueriedSeriesMetricsWindows = cortex_tsdb.DurationList{2 * time.Hour}
+	f.Var(&cfg.HeadQueriedSeriesMetricsWindows, "ingester.head-queried-series-metrics-windows", "Time windows to expose head queried series metrics. Also controls how long per-metric-name cardinality is reported after last query.")
+
+	f.BoolVar(&cfg.UploadCompactedBlocksEnabled, "ingester.upload-compacted-blocks-enabled", true, "Enable uploading compacted blocks.")
 	f.StringVar(&cfg.IgnoreSeriesLimitForMetricNames, "ingester.ignore-series-limit-for-metric-names", "", "Comma-separated list of metric names, for which -ingester.max-series-per-metric and -ingester.max-global-series-per-metric limits will be ignored. Does not affect max-series-per-user or max-global-series-per-metric limits.")
+	f.StringVar(&cfg.AdminLimitMessage, "ingester.admin-limit-message", "please contact administrator to raise it", "Customize the message contained in limit errors")
+	f.BoolVar(&cfg.LabelsStringInterningEnabled, "ingester.labels-string-interning-enabled", false, "Experimental: Enable string interning for metrics labels.")
+
+	f.BoolVar(&cfg.DisableChunkTrimming, "ingester.disable-chunk-trimming", false, "Disable trimming of matching series chunks based on query Start and End time. When disabled, the result may contain samples outside the queried time range but select performances may be improved. Note that certain query results might change by changing this option.")
+	f.IntVar(&cfg.MatchersCacheMaxItems, "ingester.matchers-cache-max-items", 0, "Maximum number of entries in the regex matchers cache. 0 to disable.")
+	f.BoolVar(&cfg.SkipMetadataLimits, "ingester.skip-metadata-limits", true, "If enabled, the metadata API returns all metadata regardless of the limits.")
+	f.BoolVar(&cfg.EnableMatcherOptimization, "ingester.enable-matcher-optimization", false, "Enable optimization of label matchers when query chunks. When enabled, matchers with low selectivity such as =~.+ are applied lazily during series scanning instead of being used for postings matching.")
+	f.BoolVar(&cfg.EnableRegexMatcherLimits, "ingester.enable-regex-matcher-limits", false, "Enable regex matcher limits and metrics collection for unoptimized regex queries. When enabled, the ingester will track pattern length, label cardinality, and total value length for unoptimized regex matchers.")
+	cfg.DefaultLimits.RegisterFlagsWithPrefix(f, "ingester.")
+	cfg.QueryProtection.RegisterFlagsWithPrefix(f, "ingester.")
+}
+
+func (cfg *Config) Validate(monitoredResources flagext.StringSliceCSV) error {
+	if err := cfg.LifecyclerConfig.Validate(); err != nil {
+		return err
+	}
+
+	if cfg.LabelsStringInterningEnabled {
+		logutil.WarnExperimentalUse("String interning for metrics labels Enabled")
+	}
+
+	if err := cfg.QueryProtection.Validate(monitoredResources); err != nil {
+		return err
+	}
+
+	// Validate active queried series metrics windows
+	if cfg.ActiveQueriedSeriesMetricsEnabled {
+		if len(cfg.ActiveQueriedSeriesMetricsWindows) == 0 {
+			return fmt.Errorf("active queried series metrics windows must be configured when enabled")
+		}
+
+		// Validate window duration
+		if cfg.ActiveQueriedSeriesMetricsWindowDuration <= 0 {
+			return fmt.Errorf("active queried series metrics sub-window duration must be > 0, got %v", cfg.ActiveQueriedSeriesMetricsWindowDuration)
+		}
+
+		// Validate sample rate
+		if cfg.ActiveQueriedSeriesMetricsSampleRate <= 0 {
+			return fmt.Errorf("active queried series metrics sample rate must be > 0, got %v", cfg.ActiveQueriedSeriesMetricsSampleRate)
+		}
+		if cfg.ActiveQueriedSeriesMetricsSampleRate > 1.0 {
+			return fmt.Errorf("active queried series metrics sample rate must be <= 1.0, got %v", cfg.ActiveQueriedSeriesMetricsSampleRate)
+		}
+
+		for _, window := range cfg.ActiveQueriedSeriesMetricsWindows {
+			if window <= 0 {
+				return fmt.Errorf("active queried series metrics window duration must be > 0, got %v", window)
+			}
+
+			// Query window duration must be at least as large as the window duration.
+			if window < cfg.ActiveQueriedSeriesMetricsWindowDuration {
+				return fmt.Errorf("active queried series metrics window duration (%v) must be at least as large as sub-window duration (%v)", window, cfg.ActiveQueriedSeriesMetricsWindowDuration)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (cfg *Config) getIgnoreSeriesLimitForMetricNamesMap() map[string]struct{} {
@@ -146,7 +283,7 @@ func (cfg *Config) getIgnoreSeriesLimitForMetricNamesMap() map[string]struct{} {
 
 	result := map[string]struct{}{}
 
-	for _, s := range strings.Split(cfg.IgnoreSeriesLimitForMetricNames, ",") {
+	for s := range strings.SplitSeq(cfg.IgnoreSeriesLimitForMetricNames, ",") {
 		tr := strings.TrimSpace(s)
 		if tr != "" {
 			result[tr] = struct{}{}
@@ -165,153 +302,693 @@ func (cfg *Config) getIgnoreSeriesLimitForMetricNamesMap() map[string]struct{} {
 type Ingester struct {
 	*services.BasicService
 
-	cfg          Config
-	clientConfig client.Config
+	cfg Config
 
-	metrics *ingesterMetrics
-	logger  log.Logger
+	metrics         *ingesterMetrics
+	validateMetrics *validation.ValidateMetrics
 
-	chunkStore         ChunkStore
-	lifecycler         *ring.Lifecycler
-	limits             *validation.Overrides
-	limiter            *Limiter
-	subservicesWatcher *services.FailureWatcher
+	logger log.Logger
 
-	userStatesMtx sync.RWMutex // protects userStates and stopped
-	userStates    *userStates
-	stopped       bool // protected by userStatesMtx
+	lifecycler           *ring.Lifecycler
+	limits               *validation.Overrides
+	limiter              *Limiter
+	resourceBasedLimiter *limiter.ResourceBasedLimiter
+	subservicesWatcher   *services.FailureWatcher
+
+	stoppedMtx sync.RWMutex // protects stopped
+	stopped    bool         // protected by stoppedMtx
 
 	// For storing metadata ingested.
 	usersMetadataMtx sync.RWMutex
 	usersMetadata    map[string]*userMetricsMetadata
 
-	// One queue per flush thread.  Fingerprint is used to
-	// pick a queue.
-	flushQueues     []*util.PriorityQueue
-	flushQueuesDone sync.WaitGroup
-
-	// Spread out calls to the chunk store over the flush period
-	flushRateLimiter *rate.Limiter
-
-	// This should never be nil.
-	wal WAL
-	// To be passed to the WAL.
-	registerer prometheus.Registerer
-
-	// Hooks for injecting behaviour from tests.
-	preFlushUserSeries func()
-	preFlushChunks     func()
-
 	// Prometheus block storage
 	TSDBState TSDBState
 
 	// Rate of pushed samples. Only used by V2-ingester to limit global samples push rate.
-	ingestionRate        *util_math.EwmaRate
-	inflightPushRequests atomic.Int64
+	ingestionRate           *util_math.EwmaRate
+	inflightPushRequests    atomic.Int64
+	maxInflightPushRequests util_math.MaxTracker
+
+	inflightQueryRequests    atomic.Int64
+	maxInflightQueryRequests util_math.MaxTracker
+
+	matchersCache                storecache.MatchersCache
+	expandedPostingsCacheFactory *cortex_tsdb.ExpandedPostingsCacheFactory
+
+	activeQueriedSeriesService *ActiveQueriedSeriesService
 }
 
-// ChunkStore is the interface we need to store chunks
-type ChunkStore interface {
-	Put(ctx context.Context, chunks []cortex_chunk.Chunk) error
+// Shipper interface is used to have an easy way to mock it in tests.
+type Shipper interface {
+	Sync(ctx context.Context) (uploaded int, err error)
+	Close() error
 }
 
-// New constructs a new Ingester.
-func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, chunkStore ChunkStore, registerer prometheus.Registerer, logger log.Logger) (*Ingester, error) {
+type tsdbState int
+
+const (
+	active          tsdbState = iota // Pushes are allowed.
+	activeShipping                   // Pushes are allowed. Blocks shipping is in progress.
+	forceCompacting                  // TSDB is being force-compacted.
+	closing                          // Used while closing idle TSDB.
+	closed                           // Used to avoid setting closing back to active in closeAndDeleteIdleUsers method.
+)
+
+// Describes result of TSDB-close check. String is used as metric label.
+type tsdbCloseCheckResult string
+
+const (
+	tsdbIdle                    tsdbCloseCheckResult = "idle" // Not reported via metrics. Metrics use tsdbIdleClosed on success.
+	tsdbShippingDisabled        tsdbCloseCheckResult = "shipping_disabled"
+	tsdbNotIdle                 tsdbCloseCheckResult = "not_idle"
+	tsdbNotCompacted            tsdbCloseCheckResult = "not_compacted"
+	tsdbNotShipped              tsdbCloseCheckResult = "not_shipped"
+	tsdbCheckFailed             tsdbCloseCheckResult = "check_failed"
+	tsdbCloseFailed             tsdbCloseCheckResult = "close_failed"
+	tsdbNotActive               tsdbCloseCheckResult = "not_active"
+	tsdbDataRemovalFailed       tsdbCloseCheckResult = "data_removal_failed"
+	tsdbTenantMarkedForDeletion tsdbCloseCheckResult = "tenant_marked_for_deletion"
+	tsdbIdleClosed              tsdbCloseCheckResult = "idle_closed" // Success.
+)
+
+func (r tsdbCloseCheckResult) shouldClose() bool {
+	return r == tsdbIdle || r == tsdbTenantMarkedForDeletion
+}
+
+type userTSDB struct {
+	db                  *tsdb.DB
+	userID              string
+	logger              log.Logger
+	activeSeries        *ActiveSeries
+	activeQueriedSeries *ActiveQueriedSeries
+	headQueriedSeries   *ActiveQueriedSeries
+	seriesInMetric      *metricCounter
+	labelSetCounter     *labelSetCounter
+	limiter             *Limiter
+
+	instanceSeriesCount *atomic.Int64 // Shared across all userTSDB instances created by ingester.
+	instanceLimitsFn    func() *InstanceLimits
+
+	stateMtx       sync.RWMutex
+	state          tsdbState
+	pushesInFlight sync.WaitGroup // Increased with stateMtx read lock held, only if state == active or activeShipping.
+	readInFlight   sync.WaitGroup // Increased with stateMtx read lock held, only if state == active, activeShipping or forceCompacting.
+
+	// Used to detect idle TSDBs.
+	lastUpdate atomic.Int64
+
+	// Thanos shipper used to ship blocks to the storage.
+	shipper                 Shipper
+	shipperMetadataFilePath string
+
+	// When deletion marker is found for the tenant (checked before shipping),
+	// shipping stops and TSDB is closed before reaching idle timeout time (if enabled).
+	deletionMarkFound atomic.Bool
+
+	// Unix timestamp of last deletion mark check.
+	lastDeletionMarkCheck atomic.Int64
+
+	// for statistics
+	ingestedAPISamples  *util_math.EwmaRate
+	ingestedRuleSamples *util_math.EwmaRate
+
+	// Cached shipped blocks.
+	shippedBlocksMtx sync.Mutex
+	shippedBlocks    map[ulid.ULID]struct{}
+
+	// Used to dedup strings and keep a single reference in memory
+	labelsStringInterningEnabled bool
+	interner                     util.Interner
+
+	blockRetentionPeriod int64
+
+	postingCache cortex_tsdb.ExpandedPostingsCache
+
+	// Tracks active series per configured tracker pattern.
+	trackerCounter *trackerCounter
+}
+
+// Explicitly wrapping the tsdb.DB functions that we use.
+
+func (u *userTSDB) Appender(ctx context.Context) storage.Appender {
+	return u.db.Appender(ctx)
+}
+
+func (u *userTSDB) Querier(mint, maxt int64) (storage.Querier, error) {
+	return u.db.Querier(mint, maxt)
+}
+
+func (u *userTSDB) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
+	return u.db.ChunkQuerier(mint, maxt)
+}
+
+func (u *userTSDB) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	return u.db.ExemplarQuerier(ctx)
+}
+
+func (u *userTSDB) Head() *tsdb.Head {
+	return u.db.Head()
+}
+
+func (u *userTSDB) Blocks() []*tsdb.Block {
+	return u.db.Blocks()
+}
+
+func (u *userTSDB) Close() error {
+	if u.shipper != nil {
+		if err := u.shipper.Close(); err != nil {
+			level.Warn(u.logger).Log("msg", "failed to close shipper", "err", err)
+		}
+	}
+	return u.db.Close()
+}
+
+func (u *userTSDB) Compact(ctx context.Context) error {
+	return u.db.Compact(ctx)
+}
+
+func (u *userTSDB) StartTime() (int64, error) {
+	return u.db.StartTime()
+}
+
+func (u *userTSDB) casState(from, to tsdbState) (bool, tsdbState) {
+	u.stateMtx.Lock()
+	defer u.stateMtx.Unlock()
+
+	if u.state != from {
+		return false, u.state
+	}
+	u.state = to
+	return true, u.state
+}
+
+// compactHead compacts the Head block at specified block durations avoiding a single huge block.
+func (u *userTSDB) compactHead(ctx context.Context, blockDuration int64) error {
+	if success, state := u.casState(active, forceCompacting); !success {
+		if state == activeShipping {
+			return errTsdbShipping
+		}
+		return fmt.Errorf("TSDB head cannot be compacted because it is not in active state (state: %d)", state)
+	}
+
+	defer u.casState(forceCompacting, active)
+
+	// Ingestion of samples in parallel with forced compaction can lead to overlapping blocks,
+	// and possible invalidation of the references returned from Appender.GetRef().
+	// So we wait for existing in-flight requests to finish. Future push requests would fail until compaction is over.
+	u.pushesInFlight.Wait()
+
+	h := u.Head()
+
+	minTime, maxTime := h.MinTime(), h.MaxTime()
+
+	for (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
+		// Data in Head spans across multiple block ranges, so we break it into blocks here.
+		// Block max time is exclusive, so we do a -1 here.
+		blockMaxTime := ((minTime/blockDuration)+1)*blockDuration - 1
+		if err := u.db.CompactHead(tsdb.NewRangeHead(h, minTime, blockMaxTime)); err != nil {
+			return err
+		}
+
+		// Get current min/max times after compaction.
+		minTime, maxTime = h.MinTime(), h.MaxTime()
+	}
+
+	if err := u.db.CompactHead(tsdb.NewRangeHead(h, minTime, maxTime)); err != nil {
+		return err
+	}
+	return u.db.CompactOOOHead(ctx)
+}
+
+// PreCreation implements SeriesLifecycleCallback interface.
+func (u *userTSDB) PreCreation(metric labels.Labels) error {
+	if u.limiter == nil {
+		return nil
+	}
+
+	// Verify ingester's global limit
+	gl := u.instanceLimitsFn()
+	if gl != nil && gl.MaxInMemorySeries > 0 {
+		if series := u.instanceSeriesCount.Load(); series >= gl.MaxInMemorySeries {
+			return errMaxSeriesLimitReached
+		}
+	}
+
+	// Total series limit.
+	if err := u.limiter.AssertMaxSeriesPerUser(u.userID, int(u.Head().NumSeries())); err != nil {
+		return err
+	}
+
+	// Total native histogram series limit.
+	if err := u.limiter.AssertMaxNativeHistogramSeriesPerUser(u.userID, u.activeSeries.ActiveNativeHistogram()); err != nil {
+		return err
+	}
+
+	// Series per metric name limit.
+	metricName, err := extract.MetricNameFromLabels(metric)
+	if err != nil {
+		return err
+	}
+	if err := u.seriesInMetric.canAddSeriesFor(u.userID, metricName); err != nil {
+		return err
+	}
+
+	if err := u.labelSetCounter.canAddSeriesForLabelSet(context.TODO(), u, metric); err != nil {
+		return err
+	}
+
+	if u.labelsStringInterningEnabled {
+		metric.InternStrings(u.interner.Intern)
+	}
+
+	return nil
+}
+
+// PostCreation implements SeriesLifecycleCallback interface.
+func (u *userTSDB) PostCreation(metric labels.Labels) {
+	u.instanceSeriesCount.Inc()
+
+	metricName, err := extract.MetricNameFromLabels(metric)
+	if err != nil {
+		// This should never happen because it has already been checked in PreCreation().
+		return
+	}
+	u.seriesInMetric.increaseSeriesForMetric(metricName)
+	u.labelSetCounter.increaseSeriesLabelSet(u, metric)
+	u.trackerCounter.increase(metric)
+
+	// Expiring here is only safe because the head adds the series to the postings before invoking
+	// this callback (prometheus/prometheus#15579); preserve that ordering when upgrading Prometheus.
+	if u.postingCache != nil {
+		u.postingCache.ExpireSeries(metric)
+	}
+}
+
+// PostDeletion implements SeriesLifecycleCallback interface.
+func (u *userTSDB) PostDeletion(metrics map[chunks.HeadSeriesRef]labels.Labels) {
+	u.instanceSeriesCount.Sub(int64(len(metrics)))
+
+	for _, metric := range metrics {
+		metricName, err := extract.MetricNameFromLabels(metric)
+		if err != nil {
+			// This should never happen because it has already been checked in PreCreation().
+			continue
+		}
+		u.seriesInMetric.decreaseSeriesForMetric(metricName)
+		u.labelSetCounter.decreaseSeriesLabelSet(u, metric)
+		u.trackerCounter.decrease(metric)
+		if u.postingCache != nil {
+			u.postingCache.ExpireSeries(metric)
+		}
+	}
+}
+
+// blocksToDelete filters the input blocks and returns the blocks which are safe to be deleted from the ingester.
+func (u *userTSDB) blocksToDelete(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
+	if u.db == nil {
+		return nil
+	}
+	deletable := tsdb.DefaultBlocksToDelete(u.db)(blocks)
+
+	now := time.Now().UnixMilli()
+	for _, b := range blocks {
+		if now-b.MaxTime() >= u.blockRetentionPeriod {
+			deletable[b.Meta().ULID] = struct{}{}
+		}
+	}
+
+	if u.shipper == nil {
+		return deletable
+	}
+
+	shippedBlocks := u.getCachedShippedBlocks()
+
+	result := map[ulid.ULID]struct{}{}
+	for shippedID := range shippedBlocks {
+		if _, ok := deletable[shippedID]; ok {
+			result[shippedID] = struct{}{}
+		}
+	}
+	return result
+}
+
+// updateCachedShippedBlocks reads the shipper meta file and updates the cached shipped blocks.
+func (u *userTSDB) updateCachedShippedBlocks() error {
+	shipperMeta, err := shipper.ReadMetaFile(u.shipperMetadataFilePath)
+	if os.IsNotExist(err) || os.IsNotExist(errors.Cause(err)) {
+		// If the meta file doesn't exist it means the shipper hasn't run yet.
+		shipperMeta = &shipper.Meta{}
+	} else if err != nil {
+		return err
+	}
+
+	// Build a map.
+	shippedBlocks := make(map[ulid.ULID]struct{}, len(shipperMeta.Uploaded))
+	for _, blockID := range shipperMeta.Uploaded {
+		shippedBlocks[blockID] = struct{}{}
+	}
+
+	// Cache it.
+	u.shippedBlocksMtx.Lock()
+	u.shippedBlocks = shippedBlocks
+	u.shippedBlocksMtx.Unlock()
+
+	return nil
+}
+
+// getCachedShippedBlocks returns the cached shipped blocks.
+func (u *userTSDB) getCachedShippedBlocks() map[ulid.ULID]struct{} {
+	u.shippedBlocksMtx.Lock()
+	defer u.shippedBlocksMtx.Unlock()
+
+	// It's safe to directly return the map because it's never updated in-place.
+	return u.shippedBlocks
+}
+
+// getOldestUnshippedBlockTime returns the unix timestamp with milliseconds precision of the oldest
+// TSDB block not shipped to the storage yet, or 0 if all blocks have been shipped.
+func (u *userTSDB) getOldestUnshippedBlockTime() uint64 {
+	shippedBlocks := u.getCachedShippedBlocks()
+	oldestTs := uint64(0)
+
+	for _, b := range u.Blocks() {
+		if _, ok := shippedBlocks[b.Meta().ULID]; ok {
+			continue
+		}
+
+		if oldestTs == 0 || b.Meta().ULID.Time() < oldestTs {
+			oldestTs = b.Meta().ULID.Time()
+		}
+	}
+
+	return oldestTs
+}
+
+func (u *userTSDB) isIdle(now time.Time, idle time.Duration) bool {
+	lu := u.lastUpdate.Load()
+
+	return time.Unix(lu, 0).Add(idle).Before(now)
+}
+
+func (u *userTSDB) setLastUpdate(t time.Time) {
+	u.lastUpdate.Store(t.Unix())
+}
+
+// Checks if TSDB can be closed.
+func (u *userTSDB) shouldCloseTSDB(idleTimeout time.Duration) tsdbCloseCheckResult {
+	if u.deletionMarkFound.Load() {
+		return tsdbTenantMarkedForDeletion
+	}
+
+	if !u.isIdle(time.Now(), idleTimeout) {
+		return tsdbNotIdle
+	}
+
+	// If head is not compacted, we cannot close this yet.
+	if u.Head().NumSeries() > 0 {
+		return tsdbNotCompacted
+	}
+
+	// Ensure that all blocks have been shipped.
+	if oldest := u.getOldestUnshippedBlockTime(); oldest > 0 {
+		return tsdbNotShipped
+	}
+
+	return tsdbIdle
+}
+
+// TSDBState holds data structures used by the TSDB storage engine
+type TSDBState struct {
+	dbs    map[string]*userTSDB // tsdb sharded by userID
+	bucket objstore.Bucket
+
+	// Value used by shipper as external label.
+	shipperIngesterID string
+
+	subservices *services.Manager
+
+	tsdbMetrics *tsdbMetrics
+
+	forceCompactTrigger chan requestWithUsersAndCallback
+	shipTrigger         chan requestWithUsersAndCallback
+
+	// Timeout chosen for idle compactions.
+	compactionIdleTimeout time.Duration
+
+	// Number of series in memory, across all tenants.
+	seriesCount atomic.Int64
+
+	// Head compactions metrics.
+	compactionsTriggered   prometheus.Counter
+	compactionsFailed      prometheus.Counter
+	walReplayTime          prometheus.Histogram
+	appenderAddDuration    prometheus.Histogram
+	appenderCommitDuration prometheus.Histogram
+	idleTsdbChecks         *prometheus.CounterVec
+}
+
+type requestWithUsersAndCallback struct {
+	users    *users.AllowedTenants // if nil, all tenants are allowed.
+	callback chan<- struct{}       // when compaction/shipping is finished, this channel is closed
+}
+
+func newTSDBState(bucketClient objstore.Bucket, registerer prometheus.Registerer) TSDBState {
+	idleTsdbChecks := promauto.With(registerer).NewCounterVec(prometheus.CounterOpts{
+		Name: "cortex_ingester_idle_tsdb_checks_total",
+		Help: "The total number of various results for idle TSDB checks.",
+	}, []string{"result"})
+
+	idleTsdbChecks.WithLabelValues(string(tsdbShippingDisabled))
+	idleTsdbChecks.WithLabelValues(string(tsdbNotIdle))
+	idleTsdbChecks.WithLabelValues(string(tsdbNotCompacted))
+	idleTsdbChecks.WithLabelValues(string(tsdbNotShipped))
+	idleTsdbChecks.WithLabelValues(string(tsdbCheckFailed))
+	idleTsdbChecks.WithLabelValues(string(tsdbCloseFailed))
+	idleTsdbChecks.WithLabelValues(string(tsdbNotActive))
+	idleTsdbChecks.WithLabelValues(string(tsdbDataRemovalFailed))
+	idleTsdbChecks.WithLabelValues(string(tsdbTenantMarkedForDeletion))
+	idleTsdbChecks.WithLabelValues(string(tsdbIdleClosed))
+
+	return TSDBState{
+		dbs:                 make(map[string]*userTSDB),
+		bucket:              bucketClient,
+		tsdbMetrics:         newTSDBMetrics(registerer),
+		forceCompactTrigger: make(chan requestWithUsersAndCallback),
+		shipTrigger:         make(chan requestWithUsersAndCallback),
+
+		compactionsTriggered: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+			Name: "cortex_ingester_tsdb_compactions_triggered_total",
+			Help: "Total number of triggered compactions.",
+		}),
+
+		compactionsFailed: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+			Name: "cortex_ingester_tsdb_compactions_failed_total",
+			Help: "Total number of compactions that failed.",
+		}),
+		walReplayTime: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
+			Name:                            "cortex_ingester_tsdb_wal_replay_duration_seconds",
+			Help:                            "The total time it takes to open and replay a TSDB WAL.",
+			Buckets:                         prometheus.DefBuckets,
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
+		}),
+		appenderAddDuration: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
+			Name:                            "cortex_ingester_tsdb_appender_add_duration_seconds",
+			Help:                            "The total time it takes for a push request to add samples to the TSDB appender.",
+			Buckets:                         []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
+		}),
+		appenderCommitDuration: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
+			Name:                            "cortex_ingester_tsdb_appender_commit_duration_seconds",
+			Help:                            "The total time it takes for a push request to commit samples appended to TSDB.",
+			Buckets:                         []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
+		}),
+
+		idleTsdbChecks: idleTsdbChecks,
+	}
+}
+
+// New returns a new Ingester that uses Cortex block storage instead of chunks storage.
+func New(cfg Config, limits *validation.Overrides, registerer prometheus.Registerer, logger log.Logger, resourceMonitor *resource.Monitor) (*Ingester, error) {
 	defaultInstanceLimits = &cfg.DefaultLimits
-
 	if cfg.ingesterClientFactory == nil {
 		cfg.ingesterClientFactory = client.MakeIngesterClient
 	}
 
-	if cfg.BlocksStorageEnabled {
-		return NewV2(cfg, clientConfig, limits, registerer, logger)
+	bucketClient, err := bucket.NewClient(context.Background(), cfg.BlocksStorageConfig.Bucket, nil, "ingester", logger, registerer)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create the bucket client")
 	}
 
-	if cfg.WALConfig.WALEnabled {
-		// If WAL is enabled, we don't transfer out the data to any ingester.
-		// Either the next ingester which takes it's place should recover from WAL
-		// or the data has to be flushed during scaledown.
-		cfg.MaxTransferRetries = 0
-
-		// Transfers are disabled with WAL, hence no need to wait for transfers.
-		cfg.LifecyclerConfig.JoinAfter = 0
-
-		recordPool = sync.Pool{
-			New: func() interface{} {
-				return &WALRecord{}
-			},
-		}
+	i := &Ingester{
+		cfg:                          cfg,
+		limits:                       limits,
+		usersMetadata:                map[string]*userMetricsMetadata{},
+		TSDBState:                    newTSDBState(bucketClient, registerer),
+		logger:                       logger,
+		ingestionRate:                util_math.NewEWMARate(0.2, instanceIngestionRateTickInterval),
+		expandedPostingsCacheFactory: cortex_tsdb.NewExpandedPostingsCacheFactory(cfg.BlocksStorageConfig.TSDB.PostingsCache),
+		matchersCache:                storecache.NoopMatchersCache,
 	}
 
-	if cfg.WALConfig.WALEnabled || cfg.WALConfig.Recover {
-		if err := os.MkdirAll(cfg.WALConfig.Dir, os.ModePerm); err != nil {
+	if cfg.BlocksStorageConfig.TSDB.MaxExemplars != 0 {
+		flagext.DeprecatedFlagsUsed.Inc()
+		level.Warn(logger).Log("msg", "running with DEPRECATED flag blocks-storage.tsdb.max-exemplars, use the per-tenant max_exemplars limit instead")
+	}
+
+	if cfg.ActiveQueriedSeriesMetricsEnabled || cfg.HeadQueriedSeriesMetricsEnabled {
+		i.activeQueriedSeriesService = NewActiveQueriedSeriesService(logger, registerer)
+	}
+
+	if cfg.MatchersCacheMaxItems > 0 {
+		r := prometheus.NewRegistry()
+		registerer.MustRegister(cortex_tsdb.NewMatchCacheMetrics("cortex_ingester", r, logger))
+		i.matchersCache, err = storecache.NewMatchersCache(storecache.WithSize(cfg.MatchersCacheMaxItems), storecache.WithPromRegistry(r))
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	i := &Ingester{
-		cfg:          cfg,
-		clientConfig: clientConfig,
+	i.metrics = newIngesterMetrics(registerer,
+		false,
+		cfg.ActiveSeriesMetricsEnabled,
+		cfg.ActiveQueriedSeriesMetricsEnabled,
+		cfg.HeadQueriedSeriesMetricsEnabled,
+		i.getInstanceLimits,
+		i.ingestionRate,
+		&i.maxInflightPushRequests,
+		&i.maxInflightQueryRequests,
+		cfg.BlocksStorageConfig.TSDB.PostingsCache.Blocks.Enabled || cfg.BlocksStorageConfig.TSDB.PostingsCache.Head.Enabled,
+		cfg.EnableRegexMatcherLimits)
+	i.validateMetrics = validation.NewValidateMetrics(registerer)
 
-		limits:           limits,
-		chunkStore:       chunkStore,
-		flushQueues:      make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
-		flushRateLimiter: rate.NewLimiter(rate.Inf, 1),
-		usersMetadata:    map[string]*userMetricsMetadata{},
-		registerer:       registerer,
-		logger:           logger,
+	// Replace specific metrics which we can't directly track but we need to read
+	// them from the underlying system (ie. TSDB).
+	if registerer != nil {
+		registerer.Unregister(i.metrics.memSeries)
+
+		promauto.With(registerer).NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "cortex_ingester_memory_series",
+			Help: "The current number of series in memory.",
+		}, i.getMemorySeriesMetric)
+
+		promauto.With(registerer).NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "cortex_ingester_oldest_unshipped_block_timestamp_seconds",
+			Help: "Unix timestamp of the oldest TSDB block not shipped to the storage yet. 0 if ingester has no blocks or all blocks have been shipped.",
+		}, i.getOldestUnshippedBlockMetric)
 	}
-	i.metrics = newIngesterMetrics(registerer, true, cfg.ActiveSeriesMetricsEnabled, i.getInstanceLimits, nil, &i.inflightPushRequests)
 
-	var err error
-	// During WAL recovery, it will create new user states which requires the limiter.
-	// Hence initialise the limiter before creating the WAL.
-	// The '!cfg.WALConfig.WALEnabled' argument says don't flush on shutdown if the WAL is enabled.
-	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester", ring.IngesterRingKey, !cfg.WALConfig.WALEnabled || cfg.WALConfig.FlushOnShutdown, logger, prometheus.WrapRegistererWithPrefix("cortex_", registerer))
+	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester", RingKey, false, cfg.BlocksStorageConfig.TSDB.FlushBlocksOnShutdown, logger, prometheus.WrapRegistererWithPrefix("cortex_", registerer))
 	if err != nil {
 		return nil, err
 	}
+	i.subservicesWatcher = services.NewFailureWatcher()
+	i.subservicesWatcher.WatchService(i.lifecycler)
 
+	// Init the limter and instantiate the user states which depend on it
 	i.limiter = NewLimiter(
 		limits,
 		i.lifecycler,
 		cfg.DistributorShardingStrategy,
 		cfg.DistributorShardByAllLabels,
 		cfg.LifecyclerConfig.RingConfig.ReplicationFactor,
-		cfg.LifecyclerConfig.RingConfig.ZoneAwarenessEnabled)
+		cfg.LifecyclerConfig.RingConfig.ZoneAwarenessEnabled,
+		cfg.AdminLimitMessage,
+	)
 
-	i.subservicesWatcher = services.NewFailureWatcher()
-	i.subservicesWatcher.WatchService(i.lifecycler)
+	i.TSDBState.shipperIngesterID = i.lifecycler.ID
 
-	i.BasicService = services.NewBasicService(i.starting, i.loop, i.stopping)
+	// Apply positive jitter only to ensure that the minimum timeout is adhered to.
+	i.TSDBState.compactionIdleTimeout = util.DurationWithPositiveJitter(i.cfg.BlocksStorageConfig.TSDB.HeadCompactionIdleTimeout, compactionIdleTimeoutJitter)
+	level.Info(i.logger).Log("msg", "TSDB idle compaction timeout set", "timeout", i.TSDBState.compactionIdleTimeout)
+
+	if resourceMonitor != nil {
+		resourceLimits := make(map[resource.Type]float64)
+		if cfg.QueryProtection.Rejection.Threshold.CPUUtilization > 0 {
+			resourceLimits[resource.CPU] = cfg.QueryProtection.Rejection.Threshold.CPUUtilization
+		}
+		if cfg.QueryProtection.Rejection.Threshold.HeapUtilization > 0 {
+			resourceLimits[resource.Heap] = cfg.QueryProtection.Rejection.Threshold.HeapUtilization
+		}
+		i.resourceBasedLimiter, err = limiter.NewResourceBasedLimiter(resourceMonitor, resourceLimits, registerer, "ingester")
+		if err != nil {
+			return nil, errors.Wrap(err, "error creating resource based limiter")
+		}
+	}
+
+	i.BasicService = services.NewBasicService(i.starting, i.updateLoop, i.stopping)
 	return i, nil
 }
 
-func (i *Ingester) starting(ctx context.Context) error {
-	if i.cfg.WALConfig.Recover {
-		level.Info(i.logger).Log("msg", "recovering from WAL")
-		start := time.Now()
-		if err := recoverFromWAL(i); err != nil {
-			level.Error(i.logger).Log("msg", "failed to recover from WAL", "time", time.Since(start).String())
-			return errors.Wrap(err, "failed to recover from WAL")
-		}
-		elapsed := time.Since(start)
-		level.Info(i.logger).Log("msg", "recovery from WAL completed", "time", elapsed.String())
-		i.metrics.walReplayDuration.Set(elapsed.Seconds())
-	}
-
-	// If the WAL recover happened, then the userStates would already be set.
-	if i.userStates == nil {
-		i.userStates = newUserStates(i.limiter, i.cfg, i.metrics, i.logger)
-	}
-
-	var err error
-	i.wal, err = newWAL(i.cfg.WALConfig, i.userStates.cp, i.registerer, i.logger)
+// NewForFlusher constructs a new Ingester to be used by flusher target.
+// Compared to the 'New' method:
+//   - Always replays the WAL.
+//   - Does not start the lifecycler.
+//
+// this is a special version of ingester used by Flusher. This ingester is not ingesting anything, its only purpose is to react
+// on Flush method and flush all opened TSDBs when called.
+func NewForFlusher(cfg Config, limits *validation.Overrides, registerer prometheus.Registerer, logger log.Logger) (*Ingester, error) {
+	bucketClient, err := bucket.NewClient(context.Background(), cfg.BlocksStorageConfig.Bucket, nil, "ingester", logger, registerer)
 	if err != nil {
-		return errors.Wrap(err, "starting WAL")
+		return nil, errors.Wrap(err, "failed to create the bucket client")
 	}
 
-	// Now that user states have been created, we can start the lifecycler.
+	i := &Ingester{
+		cfg:       cfg,
+		limits:    limits,
+		TSDBState: newTSDBState(bucketClient, registerer),
+		logger:    logger,
+	}
+	i.limiter = NewLimiter(
+		limits,
+		i.lifecycler,
+		cfg.DistributorShardingStrategy,
+		cfg.DistributorShardByAllLabels,
+		cfg.LifecyclerConfig.RingConfig.ReplicationFactor,
+		cfg.LifecyclerConfig.RingConfig.ZoneAwarenessEnabled,
+		cfg.AdminLimitMessage,
+	)
+	i.metrics = newIngesterMetrics(registerer,
+		false,
+		false,
+		false,
+		false,
+		i.getInstanceLimits,
+		nil,
+		&i.maxInflightPushRequests,
+		&i.maxInflightQueryRequests,
+		cfg.BlocksStorageConfig.TSDB.PostingsCache.Blocks.Enabled || cfg.BlocksStorageConfig.TSDB.PostingsCache.Head.Enabled,
+		cfg.EnableRegexMatcherLimits,
+	)
+
+	i.TSDBState.shipperIngesterID = "flusher"
+
+	// This ingester will not start any subservices (lifecycler, compaction, shipping),
+	// and will only open TSDBs, wait for Flush to be called, and then close TSDBs again.
+	i.BasicService = services.NewIdleService(i.startingV2ForFlusher, i.stoppingV2ForFlusher)
+	return i, nil
+}
+
+func (i *Ingester) startingV2ForFlusher(ctx context.Context) error {
+	if err := i.openExistingTSDB(ctx); err != nil {
+		// Try to rollback and close opened TSDBs before halting the ingester.
+		i.closeAllTSDB()
+
+		return errors.Wrap(err, "opening existing TSDBs")
+	}
+
+	// Don't start any sub-services (lifecycler, compaction, shipper) at all.
+	return nil
+}
+
+func (i *Ingester) starting(ctx context.Context) error {
 	// Important: we want to keep lifecycler running until we ask it to stop, so we need to give it independent context
 	if err := i.lifecycler.StartAsync(context.Background()); err != nil {
 		return errors.Wrap(err, "failed to start lifecycler")
@@ -320,82 +997,94 @@ func (i *Ingester) starting(ctx context.Context) error {
 		return errors.Wrap(err, "failed to start lifecycler")
 	}
 
-	i.startFlushLoops()
+	if err := i.openExistingTSDB(ctx); err != nil {
+		// Try to rollback and close opened TSDBs before halting the ingester.
+		i.closeAllTSDB()
 
-	return nil
-}
-
-func (i *Ingester) startFlushLoops() {
-	i.flushQueuesDone.Add(i.cfg.ConcurrentFlushes)
-	for j := 0; j < i.cfg.ConcurrentFlushes; j++ {
-		i.flushQueues[j] = util.NewPriorityQueue(i.metrics.flushQueueLength)
-		go i.flushLoop(j)
-	}
-}
-
-// NewForFlusher constructs a new Ingester to be used by flusher target.
-// Compared to the 'New' method:
-//   * Always replays the WAL.
-//   * Does not start the lifecycler.
-func NewForFlusher(cfg Config, chunkStore ChunkStore, limits *validation.Overrides, registerer prometheus.Registerer, logger log.Logger) (*Ingester, error) {
-	if cfg.BlocksStorageEnabled {
-		return NewV2ForFlusher(cfg, limits, registerer, logger)
+		return errors.Wrap(err, "opening existing TSDBs")
 	}
 
-	i := &Ingester{
-		cfg:              cfg,
-		chunkStore:       chunkStore,
-		flushQueues:      make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
-		flushRateLimiter: rate.NewLimiter(rate.Inf, 1),
-		wal:              &noopWAL{},
-		limits:           limits,
-		logger:           logger,
+	i.lifecycler.Join()
+
+	// let's start the rest of subservices via manager
+	servs := []services.Service(nil)
+
+	// Start active queried series service if enabled
+	if i.activeQueriedSeriesService != nil {
+		servs = append(servs, i.activeQueriedSeriesService)
 	}
-	i.metrics = newIngesterMetrics(registerer, true, false, i.getInstanceLimits, nil, &i.inflightPushRequests)
 
-	i.BasicService = services.NewBasicService(i.startingForFlusher, i.loopForFlusher, i.stopping)
-	return i, nil
-}
+	compactionService := services.NewBasicService(nil, i.compactionLoop, nil)
+	servs = append(servs, compactionService)
 
-func (i *Ingester) startingForFlusher(ctx context.Context) error {
-	level.Info(i.logger).Log("msg", "recovering from WAL")
-
-	// We recover from WAL always.
-	start := time.Now()
-	if err := recoverFromWAL(i); err != nil {
-		level.Error(i.logger).Log("msg", "failed to recover from WAL", "time", time.Since(start).String())
-		return err
+	if i.cfg.BlocksStorageConfig.TSDB.IsBlocksShippingEnabled() {
+		shippingService := services.NewBasicService(nil, i.shipBlocksLoop, nil)
+		servs = append(servs, shippingService)
 	}
-	elapsed := time.Since(start)
 
-	level.Info(i.logger).Log("msg", "recovery from WAL completed", "time", elapsed.String())
-	i.metrics.walReplayDuration.Set(elapsed.Seconds())
-
-	i.startFlushLoops()
-	return nil
-}
-
-func (i *Ingester) loopForFlusher(ctx context.Context) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-
-		case err := <-i.subservicesWatcher.Chan():
-			return errors.Wrap(err, "ingester subservice failed")
+	if i.cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBTimeout > 0 {
+		interval := i.cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBInterval
+		if interval == 0 {
+			interval = cortex_tsdb.DefaultCloseIdleTSDBInterval
 		}
+		closeIdleService := services.NewTimerService(interval, nil, i.closeAndDeleteIdleUserTSDBs, nil)
+		servs = append(servs, closeIdleService)
 	}
+
+	if i.expandedPostingsCacheFactory != nil {
+		interval := i.cfg.BlocksStorageConfig.TSDB.ExpandedCachingExpireInterval
+		if interval == 0 {
+			interval = cortex_tsdb.ExpandedCachingExpireInterval
+		}
+		servs = append(servs, services.NewTimerService(interval, nil, i.expirePostingsCache, nil))
+	}
+
+	var err error
+	i.TSDBState.subservices, err = services.NewManager(servs...)
+	if err == nil {
+		err = services.StartManagerAndAwaitHealthy(ctx, i.TSDBState.subservices)
+	}
+	return errors.Wrap(err, "failed to start ingester components")
 }
 
-func (i *Ingester) loop(ctx context.Context) error {
-	flushTicker := time.NewTicker(i.cfg.FlushCheckPeriod)
-	defer flushTicker.Stop()
+func (i *Ingester) stoppingV2ForFlusher(_ error) error {
+	if !i.cfg.BlocksStorageConfig.TSDB.KeepUserTSDBOpenOnShutdown {
+		i.closeAllTSDB()
+	}
+	return nil
+}
 
+// runs when ingester is stopping
+func (i *Ingester) stopping(_ error) error {
+	// This will prevent us accepting any more samples
+	i.stopIncomingRequests()
+	// It's important to wait until shipper is finished,
+	// because the blocks transfer should start only once it's guaranteed
+	// there's no shipping on-going.
+	if err := services.StopManagerAndAwaitStopped(context.Background(), i.TSDBState.subservices); err != nil {
+		level.Warn(i.logger).Log("msg", "failed to stop ingester subservices", "err", err)
+	}
+
+	// Next initiate our graceful exit from the ring.
+	if err := services.StopAndAwaitTerminated(context.Background(), i.lifecycler); err != nil {
+		level.Warn(i.logger).Log("msg", "failed to stop ingester lifecycler", "err", err)
+	}
+
+	if !i.cfg.BlocksStorageConfig.TSDB.KeepUserTSDBOpenOnShutdown {
+		i.closeAllTSDB()
+	}
+	return nil
+}
+
+func (i *Ingester) updateLoop(ctx context.Context) error {
 	rateUpdateTicker := time.NewTicker(i.cfg.RateUpdatePeriod)
 	defer rateUpdateTicker.Stop()
 
-	metadataPurgeTicker := time.NewTicker(metadataPurgePeriod)
-	defer metadataPurgeTicker.Stop()
+	userTSDBConfigTicker := time.NewTicker(i.cfg.UserTSDBConfigsUpdatePeriod)
+	defer userTSDBConfigTicker.Stop()
+
+	ingestionRateTicker := time.NewTicker(instanceIngestionRateTickInterval)
+	defer ingestionRateTicker.Stop()
 
 	var activeSeriesTickerChan <-chan time.Time
 	if i.cfg.ActiveSeriesMetricsEnabled {
@@ -404,49 +1093,205 @@ func (i *Ingester) loop(ctx context.Context) error {
 		defer t.Stop()
 	}
 
+	var activeQueriedSeriesTickerChan <-chan time.Time
+	if i.cfg.ActiveQueriedSeriesMetricsEnabled {
+		t := time.NewTicker(i.cfg.ActiveQueriedSeriesMetricsUpdatePeriod)
+		activeQueriedSeriesTickerChan = t.C
+		defer t.Stop()
+	}
+
+	var headQueriedSeriesTickerChan <-chan time.Time
+	if i.cfg.HeadQueriedSeriesMetricsEnabled {
+		t := time.NewTicker(i.cfg.ActiveQueriedSeriesMetricsUpdatePeriod)
+		headQueriedSeriesTickerChan = t.C
+		defer t.Stop()
+	}
+
+	// Similarly to the above, this is a hardcoded value.
+	metadataPurgeTicker := time.NewTicker(metadataPurgePeriod)
+	defer metadataPurgeTicker.Stop()
+
+	maxTrackerResetTicker := time.NewTicker(maxInflightRequestResetPeriod)
+	defer maxTrackerResetTicker.Stop()
+
+	labelSetMetricsTicker := time.NewTicker(labelSetMetricsTickInterval)
+	defer labelSetMetricsTicker.Stop()
+
 	for {
 		select {
 		case <-metadataPurgeTicker.C:
 			i.purgeUserMetricsMetadata()
-
-		case <-flushTicker.C:
-			i.sweepUsers(false)
-
+		case <-ingestionRateTicker.C:
+			i.ingestionRate.Tick()
 		case <-rateUpdateTicker.C:
-			i.userStates.updateRates()
+			i.stoppedMtx.RLock()
+			for _, db := range i.TSDBState.dbs {
+				db.ingestedAPISamples.Tick()
+				db.ingestedRuleSamples.Tick()
+			}
+			i.stoppedMtx.RUnlock()
 
 		case <-activeSeriesTickerChan:
-			i.userStates.purgeAndUpdateActiveSeries(time.Now().Add(-i.cfg.ActiveSeriesMetricsIdleTimeout))
-
+			i.updateActiveSeries(ctx)
+		case <-activeQueriedSeriesTickerChan:
+			i.updateActiveQueriedSeries(ctx)
+		case <-headQueriedSeriesTickerChan:
+			i.updateHeadQueriedMetrics(ctx)
+		case <-maxTrackerResetTicker.C:
+			i.maxInflightQueryRequests.Tick()
+			i.maxInflightPushRequests.Tick()
+		case <-userTSDBConfigTicker.C:
+			i.updateUserTSDBConfigs()
+		case <-labelSetMetricsTicker.C:
+			i.updateLabelSetMetrics()
 		case <-ctx.Done():
 			return nil
-
 		case err := <-i.subservicesWatcher.Chan():
 			return errors.Wrap(err, "ingester subservice failed")
 		}
 	}
 }
 
-// stopping is run when ingester is asked to stop
-func (i *Ingester) stopping(_ error) error {
-	i.wal.Stop()
+func (i *Ingester) updateUserTSDBConfigs() {
+	for _, userID := range i.getTSDBUsers() {
+		userDB, err := i.getTSDB(userID)
+		if err != nil || userDB == nil {
+			continue
+		}
 
-	// This will prevent us accepting any more samples
-	i.stopIncomingRequests()
+		cfg := &config.Config{
+			StorageConfig: config.StorageConfig{
+				ExemplarsConfig: &config.ExemplarsConfig{
+					MaxExemplars: i.getMaxExemplars(userID),
+				},
+				TSDBConfig: &config.TSDBConfig{
+					OutOfOrderTimeWindow: time.Duration(i.limits.OutOfOrderTimeWindow(userID)).Milliseconds(),
+				},
+			},
+		}
 
-	// Lifecycler can be nil if the ingester is for a flusher.
-	if i.lifecycler != nil {
-		// Next initiate our graceful exit from the ring.
-		return services.StopAndAwaitTerminated(context.Background(), i.lifecycler)
+		// This method currently updates the MaxExemplars and OutOfOrderTimeWindow.
+		err = userDB.db.ApplyConfig(cfg)
+		if err != nil {
+			level.Error(logutil.WithUserID(userID, i.logger)).Log("msg", "failed to update user tsdb configuration.")
+		}
+	}
+}
+
+// getMaxExemplars returns the maxExemplars value set in limits config.
+// If limits value is set to zero, it falls back to old configuration
+// in block storage config.
+func (i *Ingester) getMaxExemplars(userID string) int64 {
+	maxExemplarsFromLimits := i.limits.MaxExemplars(userID)
+
+	if maxExemplarsFromLimits == 0 {
+		return int64(i.cfg.BlocksStorageConfig.TSDB.MaxExemplars)
 	}
 
-	return nil
+	return int64(maxExemplarsFromLimits)
+}
+
+func (i *Ingester) updateActiveSeries(ctx context.Context) {
+	purgeTime := time.Now().Add(-i.cfg.ActiveSeriesMetricsIdleTimeout)
+
+	for _, userID := range i.getTSDBUsers() {
+		userDB, err := i.getTSDB(userID)
+		if err != nil || userDB == nil {
+			continue
+		}
+
+		userDB.activeSeries.Purge(purgeTime)
+		i.metrics.activeSeriesPerUser.WithLabelValues(userID).Set(float64(userDB.activeSeries.Active()))
+		i.metrics.activeNHSeriesPerUser.WithLabelValues(userID).Set(float64(userDB.activeSeries.ActiveNativeHistogram()))
+		i.metrics.headMetricNamesPerUser.WithLabelValues(userID).Set(float64(userDB.seriesInMetric.ActiveMetricNames()))
+		if err := userDB.labelSetCounter.UpdateMetric(ctx, userDB, i.metrics); err != nil {
+			level.Warn(i.logger).Log("msg", "failed to update per labelSet metrics", "user", userID, "err", err)
+		}
+
+		// Per-tenant active series trackers (hot-reloadable via runtime config overrides).
+		trackers := i.limits.ActiveSeriesTrackers(userID)
+		userDB.trackerCounter.updateConfig(ctx, userDB.db, trackers)
+		userDB.trackerCounter.updateMetrics(i.metrics.activeSeriesPerTracker, userID, trackers)
+	}
+}
+
+func (i *Ingester) updateActiveQueriedSeries(ctx context.Context) {
+	now := time.Now()
+	for _, userID := range i.getTSDBUsers() {
+		userDB, err := i.getTSDB(userID)
+		if err != nil || userDB == nil || userDB.activeQueriedSeries == nil {
+			continue
+		}
+
+		// Purge expired windows for all trackers
+		userDB.activeQueriedSeries.Purge(now)
+
+		// Get estimated cardinality for each configured window
+		for _, windowDuration := range i.cfg.ActiveQueriedSeriesMetricsWindows {
+			estimatedCount, err := userDB.activeQueriedSeries.GetSeriesQueried(now, windowDuration)
+			if err != nil {
+				level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "failed to get active queried series count", "user", userID, "window", windowDuration, "err", err)
+				continue
+			}
+
+			// Update metric with window label
+			i.metrics.activeQueriedSeriesPerUser.WithLabelValues(userID, windowDuration.String()).Set(float64(estimatedCount))
+		}
+	}
+}
+
+func (i *Ingester) updateHeadQueriedMetrics(ctx context.Context) {
+	now := time.Now()
+	for _, userID := range i.getTSDBUsers() {
+		userDB, err := i.getTSDB(userID)
+		if err != nil || userDB == nil {
+			continue
+		}
+
+		// Metric 1: total series queried from head (HLL)
+		if userDB.headQueriedSeries != nil {
+			userDB.headQueriedSeries.Purge(now)
+			for _, windowDuration := range i.cfg.HeadQueriedSeriesMetricsWindows {
+				estimatedCount, err := userDB.headQueriedSeries.GetSeriesQueried(now, windowDuration)
+				if err != nil {
+					level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "failed to get head queried series count", "user", userID, "window", windowDuration, "err", err)
+					continue
+				}
+				i.metrics.headQueriedSeriesPerUser.WithLabelValues(userID, windowDuration.String()).Set(float64(estimatedCount))
+			}
+		}
+
+	}
+}
+
+func (i *Ingester) updateLabelSetMetrics() {
+	activeUserSet := make(map[string]map[uint64]struct{})
+	for _, userID := range i.getTSDBUsers() {
+		userDB, err := i.getTSDB(userID)
+		if err != nil || userDB == nil {
+			continue
+		}
+
+		limits := i.limits.LimitsPerLabelSet(userID)
+		activeUserSet[userID] = make(map[uint64]struct{}, len(limits))
+		for _, l := range limits {
+			activeUserSet[userID][l.Hash] = struct{}{}
+		}
+	}
+
+	// Update label set metrics in validate metrics.
+	i.validateMetrics.UpdateLabelSet(activeUserSet, i.logger)
+}
+
+func (i *Ingester) RenewTokenHandler(w http.ResponseWriter, r *http.Request) {
+	i.lifecycler.RenewTokens(0.1, r.Context())
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ShutdownHandler triggers the following set of operations in order:
-//     * Change the state of ring to stop accepting writes.
-//     * Flush all the chunks.
-func (i *Ingester) ShutdownHandler(w http.ResponseWriter, r *http.Request) {
+//   - Change the state of ring to stop accepting writes.
+//   - Flush all the chunks.
+func (i *Ingester) ShutdownHandler(w http.ResponseWriter, _ *http.Request) {
 	originalFlush := i.lifecycler.FlushOnShutdown()
 	// We want to flush the chunks if transfer fails irrespective of original flag.
 	i.lifecycler.SetFlushOnShutdown(true)
@@ -461,13 +1306,6 @@ func (i *Ingester) ShutdownHandler(w http.ResponseWriter, r *http.Request) {
 	i.lifecycler.SetUnregisterOnShutdown(originalUnregister)
 
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// stopIncomingRequests is called during the shutdown process.
-func (i *Ingester) stopIncomingRequests() {
-	i.userStatesMtx.Lock()
-	defer i.userStatesMtx.Unlock()
-	i.stopped = true
 }
 
 // check that ingester has finished starting, i.e. it is in Running or Stopping state.
@@ -491,176 +1329,2311 @@ func (i *Ingester) checkRunning() error {
 	return status.Error(codes.Unavailable, s.String())
 }
 
-// Push implements client.IngesterServer
+// GetRef() is an extra method added to TSDB to let Cortex check before calling Add()
+type extendedAppender interface {
+	storage.Appender
+	storage.GetRef
+}
+
+func (i *Ingester) isLabelSetOutOfOrder(lbls labels.Labels) bool {
+	last := ""
+
+	err := lbls.Validate(func(l labels.Label) error {
+		if last > l.Name {
+			return errLabelsOutOfOrder
+		}
+		last = l.Name
+		return nil
+	})
+
+	return errors.Is(err, errLabelsOutOfOrder)
+}
+
+// Push adds metrics to a block
 func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error) {
 	if err := i.checkRunning(); err != nil {
 		return nil, err
 	}
 
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Ingester.Push")
+	defer span.Finish()
+
+	userID, err := users.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// We will report *this* request in the error too.
 	inflight := i.inflightPushRequests.Inc()
+	i.maxInflightPushRequests.Track(inflight)
 	defer i.inflightPushRequests.Dec()
 
 	gl := i.getInstanceLimits()
 	if gl != nil && gl.MaxInflightPushRequests > 0 {
 		if inflight > gl.MaxInflightPushRequests {
+			i.metrics.pushErrorsTotal.WithLabelValues(userID, pushErrTooManyInflightRequests).Inc()
 			return nil, errTooManyInflightPushRequests
 		}
 	}
 
-	if i.cfg.BlocksStorageEnabled {
-		return i.v2Push(ctx, req)
-	}
+	var firstPartialErr error
 
 	// NOTE: because we use `unsafe` in deserialisation, we must not
 	// retain anything from `req` past the call to ReuseSlice
+	defer req.Free()
 	defer cortexpb.ReuseSlice(req.Timeseries)
 
-	userID, err := tenant.TenantID(ctx)
-	if err != nil {
-		return nil, err
+	il := i.getInstanceLimits()
+	if il != nil && il.MaxIngestionRate > 0 {
+		if rate := i.ingestionRate.Rate(); rate >= il.MaxIngestionRate {
+			return nil, errMaxSamplesPushRateLimitReached
+		}
 	}
+
+	db, err := i.getOrCreateTSDB(userID, false)
+	if err != nil {
+		return nil, wrapWithUser(err, userID)
+	}
+
+	// Ensure the ingester shutdown procedure hasn't started
+	i.stoppedMtx.RLock()
+	if i.stopped {
+		i.stoppedMtx.RUnlock()
+		return nil, errIngesterStopping
+	}
+	i.stoppedMtx.RUnlock()
+
+	if err := db.acquireAppendLock(); err != nil {
+		return &cortexpb.WriteResponse{}, httpgrpc.Errorf(http.StatusServiceUnavailable, "%s", wrapWithUser(err, userID).Error())
+	}
+	defer db.releaseAppendLock()
 
 	// Given metadata is a best-effort approach, and we don't halt on errors
 	// process it before samples. Otherwise, we risk returning an error before ingestion.
-	i.pushMetadata(ctx, userID, req.GetMetadata())
+	ingestedMetadata := i.pushMetadata(ctx, userID, req.GetMetadata())
 
-	var firstPartialErr *validationError
-	var record *WALRecord
-	if i.cfg.WALConfig.WALEnabled {
-		record = recordPool.Get().(*WALRecord)
-		record.UserID = userID
-		// Assuming there is not much churn in most cases, there is no use
-		// keeping the record.Labels slice hanging around.
-		record.Series = nil
-		if cap(record.Samples) < len(req.Timeseries) {
-			record.Samples = make([]tsdb_record.RefSample, 0, len(req.Timeseries))
-		} else {
-			record.Samples = record.Samples[:0]
+	reasonCounter := newLabelSetReasonCounters()
+
+	// Keep track of some stats which are tracked only if the samples will be
+	// successfully committed
+	var (
+		succeededSamplesCount                  = 0
+		failedSamplesCount                     = 0
+		succeededHistogramsCount               = 0
+		failedHistogramsCount                  = 0
+		succeededExemplarsCount                = 0
+		failedExemplarsCount                   = 0
+		startTimestampSampleAppendFailCount    = 0
+		startTimestampHistogramAppendFailCount = 0
+		startAppend                            = time.Now()
+		sampleOutOfBoundsCount                 = 0
+		sampleOutOfOrderCount                  = 0
+		sampleTooOldCount                      = 0
+		newValueForTimestampCount              = 0
+		perUserSeriesLimitCount                = 0
+		perUserNativeHistogramSeriesLimitCount = 0
+		perLabelSetSeriesLimitCount            = 0
+		perMetricSeriesLimitCount              = 0
+		discardedNativeHistogramCount          = 0
+
+		// headMaxTime is snapshotted right after the appender is created. The appender
+		// derives its lower time bound checks (e.g. out of bounds) from the head max
+		// time at creation time. We cannot access the appender's internal bound
+		// directly, so we snapshot the head max time once here instead of fetching it
+		// again for every failed sample.
+		headMaxTime int64
+
+		updateFirstPartial = func(errFn func() error) {
+			if firstPartialErr == nil {
+				firstPartialErr = errFn()
+			}
+		}
+
+		handleAppendFailure = func(err error, timestampMs int64, lbls []cortexpb.LabelAdapter, copiedLabels labels.Labels, matchedLabelSetLimits []validation.LimitsPerLabelSet) (rollback bool) {
+			// Check if the error is a soft error we can proceed on. If so, we keep track
+			// of it, so that we can return it back to the distributor, which will return a
+			// 400 error to the client. The client (Prometheus) will not retry on 400, and
+			// we actually ingested all samples which haven't failed.
+			switch cause := errors.Cause(err); {
+			case errors.Is(cause, storage.ErrOutOfBounds):
+				sampleOutOfBoundsCount++
+				i.validateMetrics.DiscardedSeriesTracker.Track(sampleOutOfBounds, userID, copiedLabels.Hash())
+				updateFirstPartial(func() error {
+					return wrappedTSDBIngestErrWithHeadMaxTime(err, model.Time(timestampMs), model.Time(headMaxTime), lbls)
+				})
+
+			case errors.Is(cause, storage.ErrOutOfOrderSample):
+				sampleOutOfOrderCount++
+				i.validateMetrics.DiscardedSeriesTracker.Track(sampleOutOfOrder, userID, copiedLabels.Hash())
+				updateFirstPartial(func() error { return wrappedTSDBIngestErr(err, model.Time(timestampMs), lbls) })
+
+			case errors.Is(cause, storage.ErrDuplicateSampleForTimestamp):
+				newValueForTimestampCount++
+				i.validateMetrics.DiscardedSeriesTracker.Track(newValueForTimestamp, userID, copiedLabels.Hash())
+				updateFirstPartial(func() error { return wrappedTSDBIngestErr(err, model.Time(timestampMs), lbls) })
+
+			case errors.Is(cause, storage.ErrTooOldSample):
+				sampleTooOldCount++
+				i.validateMetrics.DiscardedSeriesTracker.Track(sampleTooOld, userID, copiedLabels.Hash())
+				updateFirstPartial(func() error {
+					return wrappedTSDBIngestErrWithHeadMaxTime(err, model.Time(timestampMs), model.Time(headMaxTime), lbls)
+				})
+
+			case errors.Is(cause, errMaxSeriesPerUserLimitExceeded):
+				perUserSeriesLimitCount++
+				i.validateMetrics.DiscardedSeriesTracker.Track(perUserSeriesLimit, userID, copiedLabels.Hash())
+				updateFirstPartial(func() error {
+					return makeLimitError(perUserSeriesLimit, i.limiter.FormatError(userID, cause, copiedLabels))
+				})
+
+			case errors.Is(cause, errMaxNativeHistogramSeriesPerUserLimitExceeded):
+				perUserNativeHistogramSeriesLimitCount++
+				updateFirstPartial(func() error {
+					return makeLimitError(perUserSeriesLimit, i.limiter.FormatError(userID, cause, copiedLabels))
+				})
+
+			case errors.Is(cause, errMaxSeriesPerMetricLimitExceeded):
+				perMetricSeriesLimitCount++
+				i.validateMetrics.DiscardedSeriesTracker.Track(perMetricSeriesLimit, userID, copiedLabels.Hash())
+				updateFirstPartial(func() error {
+					return makeMetricLimitError(perMetricSeriesLimit, copiedLabels, i.limiter.FormatError(userID, cause, copiedLabels))
+				})
+
+			case errors.As(cause, &errMaxSeriesPerLabelSetLimitExceeded{}):
+				perLabelSetSeriesLimitCount++
+				i.validateMetrics.DiscardedSeriesTracker.Track(perLabelsetSeriesLimit, userID, copiedLabels.Hash())
+				for _, matchedLabelset := range matchedLabelSetLimits {
+					i.validateMetrics.DiscardedSeriesPerLabelsetTracker.Track(userID, copiedLabels.Hash(), matchedLabelset.Hash, matchedLabelset.Id)
+				}
+				// We only track per labelset discarded samples for throttling by labelset limit.
+				reasonCounter.increment(matchedLabelSetLimits, perLabelsetSeriesLimit)
+				updateFirstPartial(func() error {
+					return makeMetricLimitError(perLabelsetSeriesLimit, copiedLabels, i.limiter.FormatError(userID, cause, copiedLabels))
+				})
+
+			case isHistogramValidationError(cause):
+				updateFirstPartial(func() error { return wrappedTSDBIngestErr(err, model.Time(timestampMs), lbls) })
+
+			default:
+				rollback = true
+			}
+			return
+		}
+	)
+
+	// Walk the samples, appending them to the users database
+	app := db.Appender(ctx).(extendedAppender)
+	headMaxTime = db.Head().MaxTime()
+
+	// Ensure the appender is always released so that we don't leak TSDB head
+	// series references, mmap'd chunks and pending state on early returns.
+	// `committed` is flipped to true immediately before app.Commit() because
+	// Prometheus closes the appender even on Commit failure (it self-rolls
+	// back internally on WAL error), so the deferred Rollback must not run
+	// afterwards.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if rollbackErr := app.Rollback(); rollbackErr != nil {
+			level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "failed to rollback appender on early return", "user", userID, "err", rollbackErr)
+		}
+	}()
+
+	// Even when OOO is enabled globally, we want to reject OOO samples in some cases.
+	// prometheus implementation: https://github.com/prometheus/prometheus/pull/14710
+	if req.DiscardOutOfOrder {
+		app.SetOptions(&storage.AppendOptions{DiscardOutOfOrder: true})
+	}
+
+	delayObserver := i.metrics.ingestionDelaySeconds.WithLabelValues(userID)
+	nowMs := time.Now().UnixMilli()
+	observeDelay := func(timestampMs int64) {
+		if delayMs := nowMs - timestampMs; delayMs >= 0 {
+			delayObserver.Observe(float64(delayMs) / 1000.0)
 		}
 	}
 
 	for _, ts := range req.Timeseries {
-		seriesSamplesIngested := 0
+		// The labels must be sorted (in our case, it's guaranteed a write request
+		// has sorted labels once hit the ingester).
+
+		// Look up a reference for this series.
+		tsLabels := cortexpb.FromLabelAdaptersToLabels(ts.Labels)
+		if i.isLabelSetOutOfOrder(tsLabels) {
+			i.metrics.oooLabelsTotal.WithLabelValues(userID).Inc()
+			return nil, wrapWithUser(errors.Errorf("out-of-order label set found when push: %s", tsLabels), userID)
+		}
+		tsLabelsHash := tsLabels.Hash()
+		ref, copiedLabels := app.GetRef(tsLabels, tsLabelsHash)
+
+		// To find out if any sample was added to this series, we keep old value.
+		oldSucceededSamplesCount := succeededSamplesCount
+		// To find out if any histogram was added to this series, we keep old value.
+		oldSucceededHistogramsCount := succeededHistogramsCount
+
+		// Copied labels will be empty if ref is 0.
+		if ref == 0 {
+			// Copy the label set because both TSDB and the active series tracker may retain it.
+			copiedLabels = cortexpb.FromLabelAdaptersToLabelsWithCopy(ts.Labels)
+		}
+		matchedLabelSetLimits := i.limiter.limitsPerLabelSets(userID, copiedLabels)
+
 		for _, s := range ts.Samples {
-			// append() copies the memory in `ts.Labels` except on the error path
-			err := i.append(ctx, userID, ts.Labels, model.Time(s.TimestampMs), model.SampleValue(s.Value), req.Source, record)
-			if err == nil {
-				seriesSamplesIngested++
-				continue
-			}
+			var err error
 
-			i.metrics.ingestedSamplesFail.Inc()
-			if ve, ok := err.(*validationError); ok {
-				if firstPartialErr == nil {
-					firstPartialErr = ve
+			// Observe ingestion delay for all samples (accepted and rejected)
+			observeDelay(s.TimestampMs)
+
+			if s.StartTimestampMs != 0 && s.TimestampMs != 0 {
+				if _, err = app.AppendSTZeroSample(ref, copiedLabels, s.TimestampMs, s.StartTimestampMs); err != nil && !errors.Is(err, storage.ErrOutOfOrderST) {
+					startTimestampSampleAppendFailCount++
+					i.metrics.startTimestampFail.WithLabelValues(sampleMetricTypeFloat).Inc()
 				}
-				continue
 			}
 
-			// non-validation error: abandon this request
-			return nil, grpcForwardableError(userID, http.StatusInternalServerError, err)
+			// If the cached reference exists, we try to use it.
+			if ref != 0 {
+				if _, err = app.Append(ref, copiedLabels, s.TimestampMs, s.Value); err == nil {
+					succeededSamplesCount++
+					continue
+				}
+
+			} else {
+				// Retain the reference in case there are multiple samples for the series.
+				if ref, err = app.Append(0, copiedLabels, s.TimestampMs, s.Value); err == nil {
+					succeededSamplesCount++
+					continue
+				}
+			}
+
+			failedSamplesCount++
+
+			if rollback := handleAppendFailure(err, s.TimestampMs, ts.Labels, copiedLabels, matchedLabelSetLimits); !rollback {
+				continue
+			}
+			// The error looks an issue on our side, so we should rollback.
+			// The deferred rollback above will close the appender; nothing to do here.
+			return nil, wrapWithUser(err, userID)
 		}
 
-		if i.cfg.ActiveSeriesMetricsEnabled && seriesSamplesIngested > 0 {
-			// updateActiveSeries will copy labels if necessary.
-			i.updateActiveSeries(userID, time.Now(), ts.Labels)
+		if i.limits.EnableNativeHistograms(userID) {
+			ingestedBucketsObserver := i.metrics.ingestedHistogramBuckets.WithLabelValues(userID)
+			for _, hp := range ts.Histograms {
+				var (
+					err error
+					h   *histogram.Histogram
+					fh  *histogram.FloatHistogram
+				)
+
+				// Observe ingestion delay for all histograms (accepted and rejected)
+				observeDelay(hp.TimestampMs)
+
+				// Choose the decoder based on the histogram's proto type (the
+				// CountInt/CountFloat oneof), not the count value. A float
+				// histogram with a count of 0 (e.g. a staleness marker or an
+				// empty histogram) still has the CountFloat oneof set, so a
+				// value-based check (hp.GetCountFloat() > 0) would misroute it
+				// to the integer decoder, which panics. This mirrors the
+				// discriminator used everywhere else (e.g. util/validation).
+				if hp.IsFloatHistogram() {
+					fh = cortexpb.FloatHistogramProtoToFloatHistogram(hp.Histogram)
+				} else {
+					h = cortexpb.HistogramProtoToHistogram(hp.Histogram)
+				}
+
+				if hp.StartTimestampMs != 0 && hp.TimestampMs != 0 {
+					if _, err = app.AppendHistogramSTZeroSample(ref, copiedLabels, hp.TimestampMs, hp.StartTimestampMs, h, fh); err != nil && !errors.Is(err, storage.ErrOutOfOrderST) {
+						startTimestampHistogramAppendFailCount++
+						i.metrics.startTimestampFail.WithLabelValues(sampleMetricTypeHistogram).Inc()
+					}
+				}
+
+				if ref != 0 {
+					if _, err = app.AppendHistogram(ref, copiedLabels, hp.TimestampMs, h, fh); err == nil {
+						succeededHistogramsCount++
+						ingestedBucketsObserver.Observe(float64(hp.BucketCount()))
+						continue
+					}
+				} else {
+					// Copy the label set because both TSDB and the active series tracker may retain it.
+					copiedLabels = cortexpb.FromLabelAdaptersToLabelsWithCopy(ts.Labels)
+					if ref, err = app.AppendHistogram(0, copiedLabels, hp.TimestampMs, h, fh); err == nil {
+						succeededHistogramsCount++
+						ingestedBucketsObserver.Observe(float64(hp.BucketCount()))
+						continue
+					}
+				}
+
+				failedHistogramsCount++
+
+				if rollback := handleAppendFailure(err, hp.TimestampMs, ts.Labels, copiedLabels, matchedLabelSetLimits); !rollback {
+					continue
+				}
+				// The error looks an issue on our side, so we should rollback.
+				// The deferred rollback above will close the appender; nothing to do here.
+				return nil, wrapWithUser(err, userID)
+			}
+		} else {
+			discardedNativeHistogramCount += len(ts.Histograms)
+		}
+
+		isNHAppended := succeededHistogramsCount > oldSucceededHistogramsCount
+		shouldUpdateSeries := (succeededSamplesCount > oldSucceededSamplesCount) || isNHAppended
+		if i.cfg.ActiveSeriesMetricsEnabled && shouldUpdateSeries {
+			db.activeSeries.UpdateSeries(tsLabels, tsLabelsHash, startAppend, isNHAppended, func(l labels.Labels) labels.Labels {
+				// we must already have copied the labels if succeededSamplesCount or succeededHistogramsCount has been incremented.
+				return copiedLabels
+			})
+		}
+
+		maxExemplarsForUser := i.getMaxExemplars(userID)
+		if maxExemplarsForUser > 0 {
+			// app.AppendExemplar currently doesn't create the series, it must
+			// already exist.  If it does not then drop.
+			if ref == 0 && len(ts.Exemplars) > 0 {
+				updateFirstPartial(func() error {
+					return wrappedTSDBIngestExemplarErr(errExemplarRef,
+						model.Time(ts.Exemplars[0].TimestampMs), ts.Labels, ts.Exemplars[0].Labels)
+				})
+				failedExemplarsCount += len(ts.Exemplars)
+			} else { // Note that else is explicit, rather than a continue in the above if, in case of additional logic post exemplar processing.
+				for _, ex := range ts.Exemplars {
+					e := exemplar.Exemplar{
+						Value:  ex.Value,
+						Ts:     ex.TimestampMs,
+						HasTs:  true,
+						Labels: cortexpb.FromLabelAdaptersToLabelsWithCopy(ex.Labels),
+					}
+
+					if _, err = app.AppendExemplar(ref, labels.EmptyLabels(), e); err == nil {
+						succeededExemplarsCount++
+						continue
+					}
+
+					// Error adding exemplar
+					updateFirstPartial(func() error {
+						return wrappedTSDBIngestExemplarErr(err, model.Time(ex.TimestampMs), ts.Labels, ex.Labels)
+					})
+					failedExemplarsCount++
+				}
+			}
 		}
 	}
 
-	if record != nil {
-		// Log the record only if there was no error in ingestion.
-		if err := i.wal.Log(record); err != nil {
-			return nil, err
+	// At this point all samples have been added to the appender, so we can track the time it took.
+	i.TSDBState.appenderAddDuration.Observe(time.Since(startAppend).Seconds())
+
+	if startTimestampSampleAppendFailCount > 0 || startTimestampHistogramAppendFailCount > 0 {
+		level.Debug(logutil.WithContext(ctx, i.logger)).Log(
+			"msg", "failed to append start timestamp in push",
+			"user", userID,
+			"sample_failures", startTimestampSampleAppendFailCount,
+			"histogram_failures", startTimestampHistogramAppendFailCount,
+		)
+	}
+
+	startCommit := time.Now()
+	// Mark committed before calling Commit: Prometheus closes the appender on
+	// both success and failure of Commit (it self-rolls-back on WAL error), so
+	// the deferred Rollback must not fire afterwards.
+	committed = true
+	if err := app.Commit(); err != nil {
+		return nil, wrapWithUser(err, userID)
+	}
+
+	i.TSDBState.appenderCommitDuration.Observe(time.Since(startCommit).Seconds())
+
+	// If only invalid samples or histograms are pushed, don't change "last update", as TSDB was not modified.
+	if succeededSamplesCount > 0 || succeededHistogramsCount > 0 {
+		db.setLastUpdate(time.Now())
+	}
+
+	// Increment metrics only if the samples have been successfully committed.
+	// If the code didn't reach this point, it means that we returned an error
+	// which will be converted into an HTTP 5xx and the client should/will retry.
+	i.metrics.ingestedSamples.Add(float64(succeededSamplesCount))
+	i.metrics.ingestedSamplesFail.Add(float64(failedSamplesCount))
+	i.metrics.ingestedHistograms.Add(float64(succeededHistogramsCount))
+	i.metrics.ingestedHistogramsFail.Add(float64(failedHistogramsCount))
+	i.metrics.ingestedExemplars.Add(float64(succeededExemplarsCount))
+	i.metrics.ingestedExemplarsFail.Add(float64(failedExemplarsCount))
+
+	if sampleOutOfBoundsCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(sampleOutOfBounds, userID).Add(float64(sampleOutOfBoundsCount))
+	}
+	if sampleOutOfOrderCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(sampleOutOfOrder, userID).Add(float64(sampleOutOfOrderCount))
+	}
+	if sampleTooOldCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(sampleTooOld, userID).Add(float64(sampleTooOldCount))
+	}
+	if newValueForTimestampCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(newValueForTimestamp, userID).Add(float64(newValueForTimestampCount))
+	}
+	if perUserSeriesLimitCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(perUserSeriesLimit, userID).Add(float64(perUserSeriesLimitCount))
+	}
+	if perUserNativeHistogramSeriesLimitCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(perUserNativeHistogramSeriesLimit, userID).Add(float64(perUserNativeHistogramSeriesLimitCount))
+	}
+	if perMetricSeriesLimitCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(perMetricSeriesLimit, userID).Add(float64(perMetricSeriesLimitCount))
+	}
+	if perLabelSetSeriesLimitCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(perLabelsetSeriesLimit, userID).Add(float64(perLabelSetSeriesLimitCount))
+	}
+
+	if !i.limits.EnableNativeHistograms(userID) && discardedNativeHistogramCount > 0 {
+		i.validateMetrics.DiscardedSamples.WithLabelValues(nativeHistogramSample, userID).Add(float64(discardedNativeHistogramCount))
+	}
+
+	for h, counter := range reasonCounter.counters {
+		labelStr := counter.lbls.String()
+		i.validateMetrics.LabelSetTracker.Track(userID, h, counter.lbls)
+		for reason, count := range counter.reasonCounter {
+			i.validateMetrics.DiscardedSamplesPerLabelSet.WithLabelValues(reason, userID, labelStr).Add(float64(count))
 		}
-		recordPool.Put(record)
+	}
+
+	// Distributor counts both samples, metadata and histograms, so for consistency ingester does the same.
+	i.ingestionRate.Add(int64(succeededSamplesCount + succeededHistogramsCount + ingestedMetadata))
+
+	switch req.Source {
+	case cortexpb.RULE:
+		db.ingestedRuleSamples.Add(int64(succeededSamplesCount + succeededHistogramsCount))
+	case cortexpb.API:
+		fallthrough
+	default:
+		db.ingestedAPISamples.Add(int64(succeededSamplesCount + succeededHistogramsCount))
 	}
 
 	if firstPartialErr != nil {
-		// grpcForwardableError turns the error into a string so it no longer references `req`
-		return &cortexpb.WriteResponse{}, grpcForwardableError(userID, firstPartialErr.code, firstPartialErr)
+		code := http.StatusBadRequest
+		var ve *validationError
+		if errors.As(firstPartialErr, &ve) {
+			code = ve.code
+		}
+		level.Debug(logutil.WithContext(ctx, i.logger)).Log("msg", "partial failures to push", "totalSamples", succeededSamplesCount+failedSamplesCount, "failedSamples", failedSamplesCount, "totalHistograms", succeededHistogramsCount+failedHistogramsCount, "failedHistograms", failedHistogramsCount, "firstPartialErr", firstPartialErr)
+		return &cortexpb.WriteResponse{}, httpgrpc.Errorf(code, "%s", wrapWithUser(firstPartialErr, userID).Error())
 	}
 
 	return &cortexpb.WriteResponse{}, nil
 }
 
-// NOTE: memory for `labels` is unsafe; anything retained beyond the
-// life of this function must be copied
-func (i *Ingester) append(ctx context.Context, userID string, labels labelPairs, timestamp model.Time, value model.SampleValue, source cortexpb.WriteRequest_SourceEnum, record *WALRecord) error {
-	labels.removeBlanks()
-
-	var (
-		state *userState
-		fp    model.Fingerprint
-	)
-	i.userStatesMtx.RLock()
-	defer func() {
-		i.userStatesMtx.RUnlock()
-		if state != nil {
-			state.fpLocker.Unlock(fp)
-		}
-	}()
-	if i.stopped {
-		return errIngesterStopping
-	}
-
-	// getOrCreateSeries copies the memory for `labels`, except on the error path.
-	state, fp, series, err := i.userStates.getOrCreateSeries(ctx, userID, labels, record)
-	if err != nil {
-		if ve, ok := err.(*validationError); ok {
-			state.discardedSamples.WithLabelValues(ve.errorType).Inc()
+func (i *Ingester) PushStream(srv client.Ingester_PushStreamServer) error {
+	ctx := srv.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "PushStream closed")
+			return ctx.Err()
+		default:
 		}
 
-		// Reset the state so that the defer will not try to unlock the fpLocker
-		// in case of error, because that lock has already been released on error.
-		state = nil
-		return err
-	}
+		req, err := srv.Recv()
 
-	prevNumChunks := len(series.chunkDescs)
-	if i.cfg.SpreadFlushes && prevNumChunks > 0 {
-		// Map from the fingerprint hash to a point in the cycle of period MaxChunkAge
-		startOfCycle := timestamp.Add(-(timestamp.Sub(model.Time(0)) % i.cfg.MaxChunkAge))
-		slot := startOfCycle.Add(time.Duration(uint64(fp) % uint64(i.cfg.MaxChunkAge)))
-		// If adding this sample means the head chunk will span that point in time, close so it will get flushed
-		if series.head().FirstTime < slot && timestamp >= slot {
-			series.closeHead(reasonSpreadFlush)
+		if err == io.EOF {
+			return nil
 		}
-	}
 
-	if err := series.add(model.SamplePair{
-		Value:     value,
-		Timestamp: timestamp,
-	}); err != nil {
-		if ve, ok := err.(*validationError); ok {
-			state.discardedSamples.WithLabelValues(ve.errorType).Inc()
-			if ve.noReport {
-				return nil
+		if err != nil {
+			return err
+		}
+
+		if contextOrgID, extractErr := users.TenantID(ctx); extractErr == nil {
+			if !isDistributorWorkerOrgID(contextOrgID) && contextOrgID != req.TenantID {
+				req.Free()
+				return status.Errorf(codes.PermissionDenied,
+					"tenant ID mismatch: stream authenticated as %q but request specifies %q",
+					contextOrgID, req.TenantID)
 			}
 		}
-		return err
+
+		pushCtx := user.InjectOrgID(ctx, req.TenantID)
+		resp, err := i.Push(pushCtx, req.Request)
+		if resp == nil {
+			resp = &cortexpb.WriteResponse{}
+		}
+		resp.Code = http.StatusOK
+		if err != nil {
+			httpResponse, isGRPCError := httpgrpc.HTTPResponseFromError(err)
+			if !isGRPCError {
+				err = httpgrpc.Errorf(http.StatusInternalServerError, "%s", err)
+				httpResponse, _ = httpgrpc.HTTPResponseFromError(err)
+			}
+			resp.Code = httpResponse.Code
+			resp.Message = string(httpResponse.Body)
+		}
+		err = srv.Send(resp)
+		req.Free()
+		if err != nil {
+			level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "error sending from PushStream", "err", err)
+		}
+	}
+}
+
+// isDistributorWorkerOrgID reports whether orgID matches the synthetic worker-name pattern
+// that the distributor injects as X-Scope-OrgID when opening a long-lived PushStream:
+//
+//	"ingester-<addr>-stream-push-worker-<N>"
+//
+// When this pattern is detected, PushStream bypasses the orgID == req.TenantID check and
+// instead trusts req.TenantID from the payload.
+//
+// Note: trusting this pattern alone is not sufficient — an attacker who knows the
+// pattern can spoof it and write to any tenant.  The stream-level gRPC interceptor
+// enabled via -distributor.sign-write-requests-keys provides cryptographic proof.
+func isDistributorWorkerOrgID(orgID string) bool {
+	return distributorWorkerOrgIDRe.MatchString(orgID)
+}
+
+func (u *userTSDB) acquireReadLock() error {
+	u.stateMtx.RLock()
+	defer u.stateMtx.RUnlock()
+
+	switch u.state {
+	case active:
+	case activeShipping:
+	case forceCompacting:
+		// Read are allowed.
+	case closing:
+		return errors.New("TSDB is closing")
+	default:
+		return errors.New("TSDB is not active")
 	}
 
-	if record != nil {
-		record.Samples = append(record.Samples, tsdb_record.RefSample{
-			Ref: chunks.HeadSeriesRef(fp),
-			T:   int64(timestamp),
-			V:   float64(value),
+	u.readInFlight.Add(1)
+	return nil
+}
+
+func (u *userTSDB) releaseReadLock() {
+	u.readInFlight.Done()
+}
+
+func (u *userTSDB) acquireAppendLock() error {
+	u.stateMtx.RLock()
+	defer u.stateMtx.RUnlock()
+
+	switch u.state {
+	case active:
+	case activeShipping:
+		// Pushes are allowed.
+	case forceCompacting:
+		return errors.New("forced compaction in progress")
+	case closing:
+		return errors.New("TSDB is closing")
+	default:
+		return errors.New("TSDB is not active")
+	}
+
+	u.pushesInFlight.Add(1)
+	return nil
+}
+
+func (u *userTSDB) releaseAppendLock() {
+	u.pushesInFlight.Done()
+}
+
+// QueryExemplars implements service.IngesterServer
+func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQueryRequest) (resp *client.ExemplarQueryResponse, err error) {
+	defer recoverIngester(i.logger, &err)
+	if err = i.checkRunning(); err != nil {
+		return nil, err
+	}
+
+	userID, err := users.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		resp, err = i.queryExemplars(ctx, userID, req)
+	})
+	return resp, err
+}
+
+func (i *Ingester) queryExemplars(ctx context.Context, userID string, req *client.ExemplarQueryRequest) (*client.ExemplarQueryResponse, error) {
+	from, through, matchers, err := client.FromExemplarQueryRequest(i.matchersCache, req)
+	if err != nil {
+		return nil, err
+	}
+
+	i.metrics.queries.Inc()
+
+	db, err := i.getTSDB(userID)
+	if err != nil || db == nil {
+		return &client.ExemplarQueryResponse{}, nil
+	}
+
+	if err = db.acquireReadLock(); err != nil {
+		return &client.ExemplarQueryResponse{}, nil
+	}
+	defer db.releaseReadLock()
+
+	q, err := db.ExemplarQuerier(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// We will report *this* request in the error too.
+	c, err := i.trackInflightQueryRequest()
+	if err != nil {
+		return nil, err
+	}
+
+	// It's not required to sort series from a single ingester because series are sorted by the Exemplar Storage before returning from Select.
+	res, err := q.Select(from, through, matchers...)
+	c()
+	if err != nil {
+		return nil, err
+	}
+
+	numExemplars := 0
+
+	result := &client.ExemplarQueryResponse{}
+	for _, es := range res {
+		ts := cortexpb.TimeSeries{
+			Labels:    cortexpb.FromLabelsToLabelAdapters(es.SeriesLabels),
+			Exemplars: cortexpb.FromExemplarsToExemplarProtos(es.Exemplars),
+		}
+
+		numExemplars += len(ts.Exemplars)
+		result.Timeseries = append(result.Timeseries, ts)
+	}
+
+	i.metrics.queriedExemplars.Observe(float64(numExemplars))
+
+	return result, nil
+}
+
+// LabelValues returns all label values that are associated with a given label name.
+func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesRequest) (resp *client.LabelValuesResponse, err error) {
+	defer recoverIngester(i.logger, &err)
+
+	userID, userErr := users.TenantID(ctx)
+	if userErr != nil {
+		return nil, userErr
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		var cleanup func()
+		resp, cleanup, err = i.labelsValuesCommon(ctx, req)
+		defer cleanup()
+	})
+	return resp, err
+}
+
+// LabelValuesStream returns all label values that are associated with a given label name.
+func (i *Ingester) LabelValuesStream(req *client.LabelValuesRequest, stream client.Ingester_LabelValuesStreamServer) (err error) {
+	defer recoverIngester(i.logger, &err)
+
+	ctx := stream.Context()
+	userID, userErr := users.TenantID(ctx)
+	if userErr != nil {
+		return userErr
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		var resp *client.LabelValuesResponse
+		var cleanup func()
+		resp, cleanup, err = i.labelsValuesCommon(ctx, req)
+		defer cleanup()
+
+		if err != nil {
+			return
+		}
+
+		for i := 0; i < len(resp.LabelValues); i += metadataStreamBatchSize {
+			j := min(i+metadataStreamBatchSize, len(resp.LabelValues))
+			resp := &client.LabelValuesStreamResponse{
+				LabelValues: resp.LabelValues[i:j],
+			}
+			err = client.SendLabelValuesStream(stream, resp)
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	return err
+}
+
+// labelsValuesCommon returns all label values that are associated with a given label name.
+// this should be used by LabelValues and LabelValuesStream
+// the cleanup function should be called in order to close the querier
+func (i *Ingester) labelsValuesCommon(ctx context.Context, req *client.LabelValuesRequest) (*client.LabelValuesResponse, func(), error) {
+	cleanup := func() {}
+	if err := i.checkRunning(); err != nil {
+		return nil, cleanup, err
+	}
+
+	labelName, startTimestampMs, endTimestampMs, limit, matchers, err := client.FromLabelValuesRequest(i.matchersCache, req)
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	userID, err := users.TenantID(ctx)
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	db, err := i.getTSDB(userID)
+	if err != nil || db == nil {
+		return &client.LabelValuesResponse{}, cleanup, nil
+	}
+
+	if err := db.acquireReadLock(); err != nil {
+		return &client.LabelValuesResponse{}, cleanup, nil
+	}
+	defer db.releaseReadLock()
+
+	mint, maxt, err := metadataQueryRange(startTimestampMs, endTimestampMs, db, i.limits.QueryIngestersWithin(userID))
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	q, err := db.Querier(mint, maxt)
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	cleanup = func() {
+		q.Close()
+	}
+
+	c, err := i.trackInflightQueryRequest()
+	if err != nil {
+		return nil, cleanup, err
+	}
+	defer c()
+	vals, _, err := q.LabelValues(ctx, labelName, &storage.LabelHints{Limit: limit}, matchers...)
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	if limit > 0 && len(vals) > limit {
+		vals = vals[:limit]
+	}
+
+	return &client.LabelValuesResponse{
+		LabelValues: vals,
+	}, cleanup, nil
+}
+
+// LabelNames return all the label names.
+func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest) (resp *client.LabelNamesResponse, err error) {
+	defer recoverIngester(i.logger, &err)
+
+	userID, userErr := users.TenantID(ctx)
+	if userErr != nil {
+		return nil, userErr
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		var cleanup func()
+		resp, cleanup, err = i.labelNamesCommon(ctx, req)
+		defer cleanup()
+	})
+	return resp, err
+}
+
+// LabelNamesStream return all the label names.
+func (i *Ingester) LabelNamesStream(req *client.LabelNamesRequest, stream client.Ingester_LabelNamesStreamServer) (err error) {
+	defer recoverIngester(i.logger, &err)
+
+	ctx := stream.Context()
+	userID, userErr := users.TenantID(ctx)
+	if userErr != nil {
+		return userErr
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		var resp *client.LabelNamesResponse
+		var cleanup func()
+		resp, cleanup, err = i.labelNamesCommon(ctx, req)
+		defer cleanup()
+
+		if err != nil {
+			return
+		}
+
+		for i := 0; i < len(resp.LabelNames); i += metadataStreamBatchSize {
+			j := min(i+metadataStreamBatchSize, len(resp.LabelNames))
+			resp := &client.LabelNamesStreamResponse{
+				LabelNames: resp.LabelNames[i:j],
+			}
+			err = client.SendLabelNamesStream(stream, resp)
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	return err
+}
+
+// labelNamesCommon return all the label names.
+// this should be used by LabelNames and LabelNamesStream.
+// the cleanup function should be called in order to close the querier
+func (i *Ingester) labelNamesCommon(ctx context.Context, req *client.LabelNamesRequest) (*client.LabelNamesResponse, func(), error) {
+	cleanup := func() {}
+	if err := i.checkRunning(); err != nil {
+		return nil, cleanup, err
+	}
+
+	startTimestampMs, endTimestampMs, limit, matchers, err := client.FromLabelNamesRequest(i.matchersCache, req)
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	userID, err := users.TenantID(ctx)
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	db, err := i.getTSDB(userID)
+	if err != nil || db == nil {
+		return &client.LabelNamesResponse{}, cleanup, nil
+	}
+
+	if err := db.acquireReadLock(); err != nil {
+		return &client.LabelNamesResponse{}, cleanup, nil
+	}
+	defer db.releaseReadLock()
+
+	mint, maxt, err := metadataQueryRange(startTimestampMs, endTimestampMs, db, i.limits.QueryIngestersWithin(userID))
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	q, err := db.Querier(mint, maxt)
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	cleanup = func() {
+		q.Close()
+	}
+
+	c, err := i.trackInflightQueryRequest()
+	if err != nil {
+		return nil, cleanup, err
+	}
+	defer c()
+	names, _, err := q.LabelNames(ctx, &storage.LabelHints{Limit: limit}, matchers...)
+	if err != nil {
+		return nil, cleanup, err
+	}
+
+	if limit > 0 && len(names) > limit {
+		names = names[:limit]
+	}
+
+	return &client.LabelNamesResponse{
+		LabelNames: names,
+	}, cleanup, nil
+}
+
+// MetricsForLabelMatchers returns all the metrics which match a set of matchers.
+func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.MetricsForLabelMatchersRequest) (result *client.MetricsForLabelMatchersResponse, err error) {
+	defer recoverIngester(i.logger, &err)
+
+	userID, userErr := users.TenantID(ctx)
+	if userErr != nil {
+		return nil, userErr
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		result = &client.MetricsForLabelMatchersResponse{}
+		var cleanup func()
+		cleanup, err = i.metricsForLabelMatchersCommon(ctx, req, func(l labels.Labels) error {
+			result.Metric = append(result.Metric, &cortexpb.Metric{
+				Labels: cortexpb.FromLabelsToLabelAdapters(l),
+			})
+			return nil
+		})
+		defer cleanup()
+	})
+	return result, err
+}
+
+func (i *Ingester) MetricsForLabelMatchersStream(req *client.MetricsForLabelMatchersRequest, stream client.Ingester_MetricsForLabelMatchersStreamServer) (err error) {
+	defer recoverIngester(i.logger, &err)
+
+	ctx := stream.Context()
+	userID, userErr := users.TenantID(ctx)
+	if userErr != nil {
+		return userErr
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		result := &client.MetricsForLabelMatchersStreamResponse{}
+
+		var cleanup func()
+		cleanup, err = i.metricsForLabelMatchersCommon(ctx, req, func(l labels.Labels) error {
+			result.Metric = append(result.Metric, &cortexpb.Metric{
+				Labels: cortexpb.FromLabelsToLabelAdapters(l),
+			})
+
+			if len(result.Metric) >= metadataStreamBatchSize {
+				err := client.SendMetricsForLabelMatchersStream(stream, result)
+				if err != nil {
+					return err
+				}
+				result.Metric = result.Metric[:0]
+			}
+			return nil
+		})
+		defer cleanup()
+		if err != nil {
+			return
+		}
+
+		// Send last batch
+		if len(result.Metric) > 0 {
+			err = client.SendMetricsForLabelMatchersStream(stream, result)
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	return err
+}
+
+// metricsForLabelMatchersCommon returns all the metrics which match a set of matchers.
+// this should be used by MetricsForLabelMatchers and MetricsForLabelMatchersStream.
+// the cleanup function should be called in order to close the querier
+func (i *Ingester) metricsForLabelMatchersCommon(ctx context.Context, req *client.MetricsForLabelMatchersRequest, acc func(labels.Labels) error) (func(), error) {
+	cleanup := func() {}
+	if err := i.checkRunning(); err != nil {
+		return cleanup, err
+	}
+
+	userID, err := users.TenantID(ctx)
+	if err != nil {
+		return cleanup, err
+	}
+
+	db, err := i.getTSDB(userID)
+	if err != nil || db == nil {
+		return cleanup, nil
+	}
+
+	if err := db.acquireReadLock(); err != nil {
+		return cleanup, nil
+	}
+	defer db.releaseReadLock()
+
+	// Parse the request
+	_, _, limit, matchersSet, err := client.FromMetricsForLabelMatchersRequest(i.matchersCache, req)
+	if err != nil {
+		return cleanup, err
+	}
+
+	mint, maxt, err := metadataQueryRange(req.StartTimestampMs, req.EndTimestampMs, db, i.limits.QueryIngestersWithin(userID))
+	if err != nil {
+		return cleanup, err
+	}
+
+	q, err := db.Querier(mint, maxt)
+	if err != nil {
+		return cleanup, err
+	}
+
+	cleanup = func() {
+		q.Close()
+	}
+
+	// Run a query for each matchers set and collect all the results.
+	var (
+		sets      []storage.SeriesSet
+		mergedSet storage.SeriesSet
+	)
+
+	hints := &storage.SelectHints{
+		Start: mint,
+		End:   maxt,
+		Func:  "series", // There is no series function, this token is used for lookups that don't need samples.
+		Limit: limit,
+	}
+	if len(matchersSet) > 1 {
+		for _, matchers := range matchersSet {
+			// Interrupt if the context has been canceled.
+			if ctx.Err() != nil {
+				return cleanup, ctx.Err()
+			}
+
+			seriesSet := q.Select(ctx, true, hints, matchers...)
+			sets = append(sets, seriesSet)
+		}
+		mergedSet = storage.NewMergeSeriesSet(sets, limit, storage.ChainedSeriesMerge)
+	} else {
+		mergedSet = q.Select(ctx, false, hints, matchersSet[0]...)
+	}
+
+	cnt := 0
+	for mergedSet.Next() {
+		cnt++
+		// Interrupt if the context has been canceled.
+		if cnt%util.CheckContextEveryNIterations == 0 && ctx.Err() != nil {
+			return cleanup, ctx.Err()
+		}
+		if err := acc(mergedSet.At().Labels()); err != nil {
+			return cleanup, err
+		}
+
+		if limit > 0 && cnt >= limit {
+			break
+		}
+	}
+
+	return cleanup, nil
+}
+
+// MetricsMetadata returns all the metric metadata of a user.
+func (i *Ingester) MetricsMetadata(ctx context.Context, req *client.MetricsMetadataRequest) (resp *client.MetricsMetadataResponse, err error) {
+	i.stoppedMtx.RLock()
+	if err := i.checkRunningOrStopping(); err != nil {
+		i.stoppedMtx.RUnlock()
+		return nil, err
+	}
+	i.stoppedMtx.RUnlock()
+
+	userID, err := users.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		userMetadata := i.getUserMetadata(userID)
+
+		if userMetadata == nil {
+			resp = &client.MetricsMetadataResponse{}
+			return
+		}
+
+		resp = &client.MetricsMetadataResponse{Metadata: userMetadata.toClientMetadata(req)}
+	})
+
+	return resp, nil
+}
+
+// CheckReady is the readiness handler used to indicate to k8s when the ingesters
+// are ready for the addition or removal of another ingester.
+func (i *Ingester) CheckReady(ctx context.Context) error {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return fmt.Errorf("ingester not ready: %v", err)
+	}
+	return i.lifecycler.CheckReady(ctx)
+}
+
+// UserStats returns ingestion statistics for the current user.
+func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) (*client.UserStatsResponse, error) {
+	if err := i.checkRunning(); err != nil {
+		return nil, err
+	}
+
+	userID, err := users.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := i.getTSDB(userID)
+	if err != nil || db == nil {
+		return &client.UserStatsResponse{}, nil
+	}
+
+	userStat := createUserStats(db, i.cfg.ActiveSeriesMetricsEnabled)
+
+	return &client.UserStatsResponse{
+		IngestionRate:     userStat.IngestionRate,
+		NumSeries:         userStat.NumSeries,
+		ApiIngestionRate:  userStat.APIIngestionRate,
+		RuleIngestionRate: userStat.RuleIngestionRate,
+		ActiveSeries:      userStat.ActiveSeries,
+		LoadedBlocks:      userStat.LoadedBlocks,
+	}, nil
+}
+
+func (i *Ingester) userStats() []UserIDStats {
+	i.stoppedMtx.RLock()
+	defer i.stoppedMtx.RUnlock()
+
+	users := i.TSDBState.dbs
+
+	response := make([]UserIDStats, 0, len(users))
+	for id, db := range users {
+		response = append(response, UserIDStats{
+			UserID:    id,
+			UserStats: createUserStats(db, i.cfg.ActiveSeriesMetricsEnabled),
 		})
 	}
 
-	i.metrics.memoryChunks.Add(float64(len(series.chunkDescs) - prevNumChunks))
-	i.metrics.ingestedSamples.Inc()
-	switch source {
-	case cortexpb.RULE:
-		state.ingestedRuleSamples.Inc()
-	case cortexpb.API:
-		fallthrough
-	default:
-		state.ingestedAPISamples.Inc()
+	return response
+}
+
+// AllUserStatsHandler shows stats for all users.
+func (i *Ingester) AllUserStatsHandler(w http.ResponseWriter, r *http.Request) {
+	stats := i.userStats()
+
+	AllUserStatsRender(w, r, stats, 0, 0)
+}
+
+// AllUserStats returns ingestion statistics for all users known to this ingester.
+func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+	if err := i.checkRunning(); err != nil {
+		return nil, err
 	}
 
+	userStats := i.userStats()
+
+	response := &client.UsersStatsResponse{
+		Stats: make([]*client.UserIDStatsResponse, 0, len(userStats)),
+	}
+	for _, userStat := range userStats {
+		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
+			UserId: userStat.UserID,
+			Data: &client.UserStatsResponse{
+				IngestionRate:     userStat.IngestionRate,
+				NumSeries:         userStat.NumSeries,
+				ApiIngestionRate:  userStat.APIIngestionRate,
+				RuleIngestionRate: userStat.RuleIngestionRate,
+				ActiveSeries:      userStat.ActiveSeries,
+				LoadedBlocks:      userStat.LoadedBlocks,
+			},
+		})
+	}
+	return response, nil
+}
+
+func createUserStats(db *userTSDB, activeSeriesMetricsEnabled bool) UserStats {
+	apiRate := db.ingestedAPISamples.Rate()
+	ruleRate := db.ingestedRuleSamples.Rate()
+
+	var activeSeries uint64
+	if activeSeriesMetricsEnabled {
+		activeSeries = uint64(db.activeSeries.Active())
+	}
+
+	return UserStats{
+		IngestionRate:     apiRate + ruleRate,
+		APIIngestionRate:  apiRate,
+		RuleIngestionRate: ruleRate,
+		NumSeries:         db.Head().NumSeries(),
+		ActiveSeries:      activeSeries,
+		LoadedBlocks:      uint64(len(db.Blocks())),
+	}
+}
+
+const queryStreamBatchMessageSize = 1 * 1024 * 1024
+
+// QueryStream implements service.IngesterServer
+// Streams metrics from a TSDB. This implements the client.IngesterServer interface
+func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_QueryStreamServer) (err error) {
+	defer recoverIngester(i.logger, &err)
+	defer req.Free()
+
+	if err = i.checkRunning(); err != nil {
+		return err
+	}
+
+	spanlog, ctx := spanlogger.New(stream.Context(), "QueryStream")
+	defer spanlog.Finish()
+
+	userID, err := users.TenantID(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Set pprof labels for profiling
+	pprof.Do(ctx, pprof.Labels("user", userID, "source", requestmeta.GetSource(ctx)), func(ctx context.Context) {
+		err = i.queryStream(ctx, userID, req, stream, spanlog)
+	})
+
 	return err
+}
+
+func (i *Ingester) queryStream(ctx context.Context, userID string, req *client.QueryRequest, stream client.Ingester_QueryStreamServer, spanlog *spanlogger.SpanLogger) error {
+	from, through, matchers, err := client.FromQueryRequest(i.matchersCache, req)
+	if err != nil {
+		return err
+	}
+
+	matchers, shardMatcher, err := querysharding.ExtractShardingMatchers(matchers)
+	if err != nil {
+		return err
+	}
+
+	defer shardMatcher.Close()
+
+	i.metrics.queries.Inc()
+
+	db, err := i.getTSDB(userID)
+	if err != nil || db == nil {
+		return nil
+	}
+
+	if err := db.acquireReadLock(); err != nil {
+		return nil
+	}
+	defer db.releaseReadLock()
+
+	numSamples := 0
+	numSeries := 0
+	totalDataBytes := 0
+	numChunks := 0
+	numSeries, numSamples, totalDataBytes, numChunks, err = i.queryStreamChunks(ctx, userID, db, int64(from), int64(through), matchers, shardMatcher, stream)
+
+	if err != nil {
+		return err
+	}
+
+	i.metrics.queriedSeries.Observe(float64(numSeries))
+	i.metrics.queriedSamples.Observe(float64(numSamples))
+	i.metrics.queriedChunks.Observe(float64(numChunks))
+	level.Debug(spanlog).Log("series", numSeries, "samples", numSamples, "data_bytes", totalDataBytes, "chunks", numChunks)
+	spanlog.SetTag("series", numSeries)
+	spanlog.SetTag("samples", numSamples)
+	spanlog.SetTag("data_bytes", totalDataBytes)
+	spanlog.SetTag("chunks", numChunks)
+	return nil
+}
+
+func (i *Ingester) trackInflightQueryRequest() (func(), error) {
+	gl := i.getInstanceLimits()
+	if gl != nil && gl.MaxInflightQueryRequests > 0 {
+		if i.inflightQueryRequests.Load() >= gl.MaxInflightQueryRequests {
+			return nil, errTooManyInflightQueryRequests
+		}
+	}
+
+	if i.resourceBasedLimiter != nil {
+		if err := i.resourceBasedLimiter.AcceptNewRequest(); err != nil {
+			level.Warn(i.logger).Log("msg", "failed to accept request", "err", err)
+			return nil, limiter.ErrResourceLimitReached
+		}
+	}
+
+	i.maxInflightQueryRequests.Track(i.inflightQueryRequests.Inc())
+
+	return func() {
+		i.inflightQueryRequests.Dec()
+	}, nil
+}
+
+func isRegexUnOptimized(matcher *labels.Matcher) bool {
+	if matcher.Type != labels.MatchRegexp {
+		return false
+	}
+	// PostingsForMatchers will optimize .* and .+ matchers, so we don't need to check them.
+	if matcher.Value == ".*" || matcher.Value == ".+" {
+		return false
+	}
+	return !matcher.IsRegexOptimized()
+}
+
+// checkRegexMatcherLimits validates regex matchers against configured limits to prevent expensive queries.
+func (i *Ingester) checkRegexMatcherLimits(ctx context.Context, userID string, db *userTSDB, matchers []*labels.Matcher, from, through int64) error {
+	// Collect all unoptimized regex matchers upfront
+	var unoptimizedMatchers []*labels.Matcher
+	for _, matcher := range matchers {
+		if isRegexUnOptimized(matcher) {
+			unoptimizedMatchers = append(unoptimizedMatchers, matcher)
+			// Record pattern length metric
+			if i.metrics.unoptimizedRegexPatternLength != nil {
+				i.metrics.unoptimizedRegexPatternLength.Observe(float64(len(matcher.Value)))
+			}
+		}
+	}
+
+	if len(unoptimizedMatchers) == 0 {
+		return nil
+	}
+
+	// Check pattern length limit if configured
+	maxPatternLength := i.limits.MaxRegexPatternLength(userID)
+	if maxPatternLength > 0 {
+		for _, matcher := range unoptimizedMatchers {
+			patternLength := len(matcher.Value)
+			if patternLength > maxPatternLength {
+				if i.metrics.unoptimizedRegexRejectedTotal != nil {
+					i.metrics.unoptimizedRegexRejectedTotal.WithLabelValues(userID, "pattern_length").Inc()
+				}
+				return validation.LimitError(fmt.Sprintf(
+					"regex pattern length %d exceeds limit %d for unoptimized regex matcher %q. Consider using a more specific pattern.",
+					patternLength, maxPatternLength, matcher.String(),
+				))
+			}
+		}
+	}
+
+	// Query TSDB to collect cardinality and total value length metrics and check limits.
+	labelQuerier, err := db.Querier(from, through)
+	if err != nil {
+		return err
+	}
+	defer labelQuerier.Close()
+
+	maxCardinality := i.limits.MaxLabelCardinalityForUnoptimizedRegex(userID)
+	maxTotalValueLength := i.limits.MaxTotalLabelValueLengthForUnoptimizedRegex(userID)
+
+	for _, matcher := range unoptimizedMatchers {
+		labelVals, _, err := labelQuerier.LabelValues(ctx, matcher.Name, nil)
+		if err != nil {
+			// If we can't get label values, skip this matcher and continue checking others
+			continue
+		}
+
+		cardinality := len(labelVals)
+
+		// Calculate total length of all values
+		var totalValueLength int
+		for _, val := range labelVals {
+			totalValueLength += len(val)
+		}
+
+		// Always record metrics regardless of whether limits are configured (if metrics are enabled)
+		if i.metrics.unoptimizedRegexLabelCardinality != nil {
+			i.metrics.unoptimizedRegexLabelCardinality.Observe(float64(cardinality))
+		}
+		if i.metrics.unoptimizedRegexTotalValueLength != nil {
+			i.metrics.unoptimizedRegexTotalValueLength.Observe(float64(totalValueLength))
+		}
+
+		// Check limits only if configured
+		if maxCardinality > 0 && cardinality > maxCardinality {
+			if i.metrics.unoptimizedRegexRejectedTotal != nil {
+				i.metrics.unoptimizedRegexRejectedTotal.WithLabelValues(userID, "cardinality").Inc()
+			}
+			return validation.LimitError(fmt.Sprintf(
+				"label %q has cardinality %d which exceeds limit %d for unoptimized regex matcher %q. Consider using a more specific matcher.",
+				matcher.Name, cardinality, maxCardinality, matcher.String(),
+			))
+		}
+
+		if maxTotalValueLength > 0 && totalValueLength > maxTotalValueLength {
+			if i.metrics.unoptimizedRegexRejectedTotal != nil {
+				i.metrics.unoptimizedRegexRejectedTotal.WithLabelValues(userID, "total_value_length").Inc()
+			}
+			return validation.LimitError(fmt.Sprintf(
+				"label %q has total value length %d bytes (across %d values) which exceeds limit %d for unoptimized regex matcher %q. Consider using a more specific matcher.",
+				matcher.Name, totalValueLength, cardinality, maxTotalValueLength, matcher.String(),
+			))
+		}
+	}
+
+	return nil
+}
+
+// queryStreamChunks streams metrics from a TSDB. This implements the client.IngesterServer interface
+func (i *Ingester) queryStreamChunks(ctx context.Context, userID string, db *userTSDB, from, through int64, matchers []*labels.Matcher, sm *storepb.ShardMatcher, stream client.Ingester_QueryStreamServer) (numSeries, numSamples, totalBatchSizeBytes, numChunks int, _ error) {
+	q, err := db.ChunkQuerier(from, through)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer q.Close()
+
+	// Check regex matcher limits before executing query if enabled
+	if i.cfg.EnableRegexMatcherLimits {
+		if err := i.checkRegexMatcherLimits(ctx, userID, db, matchers, from, through); err != nil {
+			return 0, 0, 0, 0, err
+		}
+	}
+
+	c, err := i.trackInflightQueryRequest()
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	hints := &storage.SelectHints{
+		Start:           from,
+		End:             through,
+		DisableTrimming: i.cfg.DisableChunkTrimming,
+	}
+	var lazyMatchers []*labels.Matcher
+	if i.cfg.EnableMatcherOptimization {
+		matchers, lazyMatchers = optimizeMatchers(matchers)
+	}
+	// It's not required to return sorted series because series are sorted by the Cortex querier.
+	ss := q.Select(ctx, false, hints, matchers...)
+	c()
+	if ss.Err() != nil {
+		return 0, 0, 0, 0, ss.Err()
+	}
+
+	chunkSeries := getTimeSeriesChunksSlice()
+	defer putTimeSeriesChunksSlice(chunkSeries)
+	batchSizeBytes := 0
+	var it chunks.Iterator
+
+	now := time.Now()
+	// Check sampling decision early to avoid calculating hashes if batch will be skipped
+	var queriedSeriesHashes []uint64
+	sampled := false
+	if db.activeQueriedSeries != nil {
+		sampled = db.activeQueriedSeries.SampleRequest()
+		if sampled {
+			queriedSeriesHashes = getQueriedSeriesHashesSlice()
+		}
+	}
+
+	for ss.Next() {
+		series := ss.At()
+		lbls := series.Labels()
+
+		if !labelsMatches(lbls, lazyMatchers) {
+			continue
+		}
+
+		if sm.IsSharded() && !sm.MatchesLabels(lbls) {
+			continue
+		}
+
+		// Collect hash for batched tracking (only if sampling decision allows)
+		if sampled {
+			hash := lbls.Hash()
+			queriedSeriesHashes = append(queriedSeriesHashes, hash)
+		}
+
+		// convert labels to LabelAdapter
+		ts := client.TimeSeriesChunk{
+			Labels: cortexpb.FromLabelsToLabelAdapters(lbls),
+		}
+
+		it := series.Iterator(it)
+		for it.Next() {
+			// Chunks are ordered by min time.
+			meta := it.At()
+
+			// It is not guaranteed that chunk returned by iterator is populated.
+			// For now just return error. We could also try to figure out how to read the chunk.
+			if meta.Chunk == nil {
+				return 0, 0, 0, 0, errors.Errorf("unfilled chunk returned from TSDB chunk querier")
+			}
+
+			ch := client.Chunk{
+				StartTimestampMs: meta.MinTime,
+				EndTimestampMs:   meta.MaxTime,
+				Data:             meta.Chunk.Bytes(),
+			}
+
+			switch meta.Chunk.Encoding() {
+			case chunkenc.EncXOR:
+				ch.Encoding = int32(encoding.PrometheusXorChunk)
+			case chunkenc.EncHistogram:
+				ch.Encoding = int32(encoding.PrometheusHistogramChunk)
+			case chunkenc.EncFloatHistogram:
+				ch.Encoding = int32(encoding.PrometheusFloatHistogramChunk)
+			default:
+				return 0, 0, 0, 0, errors.Errorf("unknown chunk encoding from TSDB chunk querier: %v", meta.Chunk.Encoding())
+			}
+
+			ts.Chunks = append(ts.Chunks, ch)
+			numChunks++
+			numSamples += meta.Chunk.NumSamples()
+		}
+		numSeries++
+		tsSize := ts.Size()
+		totalBatchSizeBytes += tsSize
+
+		if (batchSizeBytes > 0 && batchSizeBytes+tsSize > queryStreamBatchMessageSize) || len(chunkSeries) >= queryStreamBatchSize {
+			// Adding this series to the batch would make it too big,
+			// flush the data and add it to new batch instead.
+			err = client.SendQueryStream(stream, &client.QueryStreamResponse{
+				Chunkseries: chunkSeries,
+			})
+			if err != nil {
+				return 0, 0, 0, 0, err
+			}
+
+			batchSizeBytes = 0
+			chunkSeries = chunkSeries[:0]
+		}
+
+		chunkSeries = append(chunkSeries, ts)
+		batchSizeBytes += tsSize
+	}
+
+	// Ensure no error occurred while iterating the series set.
+	if err := ss.Err(); err != nil {
+		return 0, 0, 0, 0, err
+	}
+
+	// Update active queried series tracking in a single batched call
+	if sampled && len(queriedSeriesHashes) > 0 && db.activeQueriedSeries != nil && i.activeQueriedSeriesService != nil {
+		i.activeQueriedSeriesService.UpdateSeriesBatch(db.activeQueriedSeries, queriedSeriesHashes, now, db.userID)
+	}
+
+	// Final flush any existing metrics
+	if batchSizeBytes != 0 {
+		err = client.SendQueryStream(stream, &client.QueryStreamResponse{
+			Chunkseries: chunkSeries,
+		})
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+	}
+
+	return numSeries, numSamples, totalBatchSizeBytes, numChunks, nil
+}
+
+func (i *Ingester) getTSDB(userID string) (*userTSDB, error) {
+	i.stoppedMtx.RLock()
+	defer i.stoppedMtx.RUnlock()
+	db := i.TSDBState.dbs[userID]
+	if db == nil {
+		return nil, errNoUserDb
+	}
+	return db, nil
+}
+
+// List all users for which we have a TSDB. We do it here in order
+// to keep the mutex locked for the shortest time possible.
+func (i *Ingester) getTSDBUsers() []string {
+	i.stoppedMtx.RLock()
+	defer i.stoppedMtx.RUnlock()
+
+	ids := make([]string, 0, len(i.TSDBState.dbs))
+	for userID := range i.TSDBState.dbs {
+		ids = append(ids, userID)
+	}
+
+	return ids
+}
+
+func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error) {
+	db, err := i.getTSDB(userID)
+	if db != nil {
+		if err != nil {
+			level.Warn(i.logger).Log("msg", "error getting user DB but userDB is not null", "err", err, "userID", userID)
+		}
+		return db, nil
+	}
+
+	i.stoppedMtx.Lock()
+	defer i.stoppedMtx.Unlock()
+
+	// Check again for DB in the event it was created in-between locks
+	var ok bool
+	db, ok = i.TSDBState.dbs[userID]
+	if ok {
+		return db, nil
+	}
+
+	// We're ready to create the TSDB, however we must be sure that the ingester
+	// is in the ACTIVE state, otherwise it may conflict with the transfer in/out.
+	// The TSDB is created when the first series is pushed and this shouldn't happen
+	// to a non-ACTIVE ingester, however we want to protect from any bug, cause we
+	// may have data loss or TSDB WAL corruption if the TSDB is created before/during
+	// a transfer in occurs.
+	if ingesterState := i.lifecycler.GetState(); !force && ingesterState != ring.ACTIVE {
+		return nil, fmt.Errorf(errTSDBCreateIncompatibleState, ingesterState)
+	}
+
+	gl := i.getInstanceLimits()
+	if gl != nil && gl.MaxInMemoryTenants > 0 {
+		if users := int64(len(i.TSDBState.dbs)); users >= gl.MaxInMemoryTenants {
+			return nil, errMaxUsersLimitReached
+		}
+	}
+
+	// Create the database and a shipper for a user
+	db, err = i.createTSDB(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add the db to list of user databases
+	i.TSDBState.dbs[userID] = db
+	i.metrics.memUsers.Inc()
+
+	return db, nil
+}
+
+func (i *Ingester) blockChunkQuerierFunc(userId string) tsdb.BlockChunkQuerierFunc {
+	return func(b tsdb.BlockReader, mint, maxt int64) (storage.ChunkQuerier, error) {
+		db, err := i.getTSDB(userId)
+
+		var postingCache cortex_tsdb.ExpandedPostingsCache
+		if err == nil && db != nil {
+			postingCache = db.postingCache
+		}
+
+		// Caching expanded postings for queries that are "in the future" may lead to incorrect results being cached.
+		// This occurs because the tsdb.PostingsForMatchers function can return invalid data in such scenarios.
+		// For more details, see: https://github.com/cortexproject/cortex/issues/6556
+		// TODO: alanprot: Consider removing this logic when prometheus is updated as this logic is "fixed" upstream.
+		var q storage.ChunkQuerier
+		if postingCache == nil || mint > db.Head().MaxTime() {
+			q, err = tsdb.NewBlockChunkQuerier(b, mint, maxt)
+		} else {
+			q, err = cortex_tsdb.NewCachedBlockChunkQuerier(postingCache, b, mint, maxt)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		// Wrap only for head queriers when head queried series metrics are enabled.
+		if i.cfg.HeadQueriedSeriesMetricsEnabled && isHead(b) && db != nil && db.headQueriedSeries != nil {
+			q = &headQueriedSeriesChunkQuerier{
+				ChunkQuerier:               q,
+				headQueriedSeries:          db.headQueriedSeries,
+				activeQueriedSeriesService: i.activeQueriedSeriesService,
+				userID:                     userId,
+				sampled:                    db.headQueriedSeries.SampleRequest(),
+			}
+		}
+
+		return q, nil
+	}
+}
+
+// createTSDB creates a TSDB for a given userID, and returns the created db.
+func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
+	tsdbPromReg := prometheus.NewRegistry()
+	udir := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	userLogger := logutil.WithUserID(userID, i.logger)
+
+	blockRanges := i.cfg.BlocksStorageConfig.TSDB.BlockRanges.ToMilliseconds()
+
+	var postingCache cortex_tsdb.ExpandedPostingsCache
+	if i.expandedPostingsCacheFactory != nil {
+		postingCache = i.expandedPostingsCacheFactory.NewExpandedPostingsCache(userID, i.metrics.expandedPostingsCacheMetrics)
+	}
+
+	var activeQueriedSeries *ActiveQueriedSeries
+	if i.cfg.ActiveQueriedSeriesMetricsEnabled {
+		activeQueriedSeries = NewActiveQueriedSeries(
+			i.cfg.ActiveQueriedSeriesMetricsWindows,
+			i.cfg.ActiveQueriedSeriesMetricsWindowDuration,
+			i.cfg.ActiveQueriedSeriesMetricsSampleRate,
+			i.logger,
+		)
+	}
+
+	var headQueriedSeries *ActiveQueriedSeries
+	if i.cfg.HeadQueriedSeriesMetricsEnabled {
+		headQueriedSeries = NewActiveQueriedSeries(
+			i.cfg.HeadQueriedSeriesMetricsWindows,
+			i.cfg.HeadQueriedSeriesMetricsWindowDuration,
+			i.cfg.HeadQueriedSeriesMetricsSampleRate,
+			i.logger,
+		)
+	}
+
+	userDB := &userTSDB{
+		userID:              userID,
+		logger:              userLogger,
+		activeSeries:        NewActiveSeries(),
+		activeQueriedSeries: activeQueriedSeries,
+		headQueriedSeries:   headQueriedSeries,
+		seriesInMetric:      newMetricCounter(i.limiter, i.cfg.getIgnoreSeriesLimitForMetricNamesMap()),
+		labelSetCounter:     newLabelSetCounter(i.limiter),
+		trackerCounter:      newTrackerCounter(),
+		ingestedAPISamples:  util_math.NewEWMARate(0.2, i.cfg.RateUpdatePeriod),
+		ingestedRuleSamples: util_math.NewEWMARate(0.2, i.cfg.RateUpdatePeriod),
+
+		instanceLimitsFn:             i.getInstanceLimits,
+		instanceSeriesCount:          &i.TSDBState.seriesCount,
+		interner:                     util.NewLruInterner(i.cfg.LabelsStringInterningEnabled),
+		labelsStringInterningEnabled: i.cfg.LabelsStringInterningEnabled,
+
+		blockRetentionPeriod: i.cfg.BlocksStorageConfig.TSDB.Retention.Milliseconds(),
+		postingCache:         postingCache,
+	}
+
+	enableExemplars := false
+	maxExemplarsForUser := i.getMaxExemplars(userID)
+	if maxExemplarsForUser > 0 {
+		enableExemplars = true
+	}
+	oooTimeWindow := i.limits.OutOfOrderTimeWindow(userID)
+
+	walCompressType := compression.None
+	if i.cfg.BlocksStorageConfig.TSDB.WALCompressionType != "" {
+		walCompressType = i.cfg.BlocksStorageConfig.TSDB.WALCompressionType
+	}
+
+	// Create a new user database
+	db, err := tsdb.Open(udir, logutil.GoKitLogToSlog(userLogger), tsdbPromReg, &tsdb.Options{
+		RetentionDuration:              i.cfg.BlocksStorageConfig.TSDB.Retention.Milliseconds(),
+		MinBlockDuration:               blockRanges[0],
+		MaxBlockDuration:               blockRanges[len(blockRanges)-1],
+		NoLockfile:                     true,
+		StripeSize:                     i.cfg.BlocksStorageConfig.TSDB.StripeSize,
+		HeadChunksWriteBufferSize:      i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteBufferSize,
+		WALCompression:                 walCompressType,
+		WALSegmentSize:                 i.cfg.BlocksStorageConfig.TSDB.WALSegmentSizeBytes,
+		SeriesLifecycleCallback:        userDB,
+		BlocksToDelete:                 userDB.blocksToDelete,
+		EnableExemplarStorage:          enableExemplars,
+		IsolationDisabled:              true,
+		MaxExemplars:                   maxExemplarsForUser,
+		HeadChunksWriteQueueSize:       i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteQueueSize,
+		EnableMemorySnapshotOnShutdown: i.cfg.BlocksStorageConfig.TSDB.MemorySnapshotOnShutdown,
+		OutOfOrderTimeWindow:           time.Duration(oooTimeWindow).Milliseconds(),
+		OutOfOrderCapMax:               i.cfg.BlocksStorageConfig.TSDB.OutOfOrderCapMax,
+		EnableOverlappingCompaction:    false, // Always let compactors handle overlapped blocks, e.g. OOO blocks.
+		BlockChunkQuerierFunc:          i.blockChunkQuerierFunc(userID),
+		BlockReloadInterval:            1 * time.Minute, // use default value
+	}, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to open TSDB: %s", udir)
+	}
+	db.DisableCompactions() // we will compact on our own schedule
+
+	// Run compaction before using this TSDB. If there is data in head that needs to be put into blocks,
+	// this will actually create the blocks. If there is no data (empty TSDB), this is a no-op, although
+	// local blocks compaction may still take place if configured.
+	level.Info(userLogger).Log("msg", "Running compaction after WAL replay")
+	err = db.Compact(context.TODO())
+	if err != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			level.Warn(userLogger).Log("msg", "failed to close TSDB after compact failure", "err", closeErr)
+		}
+		return nil, errors.Wrapf(err, "failed to compact TSDB: %s", udir)
+	}
+
+	userDB.db = db
+	// We set the limiter here because we don't want to limit
+	// series during WAL replay.
+	userDB.limiter = i.limiter
+
+	if db.Head().NumSeries() > 0 {
+		// If there are series in the head, use max time from head. If this time is too old,
+		// TSDB will be eligible for flushing and closing sooner, unless more data is pushed to it quickly.
+		userDB.setLastUpdate(util.TimeFromMillis(db.Head().MaxTime()))
+	} else {
+		// If head is empty (eg. new TSDB), don't close it right after.
+		userDB.setLastUpdate(time.Now())
+	}
+
+	// Thanos shipper requires at least 1 external label to be set. For this reason,
+	// we set the tenant ID as external label and we'll filter it out when reading
+	// the series from the storage.
+	l := labels.FromStrings(cortex_tsdb.TenantIDExternalLabel, userID, cortex_tsdb.IngesterIDExternalLabel, i.TSDBState.shipperIngesterID)
+
+	// Create a new shipper for this database
+	if i.cfg.BlocksStorageConfig.TSDB.IsBlocksShippingEnabled() {
+		udirRoot, err := os.OpenRoot(udir)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to open root dir for shipper: %s", udir)
+		}
+
+		userDB.shipper = shipper.New(
+			bucket.NewUserBucketClient(userID, i.TSDBState.bucket, i.limits),
+			udirRoot,
+			shipper.WithLogger(userLogger),
+			shipper.WithRegisterer(tsdbPromReg),
+			shipper.WithLabels(func() labels.Labels { return l }),
+			shipper.WithSource(metadata.ReceiveSource),
+			shipper.WithHashFunc(metadata.NoneFunc),
+			shipper.WithUploadCompacted(i.cfg.UploadCompactedBlocksEnabled),
+			shipper.WithAllowOutOfOrderUploads(true), // Allow out of order uploads. It's fine in Cortex's context.
+			shipper.WithSkipCorruptedBlocks(true),    // We allow out of order uploads. This is the same behavior. We should track error with metrics
+		)
+		userDB.shipperMetadataFilePath = filepath.Join(userDB.db.Dir(), filepath.Clean(shipper.DefaultMetaFilename))
+
+		// Initialise the shipper blocks cache.
+		if err := userDB.updateCachedShippedBlocks(); err != nil {
+			level.Error(userLogger).Log("msg", "failed to update cached shipped blocks after shipper initialisation", "err", err)
+		}
+	}
+
+	i.TSDBState.tsdbMetrics.setRegistryForUser(userID, tsdbPromReg)
+	return userDB, nil
+}
+
+func (i *Ingester) closeAllTSDB() {
+	i.stoppedMtx.Lock()
+
+	wg := &sync.WaitGroup{}
+	wg.Add(len(i.TSDBState.dbs))
+
+	// Concurrently close all users TSDB
+	for userID, userDB := range i.TSDBState.dbs {
+
+		go func(db *userTSDB) {
+			defer wg.Done()
+
+			if err := db.Close(); err != nil {
+				level.Warn(i.logger).Log("msg", "unable to close TSDB", "err", err, "user", userID)
+				return
+			}
+
+			// Now that the TSDB has been closed, we should remove it from the
+			// set of open ones. This lock acquisition doesn't deadlock with the
+			// outer one, because the outer one is released as soon as all go
+			// routines are started.
+			i.stoppedMtx.Lock()
+			delete(i.TSDBState.dbs, userID)
+			i.stoppedMtx.Unlock()
+
+			i.metrics.memUsers.Dec()
+			i.metrics.activeSeriesPerUser.DeleteLabelValues(userID)
+			i.metrics.activeNHSeriesPerUser.DeleteLabelValues(userID)
+			i.metrics.headMetricNamesPerUser.DeleteLabelValues(userID)
+		}(userDB)
+	}
+
+	// Wait until all Close() completed
+	i.stoppedMtx.Unlock()
+	wg.Wait()
+}
+
+// openExistingTSDB walks the user tsdb dir, and opens a tsdb for each user. This may start a WAL replay, so we limit the number of
+// concurrently opening TSDB.
+func (i *Ingester) openExistingTSDB(ctx context.Context) error {
+	level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "opening existing TSDBs")
+
+	queue := make(chan string)
+	group, groupCtx := errgroup.WithContext(ctx)
+
+	// Create a pool of workers which will open existing TSDBs.
+	for n := 0; n < i.cfg.BlocksStorageConfig.TSDB.MaxTSDBOpeningConcurrencyOnStartup; n++ {
+		group.Go(func() error {
+			for userID := range queue {
+				startTime := time.Now()
+
+				db, err := i.createTSDB(userID)
+				if err != nil {
+					level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "unable to open TSDB", "err", err, "user", userID)
+					return errors.Wrapf(err, "unable to open TSDB for user %s", userID)
+				}
+
+				// Add the database to the map of user databases
+				i.stoppedMtx.Lock()
+				i.TSDBState.dbs[userID] = db
+				i.stoppedMtx.Unlock()
+				i.metrics.memUsers.Inc()
+
+				i.TSDBState.walReplayTime.Observe(time.Since(startTime).Seconds())
+			}
+
+			return nil
+		})
+	}
+
+	// Spawn a goroutine to find all users with a TSDB on the filesystem.
+	group.Go(func() error {
+		// Close the queue once filesystem walking is done.
+		defer close(queue)
+
+		walkErr := filepath.Walk(i.cfg.BlocksStorageConfig.TSDB.Dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				// If the root directory doesn't exist, we're OK (not needed to be created upfront).
+				if os.IsNotExist(err) && path == i.cfg.BlocksStorageConfig.TSDB.Dir {
+					return filepath.SkipDir
+				}
+
+				level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "an error occurred while iterating the filesystem storing TSDBs", "path", path, "err", err)
+				return errors.Wrapf(err, "an error occurred while iterating the filesystem storing TSDBs at %s", path)
+			}
+
+			// Skip root dir and all other files
+			if path == i.cfg.BlocksStorageConfig.TSDB.Dir || !info.IsDir() {
+				return nil
+			}
+
+			// Top level directories are assumed to be user TSDBs
+			userID := info.Name()
+			f, err := os.Open(path)
+			if err != nil {
+				level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "unable to open TSDB dir", "err", err, "user", userID, "path", path)
+				return errors.Wrapf(err, "unable to open TSDB dir %s for user %s", path, userID)
+			}
+			defer f.Close()
+
+			// If the dir is empty skip it
+			if _, err := f.Readdirnames(1); err != nil {
+				if err == io.EOF {
+					return filepath.SkipDir
+				}
+
+				level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "unable to read TSDB dir", "err", err, "user", userID, "path", path)
+				return errors.Wrapf(err, "unable to read TSDB dir %s for user %s", path, userID)
+			}
+
+			// Enqueue the user to be processed.
+			select {
+			case queue <- userID:
+				// Nothing to do.
+			case <-groupCtx.Done():
+				// Interrupt in case a failure occurred in another goroutine.
+				return nil
+			}
+
+			// Don't descend into subdirectories.
+			return filepath.SkipDir
+		})
+
+		return errors.Wrapf(walkErr, "unable to walk directory %s containing existing TSDBs", i.cfg.BlocksStorageConfig.TSDB.Dir)
+	})
+
+	// Wait for all workers to complete.
+	err := group.Wait()
+	if err != nil {
+		level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "error while opening existing TSDBs", "err", err)
+		return err
+	}
+
+	level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "successfully opened existing TSDBs")
+	return nil
+}
+
+// getMemorySeriesMetric returns the total number of in-memory series across all open TSDBs.
+func (i *Ingester) getMemorySeriesMetric() float64 {
+	if err := i.checkRunning(); err != nil {
+		return 0
+	}
+
+	i.stoppedMtx.RLock()
+	defer i.stoppedMtx.RUnlock()
+
+	count := uint64(0)
+	for _, db := range i.TSDBState.dbs {
+		count += db.Head().NumSeries()
+	}
+
+	return float64(count)
+}
+
+// getOldestUnshippedBlockMetric returns the unix timestamp of the oldest unshipped block or
+// 0 if all blocks have been shipped.
+func (i *Ingester) getOldestUnshippedBlockMetric() float64 {
+	i.stoppedMtx.RLock()
+	defer i.stoppedMtx.RUnlock()
+
+	oldest := uint64(0)
+	for _, db := range i.TSDBState.dbs {
+		if ts := db.getOldestUnshippedBlockTime(); oldest == 0 || ts < oldest {
+			oldest = ts
+		}
+	}
+
+	return float64(oldest / 1000)
+}
+
+func (i *Ingester) shipBlocksLoop(ctx context.Context) error {
+	// We add a slight jitter to make sure that if the head compaction interval and ship interval are set to the same
+	// value they don't clash (if they both continuously run at the same exact time, the head compaction may not run
+	// because can't successfully change the state).
+	shipTicker := time.NewTicker(util.DurationWithJitter(i.cfg.BlocksStorageConfig.TSDB.ShipInterval, 0.01))
+	defer shipTicker.Stop()
+
+	for {
+		select {
+		case <-shipTicker.C:
+			i.shipBlocks(ctx, nil)
+
+		case req := <-i.TSDBState.shipTrigger:
+			i.shipBlocks(ctx, req.users)
+			close(req.callback) // Notify back.
+
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+// shipBlocks runs shipping for all users.
+func (i *Ingester) shipBlocks(ctx context.Context, allowed *users.AllowedTenants) {
+	// Do not ship blocks if the ingester is PENDING or JOINING. It's
+	// particularly important for the JOINING state because there could
+	// be a blocks transfer in progress (from another ingester) and if we
+	// run the shipper in such state we could end up with race conditions.
+	if i.lifecycler != nil {
+		if ingesterState := i.lifecycler.GetState(); ingesterState == ring.PENDING || ingesterState == ring.JOINING {
+			level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB blocks shipping has been skipped because of the current ingester state", "state", ingesterState)
+			return
+		}
+	}
+
+	// Number of concurrent workers is limited in order to avoid to concurrently sync a lot
+	// of tenants in a large cluster.
+	_ = concurrency.ForEachUser(ctx, i.getTSDBUsers(), i.cfg.BlocksStorageConfig.TSDB.ShipConcurrency, func(ctx context.Context, userID string) error {
+		if !allowed.IsAllowed(userID) {
+			return nil
+		}
+
+		// Get the user's DB. If the user doesn't exist, we skip it.
+		userDB, err := i.getTSDB(userID)
+		if err != nil || userDB == nil || userDB.shipper == nil {
+			return nil
+		}
+
+		if userDB.deletionMarkFound.Load() {
+			return nil
+		}
+
+		if time.Since(time.Unix(userDB.lastDeletionMarkCheck.Load(), 0)) > cortex_tsdb.DeletionMarkCheckInterval {
+			// Even if check fails with error, we don't want to repeat it too often.
+			userDB.lastDeletionMarkCheck.Store(time.Now().Unix())
+
+			deletionMarkExists, err := users.TenantDeletionMarkExists(ctx, i.TSDBState.bucket, userID)
+			if err != nil {
+				// If we cannot check for deletion mark, we continue anyway, even though in production shipper will likely fail too.
+				// This however simplifies unit tests, where tenant deletion check is enabled by default, but tests don't setup bucket.
+				level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "failed to check for tenant deletion mark before shipping blocks", "user", userID, "err", err)
+			} else if deletionMarkExists {
+				userDB.deletionMarkFound.Store(true)
+
+				level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "tenant deletion mark exists, not shipping blocks", "user", userID)
+				return nil
+			}
+		}
+
+		// Run the shipper's Sync() to upload unshipped blocks. Make sure the TSDB state is active, in order to
+		// avoid any race condition with closing idle TSDBs.
+		if success, _ := userDB.casState(active, activeShipping); !success {
+			level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "shipper skipped because the TSDB is not active", "user", userID)
+			return nil
+		}
+		defer userDB.casState(activeShipping, active)
+
+		if idxs, err := bucketindex.ReadSyncStatus(ctx, i.TSDBState.bucket, userID, logutil.WithContext(ctx, i.logger)); err == nil {
+			// Skip blocks shipping if the bucket index failed to sync due to CMK errors.
+			if idxs.Status == bucketindex.CustomerManagedKeyError {
+				level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "skipping shipping blocks due CustomerManagedKeyError", "user", userID)
+				return nil
+			}
+		}
+
+		uploaded, err := userDB.shipper.Sync(ctx)
+		if err != nil {
+			level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "shipper failed to synchronize TSDB blocks with the storage", "user", userID, "uploaded", uploaded, "err", err)
+		} else {
+			level.Debug(logutil.WithContext(ctx, i.logger)).Log("msg", "shipper successfully synchronized TSDB blocks with storage", "user", userID, "uploaded", uploaded)
+		}
+
+		// The shipper meta file could be updated even if the Sync() returned an error,
+		// so it's safer to update it each time at least a block has been uploaded.
+		// Moreover, the shipper meta file could be updated even if no blocks are uploaded
+		// (eg. blocks removed due to retention) but doesn't cause any harm not updating
+		// the cached list of blocks in such case, so we're not handling it.
+		if uploaded > 0 {
+			if err := userDB.updateCachedShippedBlocks(); err != nil {
+				level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "failed to update cached shipped blocks after shipper synchronisation", "user", userID, "err", err)
+			}
+		}
+
+		return nil
+	})
+}
+
+func (i *Ingester) compactionLoop(ctx context.Context) error {
+	infoFunc := func() (int, int) {
+		if i.cfg.LifecyclerConfig.RingConfig.ZoneAwarenessEnabled {
+			zones := i.lifecycler.Zones()
+			if len(zones) != 0 {
+				return slices.Index(zones, i.lifecycler.Zone), len(zones)
+			}
+		}
+
+		// Lets create the slot based on the hash id
+		i := int(client.HashAdd32(client.HashNew32(), i.lifecycler.ID) % 10)
+		return i, 10
+	}
+	ticker := util.NewSlottedTicker(infoFunc, i.cfg.BlocksStorageConfig.TSDB.HeadCompactionInterval, 1)
+	defer ticker.Stop()
+
+	for ctx.Err() == nil {
+		select {
+		case <-ticker.C:
+			i.compactBlocks(ctx, false, nil)
+
+		case req := <-i.TSDBState.forceCompactTrigger:
+			i.compactBlocks(ctx, true, req.users)
+			close(req.callback) // Notify back.
+
+		case <-ctx.Done():
+			return nil
+		}
+	}
+	return nil
+}
+
+// Compacts all compactable blocks. Force flag will force compaction even if head is not compactable yet.
+func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *users.AllowedTenants) {
+	// Don't compact TSDB blocks while JOINING as there may be ongoing blocks transfers.
+	// Compaction loop is not running in LEAVING state, so if we get here in LEAVING state, we're flushing blocks.
+	if i.lifecycler != nil {
+		if ingesterState := i.lifecycler.GetState(); ingesterState == ring.JOINING {
+			level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB blocks compaction has been skipped because of the current ingester state", "state", ingesterState)
+			return
+		}
+	}
+
+	_ = concurrency.ForEachUser(ctx, i.getTSDBUsers(), i.cfg.BlocksStorageConfig.TSDB.HeadCompactionConcurrency, func(ctx context.Context, userID string) error {
+		if !allowed.IsAllowed(userID) {
+			return nil
+		}
+
+		userDB, err := i.getTSDB(userID)
+		if err != nil || userDB == nil {
+			return nil
+		}
+
+		// Don't do anything, if there is nothing to compact.
+		h := userDB.Head()
+		if h.NumSeries() == 0 {
+			return nil
+		}
+
+		i.TSDBState.compactionsTriggered.Inc()
+
+		reason := ""
+		switch {
+		case force:
+			reason = "forced"
+			err = userDB.compactHead(ctx, i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
+
+		case i.TSDBState.compactionIdleTimeout > 0 && userDB.isIdle(time.Now(), i.TSDBState.compactionIdleTimeout):
+			reason = "idle"
+			level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB is idle, forcing compaction", "user", userID)
+			err = userDB.compactHead(ctx, i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
+
+		default:
+			reason = "regular"
+			err = userDB.Compact(ctx)
+		}
+
+		if err != nil {
+			// Don't treat blocks shipping as a failure
+			if errors.Is(err, errTsdbShipping) {
+				level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB blocks compaction for user was skipped", "user", userID, "err", err, "compactReason", reason)
+			} else {
+				i.TSDBState.compactionsFailed.Inc()
+				level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB blocks compaction for user has failed", "user", userID, "err", err, "compactReason", reason)
+			}
+		} else {
+			level.Debug(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB blocks compaction completed successfully", "user", userID, "compactReason", reason)
+		}
+
+		return nil
+	})
+}
+
+func (i *Ingester) closeAndDeleteIdleUserTSDBs(ctx context.Context) error {
+	for _, userID := range i.getTSDBUsers() {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		result := i.closeAndDeleteUserTSDBIfIdle(userID)
+
+		i.TSDBState.idleTsdbChecks.WithLabelValues(string(result)).Inc()
+	}
+
+	return nil
+}
+
+func (i *Ingester) expirePostingsCache(ctx context.Context) error {
+	for _, userID := range i.getTSDBUsers() {
+		if ctx.Err() != nil {
+			return nil
+		}
+		userDB, err := i.getTSDB(userID)
+		if err != nil || userDB == nil || userDB.postingCache == nil {
+			continue
+		}
+		userDB.postingCache.PurgeExpiredItems()
+	}
+
+	return nil
+}
+
+func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckResult {
+	userDB, err := i.getTSDB(userID)
+	if err != nil || userDB == nil || userDB.shipper == nil {
+		// We will not delete local data when not using shipping to storage.
+		return tsdbShippingDisabled
+	}
+
+	if result := userDB.shouldCloseTSDB(i.cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBTimeout); !result.shouldClose() {
+		return result
+	}
+
+	// This disables pushes and force-compactions. Not allowed to close while shipping is in progress.
+	if success, _ := userDB.casState(active, closing); !success {
+		return tsdbNotActive
+	}
+
+	// If TSDB is fully closed, we will set state to 'closed', which will prevent this deferred closing -> active transition.
+	defer userDB.casState(closing, active)
+
+	// Make sure we don't ignore any possible inflight requests.
+	userDB.pushesInFlight.Wait()
+	userDB.readInFlight.Wait()
+
+	// Verify again, things may have changed during the checks and pushes.
+	tenantDeleted := false
+	if result := userDB.shouldCloseTSDB(i.cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBTimeout); !result.shouldClose() {
+		// This will also change TSDB state back to active (via defer above).
+		return result
+	} else if result == tsdbTenantMarkedForDeletion {
+		tenantDeleted = true
+	}
+
+	// At this point there are no more pushes to TSDB, and no possible compaction. Normally TSDB is empty,
+	// but if we're closing TSDB because of tenant deletion mark, then it may still contain some series.
+	// We need to remove these series from series count.
+	i.TSDBState.seriesCount.Sub(int64(userDB.Head().NumSeries()))
+
+	dir := userDB.db.Dir()
+
+	if err := userDB.Close(); err != nil {
+		level.Error(i.logger).Log("msg", "failed to close idle TSDB", "user", userID, "err", err)
+		return tsdbCloseFailed
+	}
+
+	level.Info(i.logger).Log("msg", "closed idle TSDB", "user", userID)
+
+	// This will prevent going back to "active" state in deferred statement.
+	userDB.casState(closing, closed)
+
+	// Only remove user from TSDBState when everything is cleaned up
+	// This will prevent concurrency problems when cortex are trying to open new TSDB - Ie: New request for a given tenant
+	// came in - while closing the tsdb for the same tenant.
+	// If this happens now, the request will get reject as the push will not be able to acquire the lock as the tsdb will be
+	// in closed state
+	defer func() {
+		i.stoppedMtx.Lock()
+		delete(i.TSDBState.dbs, userID)
+		i.stoppedMtx.Unlock()
+	}()
+
+	i.metrics.memUsers.Dec()
+	i.TSDBState.tsdbMetrics.removeRegistryForUser(userID)
+
+	i.deleteUserMetadata(userID)
+	i.metrics.deletePerUserMetrics(userID)
+
+	validation.DeletePerUserValidationMetrics(i.validateMetrics, userID, i.logger)
+
+	// And delete local data.
+	if err := os.RemoveAll(dir); err != nil {
+		level.Error(i.logger).Log("msg", "failed to delete local TSDB", "user", userID, "err", err)
+		return tsdbDataRemovalFailed
+	}
+
+	if tenantDeleted {
+		level.Info(i.logger).Log("msg", "deleted local TSDB, user marked for deletion", "user", userID, "dir", dir)
+		return tsdbTenantMarkedForDeletion
+	}
+
+	level.Info(i.logger).Log("msg", "deleted local TSDB, due to being idle", "user", userID, "dir", dir)
+	return tsdbIdleClosed
 }
 
 // pushMetadata returns number of ingested metadata.
@@ -696,12 +3669,12 @@ func (i *Ingester) pushMetadata(ctx context.Context, userID string, metadata []*
 }
 
 func (i *Ingester) appendMetadata(userID string, m *cortexpb.MetricMetadata) error {
-	i.userStatesMtx.RLock()
+	i.stoppedMtx.RLock()
 	if i.stopped {
-		i.userStatesMtx.RUnlock()
+		i.stoppedMtx.RUnlock()
 		return errIngesterStopping
 	}
-	i.userStatesMtx.RUnlock()
+	i.stoppedMtx.RUnlock()
 
 	userMetadata := i.getOrCreateUserMetadata(userID)
 
@@ -720,7 +3693,7 @@ func (i *Ingester) getOrCreateUserMetadata(userID string) *userMetricsMetadata {
 	// Ensure it was not created between switching locks.
 	userMetadata, ok := i.usersMetadata[userID]
 	if !ok {
-		userMetadata = newMetadataMap(i.limiter, i.metrics, userID)
+		userMetadata = newMetadataMap(i.limiter, i.metrics, i.validateMetrics, userID, i.cfg.SkipMetadataLimits)
 		i.usersMetadata[userID] = userMetadata
 	}
 	return userMetadata
@@ -771,361 +3744,320 @@ func (i *Ingester) purgeUserMetricsMetadata() {
 	}
 }
 
-// Query implements service.IngesterServer
-func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client.QueryResponse, error) {
-	if i.cfg.BlocksStorageEnabled {
-		return i.v2Query(ctx, req)
+// This method will flush all data. It is called as part of Lifecycler's shutdown (if flush on shutdown is configured), or from the flusher.
+//
+// When called as during Lifecycler shutdown, this happens as part of normal Ingester shutdown (see stopping method).
+// Samples are not received at this stage. Compaction and Shipping loops have already been stopped as well.
+//
+// When used from flusher, ingester is constructed in a way that compaction, shipping and receiving of samples is never started.
+func (i *Ingester) lifecyclerFlush() {
+	level.Info(i.logger).Log("msg", "starting to flush and ship TSDB blocks")
+
+	ctx := context.Background()
+
+	i.compactBlocks(ctx, true, nil)
+	if i.cfg.BlocksStorageConfig.TSDB.IsBlocksShippingEnabled() {
+		i.shipBlocks(ctx, nil)
 	}
 
-	if err := i.checkRunningOrStopping(); err != nil {
-		return nil, err
-	}
-
-	userID, err := tenant.TenantID(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	from, through, matchers, err := client.FromQueryRequest(req)
-	if err != nil {
-		return nil, err
-	}
-
-	i.metrics.queries.Inc()
-
-	i.userStatesMtx.RLock()
-	state, ok, err := i.userStates.getViaContext(ctx)
-	i.userStatesMtx.RUnlock()
-	if err != nil {
-		return nil, err
-	} else if !ok {
-		return &client.QueryResponse{}, nil
-	}
-
-	result := &client.QueryResponse{}
-	numSeries, numSamples := 0, 0
-	maxSamplesPerQuery := i.limits.MaxSamplesPerQuery(userID)
-	err = state.forSeriesMatching(ctx, matchers, func(ctx context.Context, _ model.Fingerprint, series *memorySeries) error {
-		values, err := series.samplesForRange(from, through)
-		if err != nil {
-			return err
-		}
-		if len(values) == 0 {
-			return nil
-		}
-		numSeries++
-
-		numSamples += len(values)
-		if numSamples > maxSamplesPerQuery {
-			return httpgrpc.Errorf(http.StatusRequestEntityTooLarge, "exceeded maximum number of samples in a query (%d)", maxSamplesPerQuery)
-		}
-
-		ts := cortexpb.TimeSeries{
-			Labels:  cortexpb.FromLabelsToLabelAdapters(series.metric),
-			Samples: make([]cortexpb.Sample, 0, len(values)),
-		}
-		for _, s := range values {
-			ts.Samples = append(ts.Samples, cortexpb.Sample{
-				Value:       float64(s.Value),
-				TimestampMs: int64(s.Timestamp),
-			})
-		}
-		result.Timeseries = append(result.Timeseries, ts)
-		return nil
-	}, nil, 0)
-	i.metrics.queriedSeries.Observe(float64(numSeries))
-	i.metrics.queriedSamples.Observe(float64(numSamples))
-	return result, err
+	level.Info(i.logger).Log("msg", "finished flushing and shipping TSDB blocks")
 }
 
-// QueryStream implements service.IngesterServer
-func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_QueryStreamServer) error {
-	if i.cfg.BlocksStorageEnabled {
-		return i.v2QueryStream(req, stream)
-	}
+const (
+	tenantParam = "tenant"
+	waitParam   = "wait"
+)
 
-	if err := i.checkRunningOrStopping(); err != nil {
-		return err
-	}
-
-	spanLog, ctx := spanlogger.New(stream.Context(), "QueryStream")
-	defer spanLog.Finish()
-
-	from, through, matchers, err := client.FromQueryRequest(req)
+// Blocks version of Flush handler. It force-compacts blocks, and triggers shipping.
+func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseForm()
 	if err != nil {
-		return err
+		level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "failed to parse HTTP request in flush handler", "err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
-	i.metrics.queries.Inc()
+	tenants := r.Form[tenantParam]
 
-	i.userStatesMtx.RLock()
-	state, ok, err := i.userStates.getViaContext(ctx)
-	i.userStatesMtx.RUnlock()
-	if err != nil {
-		return err
-	} else if !ok {
-		return nil
-	}
+	allowedUsers := users.NewAllowedTenants(tenants, nil)
+	run := func() {
+		ingCtx := i.ServiceContext()
+		if ingCtx == nil || ingCtx.Err() != nil {
+			level.Info(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flushing TSDB blocks: ingester not running, ignoring flush request")
+			return
+		}
 
-	numSeries, numChunks := 0, 0
-	reuseWireChunks := [queryStreamBatchSize][]client.Chunk{}
-	batch := make([]client.TimeSeriesChunk, 0, queryStreamBatchSize)
-	// We'd really like to have series in label order, not FP order, so we
-	// can iteratively merge them with entries coming from the chunk store.  But
-	// that would involve locking all the series & sorting, so until we have
-	// a better solution in the ingesters I'd rather take the hit in the queriers.
-	err = state.forSeriesMatching(stream.Context(), matchers, func(ctx context.Context, _ model.Fingerprint, series *memorySeries) error {
-		chunks := make([]*desc, 0, len(series.chunkDescs))
-		for _, chunk := range series.chunkDescs {
-			if !(chunk.FirstTime.After(through) || chunk.LastTime.Before(from)) {
-				chunks = append(chunks, chunk.slice(from, through))
+		compactionCallbackCh := make(chan struct{})
+
+		level.Info(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flushing TSDB blocks: triggering compaction")
+		select {
+		case i.TSDBState.forceCompactTrigger <- requestWithUsersAndCallback{users: allowedUsers, callback: compactionCallbackCh}:
+			// Compacting now.
+		case <-ingCtx.Done():
+			level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "failed to compact TSDB blocks, ingester not running anymore")
+			return
+		}
+
+		// Wait until notified about compaction being finished.
+		select {
+		case <-compactionCallbackCh:
+			level.Info(logutil.WithContext(r.Context(), i.logger)).Log("msg", "finished compacting TSDB blocks")
+		case <-ingCtx.Done():
+			level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "failed to compact TSDB blocks, ingester not running anymore")
+			return
+		}
+
+		if i.cfg.BlocksStorageConfig.TSDB.IsBlocksShippingEnabled() {
+			shippingCallbackCh := make(chan struct{}) // must be new channel, as compactionCallbackCh is closed now.
+
+			level.Info(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flushing TSDB blocks: triggering shipping")
+
+			select {
+			case i.TSDBState.shipTrigger <- requestWithUsersAndCallback{users: allowedUsers, callback: shippingCallbackCh}:
+				// shipping now
+			case <-ingCtx.Done():
+				level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "failed to ship TSDB blocks, ingester not running anymore")
+				return
+			}
+
+			// Wait until shipping finished.
+			select {
+			case <-shippingCallbackCh:
+				level.Info(logutil.WithContext(r.Context(), i.logger)).Log("msg", "shipping of TSDB blocks finished")
+			case <-ingCtx.Done():
+				level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "failed to ship TSDB blocks, ingester not running anymore")
+				return
 			}
 		}
 
-		if len(chunks) == 0 {
-			return nil
-		}
-
-		numSeries++
-		reusePos := len(batch)
-		wireChunks, err := toWireChunks(chunks, reuseWireChunks[reusePos])
-		if err != nil {
-			return err
-		}
-		reuseWireChunks[reusePos] = wireChunks
-
-		numChunks += len(wireChunks)
-		batch = append(batch, client.TimeSeriesChunk{
-			Labels: cortexpb.FromLabelsToLabelAdapters(series.metric),
-			Chunks: wireChunks,
-		})
-
-		return nil
-	}, func(ctx context.Context) error {
-		if len(batch) == 0 {
-			return nil
-		}
-		err = client.SendQueryStream(stream, &client.QueryStreamResponse{
-			Chunkseries: batch,
-		})
-		batch = batch[:0]
-		return err
-	}, queryStreamBatchSize)
-	if err != nil {
-		return err
+		level.Info(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flushing TSDB blocks: finished")
 	}
 
-	i.metrics.queriedSeries.Observe(float64(numSeries))
-	i.metrics.queriedChunks.Observe(float64(numChunks))
-	level.Debug(spanLog).Log("streams", numSeries)
-	level.Debug(spanLog).Log("chunks", numChunks)
-	return err
+	if len(r.Form[waitParam]) > 0 && r.Form[waitParam][0] == "true" {
+		// Run synchronously. This simplifies and speeds up tests.
+		run()
+	} else {
+		go run()
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
-// Query implements service.IngesterServer
-func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQueryRequest) (*client.ExemplarQueryResponse, error) {
-	if !i.cfg.BlocksStorageEnabled {
-		return nil, errors.New("not supported")
-	}
-
-	return i.v2QueryExemplars(ctx, req)
-}
-
-// LabelValues returns all label values that are associated with a given label name.
-func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesRequest) (*client.LabelValuesResponse, error) {
-	if i.cfg.BlocksStorageEnabled {
-		return i.v2LabelValues(ctx, req)
-	}
-
-	if err := i.checkRunningOrStopping(); err != nil {
-		return nil, err
-	}
-
-	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-	state, ok, err := i.userStates.getViaContext(ctx)
+// ModeHandler Change mode of ingester.
+func (i *Ingester) ModeHandler(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseForm()
 	if err != nil {
-		return nil, err
-	} else if !ok {
-		return &client.LabelValuesResponse{}, nil
+		respMsg := "failed to parse HTTP request in mode handler"
+		level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", respMsg, "err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		// We ignore errors here, because we cannot do anything about them.
+		_, _ = w.Write([]byte(respMsg))
+		return
 	}
 
-	resp := &client.LabelValuesResponse{}
-	resp.LabelValues = append(resp.LabelValues, state.index.LabelValues(req.LabelName)...)
-
-	return resp, nil
-}
-
-// LabelNames return all the label names.
-func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest) (*client.LabelNamesResponse, error) {
-	if i.cfg.BlocksStorageEnabled {
-		return i.v2LabelNames(ctx, req)
-	}
-
-	if err := i.checkRunningOrStopping(); err != nil {
-		return nil, err
-	}
-
-	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-	state, ok, err := i.userStates.getViaContext(ctx)
-	if err != nil {
-		return nil, err
-	} else if !ok {
-		return &client.LabelNamesResponse{}, nil
-	}
-
-	resp := &client.LabelNamesResponse{}
-	resp.LabelNames = append(resp.LabelNames, state.index.LabelNames()...)
-
-	return resp, nil
-}
-
-// MetricsForLabelMatchers returns all the metrics which match a set of matchers.
-func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.MetricsForLabelMatchersRequest) (*client.MetricsForLabelMatchersResponse, error) {
-	if i.cfg.BlocksStorageEnabled {
-		return i.v2MetricsForLabelMatchers(ctx, req)
-	}
-
-	if err := i.checkRunningOrStopping(); err != nil {
-		return nil, err
-	}
-
-	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-	state, ok, err := i.userStates.getViaContext(ctx)
-	if err != nil {
-		return nil, err
-	} else if !ok {
-		return &client.MetricsForLabelMatchersResponse{}, nil
-	}
-
-	// TODO Right now we ignore start and end.
-	_, _, matchersSet, err := client.FromMetricsForLabelMatchersRequest(req)
-	if err != nil {
-		return nil, err
-	}
-
-	lss := map[model.Fingerprint]labels.Labels{}
-	for _, matchers := range matchersSet {
-		if err := state.forSeriesMatching(ctx, matchers, func(ctx context.Context, fp model.Fingerprint, series *memorySeries) error {
-			if _, ok := lss[fp]; !ok {
-				lss[fp] = series.metric
+	currentState := i.lifecycler.GetState()
+	reqMode := strings.ToUpper(r.Form.Get("mode"))
+	switch reqMode {
+	case "READONLY":
+		if currentState != ring.READONLY {
+			err = i.lifecycler.ChangeState(r.Context(), ring.READONLY)
+			if err != nil {
+				respMsg := fmt.Sprintf("failed to change state: %s", err)
+				level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", respMsg)
+				w.WriteHeader(http.StatusBadRequest)
+				// We ignore errors here, because we cannot do anything about them.
+				_, _ = w.Write([]byte(respMsg))
+				return
 			}
-			return nil
-		}, nil, 0); err != nil {
-			return nil, err
+		}
+	case "ACTIVE":
+		if currentState != ring.ACTIVE {
+			err = i.lifecycler.ChangeState(r.Context(), ring.ACTIVE)
+			if err != nil {
+				respMsg := fmt.Sprintf("failed to change state: %s", err)
+				level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", respMsg)
+				w.WriteHeader(http.StatusBadRequest)
+				// We ignore errors here, because we cannot do anything about them.
+				_, _ = w.Write([]byte(respMsg))
+				return
+			}
+		}
+	default:
+		respMsg := fmt.Sprintf("invalid mode input: %s", html.EscapeString(reqMode))
+		level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", respMsg)
+		w.WriteHeader(http.StatusBadRequest)
+		// We ignore errors here, because we cannot do anything about them.
+		_, _ = w.Write([]byte(respMsg))
+		return
+	}
+
+	respMsg := fmt.Sprintf("Ingester mode %s", i.lifecycler.GetState())
+	level.Info(logutil.WithContext(r.Context(), i.logger)).Log("msg", respMsg)
+	w.WriteHeader(http.StatusOK)
+	// We ignore errors here, because we cannot do anything about them.
+	_, _ = w.Write([]byte(respMsg))
+}
+
+func (i *Ingester) getInstanceLimits() *InstanceLimits {
+	// Don't apply any limits while starting. We especially don't want to apply series in memory limit while replaying WAL.
+	if i.State() == services.Starting {
+		return nil
+	}
+
+	if i.cfg.InstanceLimitsFn == nil {
+		return defaultInstanceLimits
+	}
+
+	l := i.cfg.InstanceLimitsFn()
+	if l == nil {
+		return defaultInstanceLimits
+	}
+
+	return l
+}
+
+// stopIncomingRequests is called during the shutdown process.
+func (i *Ingester) stopIncomingRequests() {
+	i.stoppedMtx.Lock()
+	defer i.stoppedMtx.Unlock()
+	i.stopped = true
+}
+
+// metadataQueryRange returns the best range to query for metadata queries based on the timerange in the ingester.
+func metadataQueryRange(queryStart, queryEnd int64, db *userTSDB, queryIngestersWithin time.Duration) (mint, maxt int64, err error) {
+	if queryIngestersWithin > 0 {
+		// If the feature for querying metadata from store-gateway is enabled,
+		// then we don't want to manipulate the mint and maxt.
+		return queryStart, queryEnd, nil
+	}
+
+	// Ingesters are run with limited retention and we don't support querying the store-gateway for labels yet.
+	// This means if someone loads a dashboard that is outside the range of the ingester, and we only return the
+	// data for the timerange requested (which will be empty), the dashboards will break. To fix this we should
+	// return the "head block" range until we can query the store-gateway.
+
+	// Now the question would be what to do when the query is partially in the ingester range. I would err on the side
+	// of caution and query the entire db, as I can't think of a good way to query the head + the overlapping range.
+	mint, maxt = queryStart, queryEnd
+
+	lowestTs, err := db.StartTime()
+	if err != nil {
+		return mint, maxt, err
+	}
+
+	// Completely outside.
+	if queryEnd < lowestTs {
+		mint, maxt = db.Head().MinTime(), db.Head().MaxTime()
+	} else if queryStart < lowestTs {
+		// Partially inside.
+		mint, maxt = 0, math.MaxInt64
+	}
+
+	return
+}
+
+func wrappedTSDBIngestErr(ingestErr error, timestamp model.Time, labels []cortexpb.LabelAdapter) error {
+	if ingestErr == nil {
+		return nil
+	}
+
+	switch {
+	case errors.Is(ingestErr, storage.ErrDuplicateSampleForTimestamp):
+		return fmt.Errorf(errTSDBIngestWithTimestamp, ingestErr, cortexpb.FromLabelAdaptersToLabels(labels).String())
+	default:
+		return fmt.Errorf(errTSDBIngest, ingestErr, timestamp.Time().UTC().Format(time.RFC3339Nano), cortexpb.FromLabelAdaptersToLabels(labels).String())
+	}
+}
+
+// wrappedTSDBIngestErrWithHeadMaxTime is like wrappedTSDBIngestErr, but it also includes the
+// TSDB head max time in the error message. This helps users understand how far behind the
+// accepted time range a rejected sample is, e.g. for out of bounds or too old sample errors.
+func wrappedTSDBIngestErrWithHeadMaxTime(ingestErr error, timestamp, headMaxTime model.Time, labels []cortexpb.LabelAdapter) error {
+	if ingestErr == nil {
+		return nil
+	}
+
+	// The TSDB head max time is unset when the head is empty (e.g. no sample ingested yet
+	// after startup). Fall back to the error message without the head max time in that case.
+	if int64(headMaxTime) == math.MinInt64 {
+		return wrappedTSDBIngestErr(ingestErr, timestamp, labels)
+	}
+
+	return fmt.Errorf(errTSDBIngestWithHeadMaxTime, ingestErr, timestamp.Time().UTC().Format(time.RFC3339Nano), headMaxTime.Time().UTC().Format(time.RFC3339Nano), cortexpb.FromLabelAdaptersToLabels(labels).String())
+}
+
+func wrappedTSDBIngestExemplarErr(ingestErr error, timestamp model.Time, seriesLabels, exemplarLabels []cortexpb.LabelAdapter) error {
+	if ingestErr == nil {
+		return nil
+	}
+
+	return fmt.Errorf(errTSDBIngestExemplar, ingestErr, timestamp.Time().UTC().Format(time.RFC3339Nano),
+		cortexpb.FromLabelAdaptersToLabels(seriesLabels).String(),
+		cortexpb.FromLabelAdaptersToLabels(exemplarLabels).String(),
+	)
+}
+
+func getTimeSeriesChunksSlice() []client.TimeSeriesChunk {
+	if p := tsChunksPool.Get(); p != nil {
+		return p
+	}
+
+	return make([]client.TimeSeriesChunk, 0, queryStreamBatchSize)
+}
+
+func putTimeSeriesChunksSlice(p []client.TimeSeriesChunk) {
+	if p != nil {
+		tsChunksPool.Put(p[:0])
+	}
+}
+
+type labelSetReasonCounters struct {
+	counters map[uint64]*labelSetReasonCounter
+}
+
+type labelSetReasonCounter struct {
+	reasonCounter map[string]int
+	lbls          labels.Labels
+}
+
+func newLabelSetReasonCounters() *labelSetReasonCounters {
+	return &labelSetReasonCounters{counters: make(map[uint64]*labelSetReasonCounter)}
+}
+
+func (c *labelSetReasonCounters) increment(matchedLabelSetLimits []validation.LimitsPerLabelSet, reason string) {
+	for _, l := range matchedLabelSetLimits {
+		if rc, exists := c.counters[l.Hash]; exists {
+			rc.reasonCounter[reason]++
+		} else {
+			c.counters[l.Hash] = &labelSetReasonCounter{
+				reasonCounter: map[string]int{
+					reason: 1,
+				},
+				lbls: l.LabelSet,
+			}
 		}
 	}
-
-	result := &client.MetricsForLabelMatchersResponse{
-		Metric: make([]*cortexpb.Metric, 0, len(lss)),
-	}
-	for _, ls := range lss {
-		result.Metric = append(result.Metric, &cortexpb.Metric{Labels: cortexpb.FromLabelsToLabelAdapters(ls)})
-	}
-
-	return result, nil
 }
 
-// MetricsMetadata returns all the metric metadata of a user.
-func (i *Ingester) MetricsMetadata(ctx context.Context, req *client.MetricsMetadataRequest) (*client.MetricsMetadataResponse, error) {
-	i.userStatesMtx.RLock()
-	if err := i.checkRunningOrStopping(); err != nil {
-		i.userStatesMtx.RUnlock()
-		return nil, err
-	}
-	i.userStatesMtx.RUnlock()
-
-	userID, err := tenant.TenantID(ctx)
-	if err != nil {
-		return nil, err
+func recoverIngester(logger log.Logger, errp *error) {
+	e := recover()
+	if e == nil {
+		return
 	}
 
-	userMetadata := i.getUserMetadata(userID)
+	switch err := e.(type) {
+	case runtime.Error:
+		// Print the stack trace but do not inhibit the running application.
+		buf := make([]byte, 64<<10)
+		buf = buf[:runtime.Stack(buf, false)]
 
-	if userMetadata == nil {
-		return &client.MetricsMetadataResponse{}, nil
+		level.Error(logger).Log("msg", "runtime panic in ingester", "err", err, "stacktrace", string(buf))
+		*errp = errors.Wrap(err, "unexpected error")
 	}
-
-	return &client.MetricsMetadataResponse{Metadata: userMetadata.toClientMetadata()}, nil
 }
 
-// UserStats returns ingestion statistics for the current user.
-func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) (*client.UserStatsResponse, error) {
-	if i.cfg.BlocksStorageEnabled {
-		return i.v2UserStats(ctx, req)
-	}
-
-	if err := i.checkRunningOrStopping(); err != nil {
-		return nil, err
-	}
-
-	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-	state, ok, err := i.userStates.getViaContext(ctx)
-	if err != nil {
-		return nil, err
-	} else if !ok {
-		return &client.UserStatsResponse{}, nil
-	}
-
-	apiRate := state.ingestedAPISamples.Rate()
-	ruleRate := state.ingestedRuleSamples.Rate()
-	return &client.UserStatsResponse{
-		IngestionRate:     apiRate + ruleRate,
-		ApiIngestionRate:  apiRate,
-		RuleIngestionRate: ruleRate,
-		NumSeries:         uint64(state.fpToSeries.length()),
-	}, nil
-}
-
-// AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(ctx context.Context, req *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
-	if i.cfg.BlocksStorageEnabled {
-		return i.v2AllUserStats(ctx, req)
-	}
-
-	if err := i.checkRunningOrStopping(); err != nil {
-		return nil, err
-	}
-
-	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-	users := i.userStates.cp()
-
-	response := &client.UsersStatsResponse{
-		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
-	}
-	for userID, state := range users {
-		apiRate := state.ingestedAPISamples.Rate()
-		ruleRate := state.ingestedRuleSamples.Rate()
-		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
-			UserId: userID,
-			Data: &client.UserStatsResponse{
-				IngestionRate:     apiRate + ruleRate,
-				ApiIngestionRate:  apiRate,
-				RuleIngestionRate: ruleRate,
-				NumSeries:         uint64(state.fpToSeries.length()),
-			},
-		})
-	}
-	return response, nil
-}
-
-// CheckReady is the readiness handler used to indicate to k8s when the ingesters
-// are ready for the addition or removal of another ingester.
-func (i *Ingester) CheckReady(ctx context.Context) error {
-	if err := i.checkRunningOrStopping(); err != nil {
-		return fmt.Errorf("ingester not ready: %v", err)
-	}
-	return i.lifecycler.CheckReady(ctx)
-}
-
-// labels will be copied if needed.
-func (i *Ingester) updateActiveSeries(userID string, now time.Time, labels []cortexpb.LabelAdapter) {
-	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-
-	i.userStates.updateActiveSeriesForUser(userID, now, cortexpb.FromLabelAdaptersToLabels(labels))
+// isHistogramValidationError checks if the error is a native histogram validation error.
+func isHistogramValidationError(err error) bool {
+	var e histogram.Error
+	return errors.As(err, &e)
 }

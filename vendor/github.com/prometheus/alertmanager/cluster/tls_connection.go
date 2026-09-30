@@ -17,14 +17,15 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/hashicorp/memberlist"
-	"github.com/pkg/errors"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/prometheus/alertmanager/cluster/clusterpb"
 )
@@ -66,7 +67,6 @@ func (conn *tlsConn) Write(b []byte) (int, error) {
 	conn.mtx.Lock()
 	defer conn.mtx.Unlock()
 	n, err := conn.connection.Write(b)
-
 	if err != nil {
 		conn.live = false
 	}
@@ -100,7 +100,7 @@ func (conn *tlsConn) writePacket(fromAddr string, b []byte) error {
 		},
 	)
 	if err != nil {
-		return errors.Wrap(err, "unable to marshal memeberlist packet message")
+		return fmt.Errorf("unable to marshal memeberlist packet message: %w", err)
 	}
 	buf := make([]byte, uint32length, uint32length+len(msg))
 	binary.LittleEndian.PutUint32(buf, uint32(len(msg)))
@@ -117,7 +117,7 @@ func (conn *tlsConn) writeStream() error {
 		},
 	)
 	if err != nil {
-		return errors.Wrap(err, "unable to marshal memeberlist stream message")
+		return fmt.Errorf("unable to marshal memeberlist stream message: %w", err)
 	}
 	buf := make([]byte, uint32length, uint32length+len(msg))
 	binary.LittleEndian.PutUint32(buf, uint32(len(msg)))
@@ -137,7 +137,7 @@ func (conn *tlsConn) read() (*memberlist.Packet, error) {
 	lenBuf := make([]byte, uint32length)
 	_, err := io.ReadFull(reader, lenBuf)
 	if err != nil {
-		return nil, errors.Wrap(err, "error reading message length")
+		return nil, fmt.Errorf("error reading message length: %w", err)
 	}
 	msgLen := binary.LittleEndian.Uint32(lenBuf)
 	msgBuf := make([]byte, msgLen)
@@ -145,12 +145,12 @@ func (conn *tlsConn) read() (*memberlist.Packet, error) {
 	conn.mtx.Unlock()
 
 	if err != nil {
-		return nil, errors.Wrap(err, "error reading message")
+		return nil, fmt.Errorf("error reading message: %w", err)
 	}
 	pb := clusterpb.MemberlistMessage{}
 	err = proto.Unmarshal(msgBuf, &pb)
 	if err != nil {
-		return nil, errors.Wrap(err, "error parsing message")
+		return nil, fmt.Errorf("error parsing message: %w", err)
 	}
 	if pb.Version != version {
 		return nil, errors.New("tls memberlist message version incompatible")
@@ -159,16 +159,16 @@ func (conn *tlsConn) read() (*memberlist.Packet, error) {
 	case clusterpb.MemberlistMessage_STREAM:
 		return nil, nil
 	case clusterpb.MemberlistMessage_PACKET:
-		return toPacket(pb)
+		return toPacket(&pb)
 	default:
 		return nil, errors.New("could not read from either stream or packet channel")
 	}
 }
 
-func toPacket(pb clusterpb.MemberlistMessage) (*memberlist.Packet, error) {
+func toPacket(pb *clusterpb.MemberlistMessage) (*memberlist.Packet, error) {
 	addr, err := net.ResolveTCPAddr(network, pb.FromAddr)
 	if err != nil {
-		return nil, errors.Wrap(err, "error parsing packet sender address")
+		return nil, fmt.Errorf("error parsing packet sender address: %w", err)
 	}
 	return &memberlist.Packet{
 		Buf:       pb.Msg,

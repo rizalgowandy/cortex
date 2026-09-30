@@ -4,25 +4,37 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/concurrency"
 	"github.com/pkg/errors"
 	"github.com/prometheus/alertmanager/config"
+	amcommoncfg "github.com/prometheus/alertmanager/config/common"
+	"github.com/prometheus/alertmanager/notify/discord"
+	"github.com/prometheus/alertmanager/notify/incidentio"
+	"github.com/prometheus/alertmanager/notify/jira"
+	"github.com/prometheus/alertmanager/notify/mattermost"
+	"github.com/prometheus/alertmanager/notify/msteams"
+	"github.com/prometheus/alertmanager/notify/msteamsv2"
+	"github.com/prometheus/alertmanager/notify/opsgenie"
+	"github.com/prometheus/alertmanager/notify/pagerduty"
+	"github.com/prometheus/alertmanager/notify/telegram"
+	"github.com/prometheus/alertmanager/notify/webhook"
 	"github.com/prometheus/alertmanager/template"
+	amtracing "github.com/prometheus/alertmanager/tracing"
 	commoncfg "github.com/prometheus/common/config"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
-	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 const (
@@ -41,12 +53,38 @@ const (
 )
 
 var (
-	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
-	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
-	errProxyURLNotAllowed            = errors.New("setting proxy_url is not allowed")
-	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
-	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
-	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	// errBearerTokenAndCredentialsFileNotAllowed covers both bearer_token_file and credentials_file
+	// because prometheus/common normalizes bearer_token_file to authorization.credentials_file
+	// during YAML unmarshaling (see HTTPClientConfig.Validate in prometheus/common/config).
+	errBearerTokenAndCredentialsFileNotAllowed  = errors.New("setting bearer_token_file and credentials_file is not allowed")
+	errPasswordFileNotAllowed                   = errors.New("setting password_file is not allowed")
+	errUsernameFileNotAllowed                   = errors.New("setting username_file is not allowed")
+	errOAuth2CertificateKeyFileNotAllowed       = errors.New("setting OAuth2 client_certificate_key_file is not allowed")
+	errOAuth2SecretFileNotAllowed               = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errTLSFileNotAllowed                        = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
+	errHTTPHeadersFilesNotAllowed               = errors.New("setting http_headers files is not allowed")
+	errSlackAPIURLFileNotAllowed                = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
+	errSlackAppTokenFileNotAllowed              = errors.New("setting Slack slack_app_token_file and global slack_app_token_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed            = errors.New("setting VictorOps api_key_file and global victorops_api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed             = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
+	errPagerDutyRoutingKeyFileNotAllowed        = errors.New("setting PagerDuty routing_key_file is not allowed")
+	errPagerDutyServiceKeyFileNotAllowed        = errors.New("setting PagerDuty service_key_file is not allowed")
+	errWebhookURLFileNotAllowed                 = errors.New("setting Webhook url_file is not allowed")
+	errPushOverUserKeyFileNotAllowed            = errors.New("setting PushOver user_key_file is not allowed")
+	errPushOverTokenFileNotAllowed              = errors.New("setting PushOver token_file is not allowed")
+	errTelegramBotTokenFileNotAllowed           = errors.New("setting Telegram bot_token_file and global telegram_bot_token_file are not allowed")
+	errTelegramChatIdFileNotAllowed             = errors.New("setting Telegram chat_id_file is not allowed")
+	errMSTeamsWebhookUrlFileNotAllowed          = errors.New("setting MSTeams webhook_url_file is not allowed")
+	errMSTeamsV2WebhookUrlFileNotAllowed        = errors.New("setting MSTeamsV2 webhook_url_file is not allowed")
+	errRocketChatTokenIdFileNotAllowed          = errors.New("setting RocketChat token_id_file and global rocketchat_token_id_file is not allowed")
+	errRocketChatTokenFileNotAllowed            = errors.New("setting RocketChat token_file and global rocketchat_token_file is not allowed")
+	errDiscordWebhookUrlFileNotAllowed          = errors.New("setting Discord webhook_url_file is not allowed")
+	errEmailAuthPasswordFileNotAllowed          = errors.New("setting Email auth_password_file and global smtp_auth_password_file is not allowed")
+	errEmailAuthSecretFileNotAllowed            = errors.New("setting Email auth_secret_file and global smtp_auth_secret_file is not allowed")
+	errIncidentIOURLFileNotAllowed              = errors.New("setting IncidentIO url_file is not allowed")
+	errIncidentIOAlertSourceTokenFileNotAllowed = errors.New("setting IncidentIO alert_source_token_file is not allowed")
+	errMatterMostWebhookUrlFileNotAllowed       = errors.New("setting Mattermost webhook_url_file and global mattermost_webhook_url_file is not allowed")
+	errWeChatAPISecretFileNotAllowed            = errors.New("setting Wechat api_secret_file and global wechat_api_secret_file is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -58,7 +96,7 @@ type UserConfig struct {
 func (am *MultitenantAlertmanager) GetUserConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
 
-	userID, err := tenant.TenantID(r.Context())
+	userID, err := users.TenantID(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
@@ -67,9 +105,12 @@ func (am *MultitenantAlertmanager) GetUserConfig(w http.ResponseWriter, r *http.
 
 	cfg, err := am.store.GetAlertConfig(r.Context(), userID)
 	if err != nil {
-		if err == alertspb.ErrNotFound {
+		switch err {
+		case alertspb.ErrNotFound:
 			http.Error(w, err.Error(), http.StatusNotFound)
-		} else {
+		case alertspb.ErrAccessDenied:
+			http.Error(w, err.Error(), http.StatusForbidden)
+		default:
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 		return
@@ -95,7 +136,7 @@ func (am *MultitenantAlertmanager) GetUserConfig(w http.ResponseWriter, r *http.
 
 func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userID, err := tenant.TenantID(r.Context())
+	userID, err := users.TenantID(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
@@ -112,7 +153,7 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		input = r.Body
 	}
 
-	payload, err := ioutil.ReadAll(input)
+	payload, err := io.ReadAll(input)
 	if err != nil {
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
@@ -155,7 +196,7 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 // Note that if no config exists for a user, StatusOK is returned.
 func (am *MultitenantAlertmanager) DeleteUserConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userID, err := tenant.TenantID(r.Context())
+	userID, err := users.TenantID(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
@@ -224,7 +265,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	// not to configured data dir, and on the flipside, it'll fail if we can't write
 	// to tmpDir. Ignoring both cases for now as they're ultra rare but will revisit if
 	// we see this in the wild.
-	userTempDir, err := ioutil.TempDir("", "validate-config-"+cfg.User)
+	userTempDir, err := os.MkdirTemp("", "validate-config-"+cfg.User)
 	if err != nil {
 		return err
 	}
@@ -248,7 +289,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		templateFiles[i] = filepath.Join(userTempDir, t)
 	}
 
-	_, err = template.FromGlobs(templateFiles...)
+	_, err = template.FromGlobs(templateFiles)
 	if err != nil {
 		return err
 	}
@@ -271,7 +312,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 
 	done := make(chan struct{})
-	iter := make(chan interface{})
+	iter := make(chan any)
 
 	go func() {
 		util.StreamWriteYAMLResponse(w, iter, logger)
@@ -280,7 +321,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 
 	err = concurrency.ForEachUser(r.Context(), userIDs, fetchConcurrency, func(ctx context.Context, userID string) error {
 		cfg, err := am.store.GetAlertConfig(ctx, userID)
-		if errors.Is(err, alertspb.ErrNotFound) {
+		if errors.Is(err, alertspb.ErrNotFound) || errors.Is(err, alertspb.ErrAccessDenied) {
 			return nil
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
@@ -306,58 +347,78 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// noopValidator is a sentinel to mark known non-receiver config types that should be ignored.
+var noopValidator = func(any) error { return nil }
+
+// configValidators maps config types to their validation functions.
+// - Actual validator: receiver config with file-based fields to validate
+// - nil: receiver config with no file-based fields to validate
+// - noopValidator: non-receiver config type to ignore
+var configValidators = map[reflect.Type]func(any) error{
+	reflect.TypeFor[config.GlobalConfig]():         func(v any) error { return validateGlobalConfig(v.(config.GlobalConfig)) },
+	reflect.TypeFor[commoncfg.HTTPClientConfig]():  func(v any) error { return validateReceiverHTTPConfig(v.(commoncfg.HTTPClientConfig)) },
+	reflect.TypeFor[commoncfg.TLSConfig]():         func(v any) error { return validateReceiverTLSConfig(v.(commoncfg.TLSConfig)) },
+	reflect.TypeFor[opsgenie.OpsGenieConfig]():     func(v any) error { return validateOpsGenieConfig(v.(opsgenie.OpsGenieConfig)) },
+	reflect.TypeFor[config.SlackConfig]():          func(v any) error { return validateSlackConfig(v.(config.SlackConfig)) },
+	reflect.TypeFor[config.VictorOpsConfig]():      func(v any) error { return validateVictorOpsConfig(v.(config.VictorOpsConfig)) },
+	reflect.TypeFor[pagerduty.PagerdutyConfig]():   func(v any) error { return validatePagerdutyConfig(v.(pagerduty.PagerdutyConfig)) },
+	reflect.TypeFor[webhook.WebhookConfig]():       func(v any) error { return validateWebhookConfig(v.(webhook.WebhookConfig)) },
+	reflect.TypeFor[config.PushoverConfig]():       func(v any) error { return validatePushOverConfig(v.(config.PushoverConfig)) },
+	reflect.TypeFor[telegram.TelegramConfig]():     func(v any) error { return validateTelegramConfig(v.(telegram.TelegramConfig)) },
+	reflect.TypeFor[msteams.MSTeamsConfig]():       func(v any) error { return validateMSTeamsConfig(v.(msteams.MSTeamsConfig)) },
+	reflect.TypeFor[msteamsv2.MSTeamsV2Config]():   func(v any) error { return validateMSTeamsV2Config(v.(msteamsv2.MSTeamsV2Config)) },
+	reflect.TypeFor[config.RocketchatConfig]():     func(v any) error { return validateRocketChatConfig(v.(config.RocketchatConfig)) },
+	reflect.TypeFor[discord.DiscordConfig]():       func(v any) error { return validateDiscordConfig(v.(discord.DiscordConfig)) },
+	reflect.TypeFor[config.EmailConfig]():          func(v any) error { return validateEmailConfig(v.(config.EmailConfig)) },
+	reflect.TypeFor[incidentio.IncidentioConfig](): func(v any) error { return validateIncidentIOConfig(v.(incidentio.IncidentioConfig)) },
+	reflect.TypeFor[mattermost.MattermostConfig](): func(v any) error { return validateMattermostConfig(v.(mattermost.MattermostConfig)) },
+	reflect.TypeFor[config.WechatConfig]():         func(v any) error { return validateWeChatConfig(v.(config.WechatConfig)) },
+	reflect.TypeFor[config.WebexConfig]():          nil, // No file-based fields to validate
+	reflect.TypeFor[config.SNSConfig]():            nil, // No file-based fields to validate
+	reflect.TypeFor[jira.JiraConfig]():             nil, // No file-based fields to validate
+	// Non-receiver config types (ignored during validation)
+	reflect.TypeFor[config.Config]():              noopValidator,
+	reflect.TypeFor[amcommoncfg.NotifierConfig](): noopValidator,
+	reflect.TypeFor[amtracing.TracingConfig]():    noopValidator,
+	reflect.TypeFor[config.ThreadingConfig]():     noopValidator,
+	reflect.TypeFor[jira.JiraFieldConfig]():       noopValidator,
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
-func validateAlertmanagerConfig(cfg interface{}) error {
+func validateAlertmanagerConfig(cfg any) error {
 	v := reflect.ValueOf(cfg)
-	t := v.Type()
 
 	// Skip invalid, the zero value or a nil pointer (checked by zero value).
 	if !v.IsValid() || v.IsZero() {
 		return nil
 	}
+	t := v.Type()
 
 	// If the input config is a pointer then we need to get its value.
 	// At this point the pointer value can't be nil.
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 		t = v.Type()
 	}
 
 	// Check if the input config is a data type for which we have a specific validation.
-	// At this point the value can't be a pointer anymore.
-	switch t {
-	case reflect.TypeOf(config.GlobalConfig{}):
-		if err := validateGlobalConfig(v.Interface().(config.GlobalConfig)); err != nil {
-			return err
+	if validator, ok := configValidators[t]; ok {
+		if validator != nil {
+			if err := validator(v.Interface()); err != nil {
+				return err
+			}
 		}
-
-	case reflect.TypeOf(commoncfg.HTTPClientConfig{}):
-		if err := validateReceiverHTTPConfig(v.Interface().(commoncfg.HTTPClientConfig)); err != nil {
-			return err
-		}
-
-	case reflect.TypeOf(commoncfg.TLSConfig{}):
-		if err := validateReceiverTLSConfig(v.Interface().(commoncfg.TLSConfig)); err != nil {
-			return err
-		}
-
-	case reflect.TypeOf(config.SlackConfig{}):
-		if err := validateSlackConfig(v.Interface().(config.SlackConfig)); err != nil {
-			return err
-		}
-
-	case reflect.TypeOf(config.VictorOpsConfig{}):
-		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
-			return err
-		}
+	} else if strings.Contains(t.PkgPath(), "alertmanager/config") &&
+		strings.HasSuffix(t.Name(), "Config") {
+		// Unhandled config type - fail to ensure we don't miss new types.
+		return fmt.Errorf("unsupported receiver config type: %s", t.Name())
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
 	if t.Kind() == reflect.Struct {
-		for i := 0; i < t.NumField(); i++ {
-			field := t.Field(i)
+		for field := range t.Fields() {
 			fieldValue := v.FieldByIndex(field.Index)
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
@@ -404,19 +465,48 @@ func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
 	if cfg.BasicAuth != nil && cfg.BasicAuth.PasswordFile != "" {
 		return errPasswordFileNotAllowed
 	}
+	if cfg.BasicAuth != nil && cfg.BasicAuth.UsernameFile != "" {
+		return errUsernameFileNotAllowed
+	}
 	if cfg.Authorization != nil && cfg.Authorization.CredentialsFile != "" {
-		return errPasswordFileNotAllowed
+		return errBearerTokenAndCredentialsFileNotAllowed
 	}
 	if cfg.BearerTokenFile != "" {
-		return errPasswordFileNotAllowed
+		return errBearerTokenAndCredentialsFileNotAllowed
 	}
-	if cfg.ProxyURL.URL != nil {
-		return errProxyURLNotAllowed
+	if cfg.OAuth2 != nil && cfg.OAuth2.ClientCertificateKeyFile != "" {
+		return errOAuth2CertificateKeyFileNotAllowed
 	}
 	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
 		return errOAuth2SecretFileNotAllowed
 	}
+	if err := validateReceiverHTTPHeaders(cfg.HTTPHeaders); err != nil {
+		return err
+	}
 	return validateReceiverTLSConfig(cfg.TLSConfig)
+}
+
+// validateReceiverHTTPHeaders validates the configured HTTP headers and returns an error
+// if any of them sources its value from a file on the Alertmanager host.
+//
+// commoncfg.Header.Files is a list of paths that headersRoundTripper.RoundTrip os.ReadFile()s
+// at notification time, injecting the contents into an outbound request whose URL the tenant
+// also controls. That is the same "tenant config reads a host file" primitive the rest of the
+// *_file denylist in this file exists to block, originally added for CVE-2021-31232 (#4129)
+// and extended per-receiver for CVE-2022-23536, so it has to be blocked here too.
+//
+// Only Files is rejected. Values and Secrets are literals supplied inline by the tenant; they
+// read nothing from the host and remain allowed, so ordinary header use keeps working.
+func validateReceiverHTTPHeaders(headers *commoncfg.Headers) error {
+	if headers == nil {
+		return nil
+	}
+	for _, header := range headers.Headers {
+		if len(header.Files) > 0 {
+			return errHTTPHeadersFilesNotAllowed
+		}
+	}
+	return nil
 }
 
 // validateReceiverTLSConfig validates the TLS config and returns an error if it contains
@@ -429,28 +519,204 @@ func validateReceiverTLSConfig(cfg commoncfg.TLSConfig) error {
 }
 
 // validateGlobalConfig validates the Global config and returns an error if it contains
-// settings now allowed by Cortex.
+// settings not allowed by Cortex.
 func validateGlobalConfig(cfg config.GlobalConfig) error {
+	if cfg.MattermostWebhookURLFile != "" {
+		return errMatterMostWebhookUrlFileNotAllowed
+	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	if cfg.RocketchatTokenFile != "" {
+		return errRocketChatTokenFileNotAllowed
+	}
+	if cfg.RocketchatTokenIDFile != "" {
+		return errRocketChatTokenIdFileNotAllowed
+	}
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	if cfg.SlackAppTokenFile != "" {
+		return errSlackAppTokenFileNotAllowed
+	}
+	if cfg.SMTPAuthPasswordFile != "" {
+		return errEmailAuthPasswordFileNotAllowed
+	}
+	if cfg.SMTPAuthSecretFile != "" {
+		return errEmailAuthSecretFileNotAllowed
+	}
+	if cfg.TelegramBotTokenFile != "" {
+		return errTelegramBotTokenFileNotAllowed
+	}
+	if cfg.VictorOpsAPIKeyFile != "" {
+		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	if cfg.WeChatAPISecretFile != "" {
+		return errWeChatAPISecretFileNotAllowed
+	}
+	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateOpsGenieConfig(cfg opsgenie.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
 	}
 	return nil
 }
 
 // validateSlackConfig validates the Slack config and returns an error if it contains
-// settings now allowed by Cortex.
+// settings not allowed by Cortex.
 func validateSlackConfig(cfg config.SlackConfig) error {
 	if cfg.APIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	if cfg.AppTokenFile != "" {
+		return errSlackAppTokenFileNotAllowed
 	}
 	return nil
 }
 
 // validateVictorOpsConfig validates the VictorOps config and returns an error if it contains
-// settings now allowed by Cortex.
+// settings not allowed by Cortex.
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validatePagerdutyConfig validates the pager duty config and returns an error if it contains
+// settings not allowed by Cortex.
+func validatePagerdutyConfig(cfg pagerduty.PagerdutyConfig) error {
+	if cfg.RoutingKeyFile != "" {
+		return errPagerDutyRoutingKeyFileNotAllowed
+	}
+
+	if cfg.ServiceKeyFile != "" {
+		return errPagerDutyServiceKeyFileNotAllowed
+	}
+
+	return nil
+}
+
+// validateWebhookConfig validates the Webhook config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateWebhookConfig(cfg webhook.WebhookConfig) error {
+	if cfg.URLFile != "" {
+		return errWebhookURLFileNotAllowed
+	}
+	return nil
+}
+
+// validatePushOverConfig validates the Pushover Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validatePushOverConfig(cfg config.PushoverConfig) error {
+	if cfg.UserKeyFile != "" {
+		return errPushOverUserKeyFileNotAllowed
+	}
+
+	if cfg.TokenFile != "" {
+		return errPushOverTokenFileNotAllowed
+	}
+
+	return nil
+}
+
+// validateTelegramConfig validates the Telegram Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateTelegramConfig(cfg telegram.TelegramConfig) error {
+	if cfg.BotTokenFile != "" {
+		return errTelegramBotTokenFileNotAllowed
+	}
+	if cfg.ChatIDFile != "" {
+		return errTelegramChatIdFileNotAllowed
+	}
+	return nil
+}
+
+// validateMSTeamsConfig validates the MSTeams Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateMSTeamsConfig(cfg msteams.MSTeamsConfig) error {
+	if cfg.WebhookURLFile != "" {
+		return errMSTeamsWebhookUrlFileNotAllowed
+	}
+	return nil
+}
+
+// validateMSTeamsV2Config validates the MSTeamsV2 Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateMSTeamsV2Config(cfg msteamsv2.MSTeamsV2Config) error {
+	if cfg.WebhookURLFile != "" {
+		return errMSTeamsV2WebhookUrlFileNotAllowed
+	}
+	return nil
+}
+
+// validateRocketChatConfig validates the RocketChat Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateRocketChatConfig(cfg config.RocketchatConfig) error {
+	if cfg.TokenIDFile != "" {
+		return errRocketChatTokenIdFileNotAllowed
+	}
+
+	if cfg.TokenFile != "" {
+		return errRocketChatTokenFileNotAllowed
+	}
+
+	return nil
+}
+
+// validateDiscordConfig validates the Discord Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateDiscordConfig(cfg discord.DiscordConfig) error {
+	if cfg.WebhookURLFile != "" {
+		return errDiscordWebhookUrlFileNotAllowed
+	}
+	return nil
+}
+
+// validateEmailConfig validates the Email Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateEmailConfig(cfg config.EmailConfig) error {
+	if cfg.AuthPasswordFile != "" {
+		return errEmailAuthPasswordFileNotAllowed
+	}
+	if cfg.AuthSecretFile != "" {
+		return errEmailAuthSecretFileNotAllowed
+	}
+	return nil
+}
+
+// validateIncidentIOConfig validates the IncidentIO Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateIncidentIOConfig(cfg incidentio.IncidentioConfig) error {
+	if cfg.URLFile != "" {
+		return errIncidentIOURLFileNotAllowed
+	}
+
+	if cfg.AlertSourceTokenFile != "" {
+		return errIncidentIOAlertSourceTokenFileNotAllowed
+	}
+
+	return nil
+}
+
+// validateMatterMostConfig validates the Mattermost Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateMattermostConfig(cfg mattermost.MattermostConfig) error {
+	if cfg.WebhookURLFile != "" {
+		return errMatterMostWebhookUrlFileNotAllowed
+	}
+	return nil
+}
+
+// validateWeChatConfig validates the WeChat Config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateWeChatConfig(cfg config.WechatConfig) error {
+	if cfg.APISecretFile != "" {
+		return errWeChatAPISecretFileNotAllowed
 	}
 	return nil
 }

@@ -10,7 +10,8 @@ import (
 	"unsafe"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/grafana/dskit/flagext"
+
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // RedisConfig defines how a RedisCache should be constructed.
@@ -87,7 +88,12 @@ func (c *RedisClient) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (c *RedisClient) MSet(ctx context.Context, keys []string, values [][]byte) error {
+func (c *RedisClient) MSet(ctx context.Context, keys []string, values [][]byte, ttl time.Duration) error {
+	// If TTL is 0, fall back to configured expiration
+	if ttl == 0 {
+		ttl = c.expiration
+	}
+
 	var cancel context.CancelFunc
 	if c.timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
@@ -98,9 +104,26 @@ func (c *RedisClient) MSet(ctx context.Context, keys []string, values [][]byte) 
 		return fmt.Errorf("MSet the length of keys and values not equal, len(keys)=%d, len(values)=%d", len(keys), len(values))
 	}
 
+	// redis.UniversalClient can take redis.Client and redis.ClusterClient.
+	// if redis.Client is set, then Single node or sentinel configuration. Transactions are supported.
+	// if redis.ClusterClient is set, then Redis Cluster configuration. Transactions across different slots are not supported.
+	_, isCluster := c.rdb.(*redis.ClusterClient)
+
+	if isCluster {
+		// For cluster mode, use individual SET commands to avoid cross-slot transaction errors
+		for i := range keys {
+			err := c.rdb.Set(ctx, keys[i], values[i], ttl).Err()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// For single/sentinel mode, use transaction pipeline for atomicity
 	pipe := c.rdb.TxPipeline()
 	for i := range keys {
-		pipe.Set(ctx, keys[i], values[i], c.expiration)
+		pipe.Set(ctx, keys[i], values[i], ttl)
 	}
 	_, err := pipe.Exec(ctx)
 	return err

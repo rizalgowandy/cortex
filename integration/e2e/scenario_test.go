@@ -1,18 +1,18 @@
-// +build requires_docker
+//go:build requires_docker
 
 package e2e_test
 
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/thanos-io/thanos/pkg/objstore/s3"
+	"github.com/thanos-io/objstore/providers/s3"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/integration/e2e"
@@ -56,7 +56,7 @@ func testMinioWorking(t *testing.T, m *e2e.HTTPService) {
 	})
 	require.NoError(t, err)
 
-	bkt, err := s3.NewBucket(log.NewNopLogger(), b, "test")
+	bkt, err := s3.NewBucket(log.NewNopLogger(), b, "test", nil)
 	require.NoError(t, err)
 
 	require.NoError(t, bkt.Upload(ctx, "recipe", bytes.NewReader([]byte("Just go to Pastry Shop and buy."))))
@@ -64,13 +64,13 @@ func testMinioWorking(t *testing.T, m *e2e.HTTPService) {
 
 	r, err := bkt.Get(ctx, "recipe")
 	require.NoError(t, err)
-	b, err = ioutil.ReadAll(r)
+	b, err = io.ReadAll(r)
 	require.NoError(t, err)
 	require.Equal(t, "Just go to Pastry Shop and buy.", string(b))
 
 	r, err = bkt.Get(ctx, "mom/recipe")
 	require.NoError(t, err)
-	b, err = ioutil.ReadAll(r)
+	b, err = io.ReadAll(r)
 	require.NoError(t, err)
 	require.Equal(t, "https://www.bbcgoodfood.com/recipes/strawberry-cheesecake-4-easy-steps", string(b))
 }
@@ -115,7 +115,7 @@ func TestScenario(t *testing.T) {
 		SecretKey: e2edb.MinioSecretKey,
 	})
 	require.NoError(t, err)
-	bkt, err := s3.NewBucket(log.NewNopLogger(), b, "test")
+	bkt, err := s3.NewBucket(log.NewNopLogger(), b, "test", nil)
 	require.NoError(t, err)
 
 	_, err = bkt.Get(context.Background(), "recipe")
@@ -139,9 +139,23 @@ func TestScenario(t *testing.T) {
 		SecretKey: e2edb.MinioSecretKey,
 	})
 	require.NoError(t, err)
-	bkt, err = s3.NewBucket(log.NewNopLogger(), b, "test")
+	bkt, err = s3.NewBucket(log.NewNopLogger(), b, "test", nil)
 	require.NoError(t, err)
 
 	_, err = bkt.Get(context.Background(), "recipe")
 	require.Error(t, err)
+}
+
+// TestStartStop tests for ensuring that when the container is stopped, it can be started again.
+// This is to test that the stop waits for the container to be stopped and cleaned up before returning.
+func TestStartStop(t *testing.T) {
+	s, err := e2e.NewScenario("e2e-scenario-test")
+	require.NoError(t, err)
+
+	m1 := e2edb.NewMinio(9000, bktName)
+
+	for range 10 {
+		require.NoError(t, s.Start(m1))
+		require.NoError(t, s.Stop(m1))
+	}
 }

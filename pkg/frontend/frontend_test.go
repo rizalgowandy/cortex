@@ -3,7 +3,7 @@ package frontend
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,9 +14,6 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
-	"github.com/grafana/dskit/concurrency"
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/services"
 	otgrpc "github.com/opentracing-contrib/go-grpc"
 	"github.com/opentracing-contrib/go-stdlib/nethttp"
 	opentracing "github.com/opentracing/opentracing-go"
@@ -28,8 +25,13 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/cortexproject/cortex/pkg/frontend/transport"
+	frontendv1 "github.com/cortexproject/cortex/pkg/frontend/v1"
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
+	"github.com/cortexproject/cortex/pkg/querier/tenantfederation"
 	querier_worker "github.com/cortexproject/cortex/pkg/querier/worker"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 const (
@@ -79,7 +81,7 @@ func TestFrontend_RequestHostHeaderWhenDownstreamURLIsConfigured(t *testing.T) {
 		require.Equal(t, 200, resp.StatusCode)
 
 		defer resp.Body.Close()
-		_, err = ioutil.ReadAll(resp.Body)
+		_, err = io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		// We expect the Host received by the downstream is the downstream host itself
@@ -93,7 +95,7 @@ func TestFrontend_RequestHostHeaderWhenDownstreamURLIsConfigured(t *testing.T) {
 	testFrontend(t, config, nil, test, true, nil)
 }
 
-func TestFrontend_LogsSlowQueriesFormValues(t *testing.T) {
+func TestFrontend_LogsSlowQueries(t *testing.T) {
 	// Create an HTTP server listening locally. This server mocks the downstream
 	// Prometheus API-compatible server.
 	downstreamListen, err := net.Listen("tcp", "localhost:0")
@@ -109,50 +111,77 @@ func TestFrontend_LogsSlowQueriesFormValues(t *testing.T) {
 	defer downstreamServer.Shutdown(context.Background()) //nolint:errcheck
 	go downstreamServer.Serve(downstreamListen)           //nolint:errcheck
 
-	// Configure the query-frontend with the mocked downstream server.
-	config := defaultFrontendConfig()
-	config.Handler.LogQueriesLongerThan = 1 * time.Microsecond
-	config.DownstreamURL = fmt.Sprintf("http://%s", downstreamListen.Addr())
-
-	var buf concurrency.SyncBuffer
-	l := log.NewLogfmtLogger(&buf)
-
-	test := func(addr string) {
-		data := url.Values{}
-		data.Set("test", "form")
-		data.Set("issue", "3111")
-
-		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/?foo=bar", addr), strings.NewReader(data.Encode()))
-		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
-
-		ctx := context.Background()
-		req = req.WithContext(ctx)
-		assert.NoError(t, err)
-		err = user.InjectOrgIDIntoHTTPRequest(user.InjectOrgID(ctx, "1"), req)
-		assert.NoError(t, err)
-
-		client := http.Client{
-			Transport: &nethttp.Transport{},
-		}
-
-		resp, err := client.Do(req)
-		assert.NoError(t, err)
-		b, err := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		assert.NoError(t, err)
-		assert.Equal(t, 200, resp.StatusCode, string(b))
-
-		logs := buf.String()
-		assert.NotContains(t, logs, "unable to parse form for request")
-		assert.Contains(t, logs, "msg=\"slow query detected\"")
-		assert.Contains(t, logs, "param_issue=3111")
-		assert.Contains(t, logs, "param_test=form")
-		assert.Contains(t, logs, "param_foo=bar")
+	tests := map[string]struct {
+		longerThan time.Duration
+		shouldLog  bool
+	}{
+		"longer than set to > 0": {
+			longerThan: 1 * time.Microsecond,
+			shouldLog:  true,
+		},
+		"longer than set to < 0": {
+			longerThan: -1 * time.Microsecond,
+			shouldLog:  true,
+		},
+		"logging disabled": {
+			longerThan: 0,
+			shouldLog:  false,
+		},
 	}
 
-	testFrontend(t, config, nil, test, false, l)
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			// Configure the query-frontend with the mocked downstream server.
+			config := defaultFrontendConfig()
+			config.Handler.LogQueriesLongerThan = testData.longerThan
+			config.DownstreamURL = fmt.Sprintf("http://%s", downstreamListen.Addr())
+
+			var buf concurrency.SyncBuffer
+
+			test := func(addr string) {
+				// To assert form values are logged as well.
+				data := url.Values{}
+				data.Set("test", "form")
+				data.Set("issue", "3111")
+
+				req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/?foo=bar", addr), strings.NewReader(data.Encode()))
+				req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+				req.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
+
+				ctx := context.Background()
+				req = req.WithContext(ctx)
+				assert.NoError(t, err)
+				err = user.InjectOrgIDIntoHTTPRequest(user.InjectOrgID(ctx, "1"), req)
+				assert.NoError(t, err)
+
+				client := http.Client{
+					Transport: &nethttp.Transport{},
+				}
+
+				resp, err := client.Do(req)
+				assert.NoError(t, err)
+				b, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				assert.NoError(t, err)
+				assert.Equal(t, 200, resp.StatusCode, string(b))
+
+				logs := buf.String()
+				assert.NotContains(t, logs, "unable to parse form for request")
+
+				if testData.shouldLog {
+					assert.Contains(t, logs, "msg=\"slow query detected\"")
+					assert.Contains(t, logs, "param_issue=3111")
+					assert.Contains(t, logs, "param_test=form")
+					assert.Contains(t, logs, "param_foo=bar")
+				} else {
+					assert.NotContains(t, logs, "msg=\"slow query detected\"")
+				}
+			}
+
+			testFrontend(t, config, nil, test, false, log.NewLogfmtLogger(&buf))
+		})
+	}
 }
 
 func TestFrontend_ReturnsRequestBodyTooLargeError(t *testing.T) {
@@ -196,7 +225,7 @@ func TestFrontend_ReturnsRequestBodyTooLargeError(t *testing.T) {
 
 		resp, err := client.Do(req)
 		assert.NoError(t, err)
-		b, err := ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		assert.NoError(t, err)
 
@@ -226,7 +255,7 @@ func testFrontend(t *testing.T, config CombinedFrontendConfig, handler http.Hand
 	httpListen, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
 
-	rt, v1, v2, err := InitFrontend(config, limits{}, 0, logger, nil)
+	rt, v1, v2, err := InitFrontend(config, frontendv1.MockLimits{}, 0, logger, nil, transport.NewRetry(0, nil))
 	require.NoError(t, err)
 	require.NotNil(t, rt)
 	// v1 will be nil if DownstreamURL is defined.
@@ -251,7 +280,7 @@ func testFrontend(t *testing.T, config CombinedFrontendConfig, handler http.Hand
 	r.PathPrefix("/").Handler(middleware.Merge(
 		middleware.AuthenticateUser,
 		middleware.Tracer{},
-	).Wrap(transport.NewHandler(config.Handler, rt, logger, nil)))
+	).Wrap(transport.NewHandler(config.Handler, tenantfederation.Config{}, rt, logger, nil)))
 
 	httpServer := http.Server{
 		Handler: r,
@@ -278,12 +307,4 @@ func defaultFrontendConfig() CombinedFrontendConfig {
 	flagext.DefaultValues(&config.FrontendV1)
 	flagext.DefaultValues(&config.FrontendV2)
 	return config
-}
-
-type limits struct {
-	queriers int
-}
-
-func (l limits) MaxQueriersPerUser(_ string) int {
-	return l.queriers
 }

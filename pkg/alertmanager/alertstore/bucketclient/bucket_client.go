@@ -3,19 +3,25 @@ package bucketclient
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/proto"
-	"github.com/grafana/dskit/concurrency"
-	"github.com/grafana/dskit/runutil"
 	"github.com/pkg/errors"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/prometheus/alertmanager/cluster/clusterpb"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/thanos/pkg/extprom"
+	googleproto "google.golang.org/protobuf/proto"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/runutil"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 const (
@@ -43,27 +49,54 @@ type BucketAlertStore struct {
 	amBucket     objstore.Bucket
 	cfgProvider  bucket.TenantConfigProvider
 	logger       log.Logger
+
+	usersScanner     users.Scanner
+	userIndexUpdater *users.UserIndexUpdater
 }
 
-func NewBucketAlertStore(bkt objstore.Bucket, cfgProvider bucket.TenantConfigProvider, logger log.Logger) *BucketAlertStore {
-	return &BucketAlertStore{
-		alertsBucket: bucket.NewPrefixedBucketClient(bkt, alertsPrefix),
-		amBucket:     bucket.NewPrefixedBucketClient(bkt, alertmanagerPrefix),
-		cfgProvider:  cfgProvider,
-		logger:       logger,
+func NewBucketAlertStore(bkt objstore.InstrumentedBucket, userScannerCfg users.UsersScannerConfig, cfgProvider bucket.TenantConfigProvider, logger log.Logger, reg prometheus.Registerer) (*BucketAlertStore, error) {
+	alertBucket := bucket.NewPrefixedBucketClient(bkt, alertsPrefix)
+
+	regWithComponent := extprom.WrapRegistererWith(prometheus.Labels{"component": "alertmanager"}, reg)
+	usersScanner, err := users.NewScanner(userScannerCfg, alertBucket, logger, regWithComponent)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to initialize alertmanager users scanner")
 	}
+
+	var userIndexUpdater *users.UserIndexUpdater
+	if userScannerCfg.Strategy == users.UserScanStrategyUserIndex {
+		// We hardcode strategy to be list so can ignore error.
+		baseScanner, _ := users.NewScanner(users.UsersScannerConfig{
+			Strategy: users.UserScanStrategyList,
+		}, alertBucket, logger, regWithComponent)
+		userIndexUpdater = users.NewUserIndexUpdater(alertBucket, userScannerCfg.UpdateInterval, baseScanner, regWithComponent)
+	}
+
+	return &BucketAlertStore{
+		alertsBucket:     alertBucket,
+		amBucket:         bucket.NewPrefixedBucketClient(bkt, alertmanagerPrefix),
+		cfgProvider:      cfgProvider,
+		logger:           logger,
+		usersScanner:     usersScanner,
+		userIndexUpdater: userIndexUpdater,
+	}, nil
+}
+
+// GetUserIndexUpdater implements alertstore.AlertStore.
+func (s *BucketAlertStore) GetUserIndexUpdater() *users.UserIndexUpdater {
+	return s.userIndexUpdater
 }
 
 // ListAllUsers implements alertstore.AlertStore.
 func (s *BucketAlertStore) ListAllUsers(ctx context.Context) ([]string, error) {
-	var userIDs []string
-
-	err := s.alertsBucket.Iter(ctx, "", func(key string) error {
-		userIDs = append(userIDs, key)
-		return nil
-	})
-
-	return userIDs, err
+	active, deleting, _, err := s.usersScanner.ScanUsers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to list users in alertmanager store bucket: %w", err)
+	}
+	userIDs := make([]string, 0, len(active)+len(deleting))
+	userIDs = append(userIDs, active...)
+	userIDs = append(userIDs, deleting...)
+	return userIDs, nil
 }
 
 // GetAlertConfigs implements alertstore.AlertStore.
@@ -73,11 +106,11 @@ func (s *BucketAlertStore) GetAlertConfigs(ctx context.Context, userIDs []string
 		cfgs   = make(map[string]alertspb.AlertConfigDesc, len(userIDs))
 	)
 
-	err := concurrency.ForEach(ctx, concurrency.CreateJobsFromStrings(userIDs), fetchConcurrency, func(ctx context.Context, job interface{}) error {
+	err := concurrency.ForEach(ctx, concurrency.CreateJobsFromStrings(userIDs), fetchConcurrency, func(ctx context.Context, job any) error {
 		userID := job.(string)
 
-		cfg, err := s.getAlertConfig(ctx, userID)
-		if s.alertsBucket.IsObjNotFoundErr(err) {
+		cfg, uBucket, err := s.getAlertConfig(ctx, userID)
+		if uBucket.IsObjNotFoundErr(err) || uBucket.IsAccessDeniedErr(err) {
 			return nil
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
@@ -95,9 +128,13 @@ func (s *BucketAlertStore) GetAlertConfigs(ctx context.Context, userIDs []string
 
 // GetAlertConfig implements alertstore.AlertStore.
 func (s *BucketAlertStore) GetAlertConfig(ctx context.Context, userID string) (alertspb.AlertConfigDesc, error) {
-	cfg, err := s.getAlertConfig(ctx, userID)
-	if s.alertsBucket.IsObjNotFoundErr(err) {
+	cfg, uBucket, err := s.getAlertConfig(ctx, userID)
+	if uBucket.IsObjNotFoundErr(err) {
 		return cfg, alertspb.ErrNotFound
+	}
+
+	if uBucket.IsAccessDeniedErr(err) {
+		return cfg, alertspb.ErrAccessDenied
 	}
 
 	return cfg, err
@@ -110,7 +147,7 @@ func (s *BucketAlertStore) SetAlertConfig(ctx context.Context, cfg alertspb.Aler
 		return err
 	}
 
-	return s.getUserBucket(cfg.User).Upload(ctx, cfg.User, bytes.NewBuffer(cfgBytes))
+	return s.getUserBucket(cfg.User).Upload(ctx, cfg.User, bytes.NewReader(cfgBytes))
 }
 
 // DeleteAlertConfig implements alertstore.AlertStore.
@@ -141,24 +178,41 @@ func (s *BucketAlertStore) GetFullState(ctx context.Context, userID string) (ale
 	bkt := s.getAlertmanagerUserBucket(userID)
 	fs := alertspb.FullStateDesc{}
 
-	err := s.get(ctx, bkt, fullStateName, &fs)
-	if s.amBucket.IsObjNotFoundErr(err) {
-		return fs, alertspb.ErrNotFound
+	readCloser, err := bkt.Get(ctx, fullStateName)
+	if err != nil {
+		if bkt.IsObjNotFoundErr(err) {
+			return fs, alertspb.ErrNotFound
+		}
+		if bkt.IsAccessDeniedErr(err) {
+			return fs, alertspb.ErrAccessDenied
+		}
+		return fs, err
+	}
+	defer runutil.CloseWithLogOnErr(s.logger, readCloser, "close bucket reader")
+
+	buf, err := io.ReadAll(readCloser)
+	if err != nil {
+		return fs, errors.Wrapf(err, "failed to read full state for user %s", userID)
 	}
 
-	return fs, err
+	state := &clusterpb.FullState{}
+	if err := googleproto.Unmarshal(buf, state); err != nil {
+		return fs, errors.Wrapf(err, "failed to deserialize full state for user %s", userID)
+	}
+	fs.State = state
+	return fs, nil
 }
 
 // SetFullState implements alertstore.AlertStore.
 func (s *BucketAlertStore) SetFullState(ctx context.Context, userID string, fs alertspb.FullStateDesc) error {
 	bkt := s.getAlertmanagerUserBucket(userID)
 
-	fsBytes, err := fs.Marshal()
+	fsBytes, err := googleproto.Marshal(fs.State)
 	if err != nil {
 		return err
 	}
 
-	return bkt.Upload(ctx, fullStateName, bytes.NewBuffer(fsBytes))
+	return bkt.Upload(ctx, fullStateName, bytes.NewReader(fsBytes))
 }
 
 // DeleteFullState implements alertstore.AlertStore.
@@ -172,10 +226,11 @@ func (s *BucketAlertStore) DeleteFullState(ctx context.Context, userID string) e
 	return err
 }
 
-func (s *BucketAlertStore) getAlertConfig(ctx context.Context, userID string) (alertspb.AlertConfigDesc, error) {
+func (s *BucketAlertStore) getAlertConfig(ctx context.Context, userID string) (alertspb.AlertConfigDesc, objstore.Bucket, error) {
 	config := alertspb.AlertConfigDesc{}
-	err := s.get(ctx, s.getUserBucket(userID), userID, &config)
-	return config, err
+	userBkt := s.getUserBucket(userID)
+	err := s.get(ctx, userBkt, userID, &config)
+	return config, userBkt, err
 }
 
 func (s *BucketAlertStore) get(ctx context.Context, bkt objstore.Bucket, name string, msg proto.Message) error {
@@ -186,7 +241,7 @@ func (s *BucketAlertStore) get(ctx context.Context, bkt objstore.Bucket, name st
 
 	defer runutil.CloseWithLogOnErr(s.logger, readCloser, "close bucket reader")
 
-	buf, err := ioutil.ReadAll(readCloser)
+	buf, err := io.ReadAll(readCloser)
 	if err != nil {
 		return errors.Wrapf(err, "failed to read alertmanager config for user %s", name)
 	}
@@ -205,5 +260,6 @@ func (s *BucketAlertStore) getUserBucket(userID string) objstore.Bucket {
 }
 
 func (s *BucketAlertStore) getAlertmanagerUserBucket(userID string) objstore.Bucket {
-	return bucket.NewUserBucketClient(userID, s.amBucket, s.cfgProvider).WithExpectedErrs(s.amBucket.IsObjNotFoundErr)
+	uBucket := bucket.NewUserBucketClient(userID, s.amBucket, s.cfgProvider)
+	return uBucket.WithExpectedErrs(bucket.IsOneOfTheExpectedErrors(uBucket.IsAccessDeniedErr, uBucket.IsObjNotFoundErr))
 }

@@ -1,7 +1,9 @@
-FROM       alpine:3.14
-RUN        apk add --no-cache ca-certificates
+ARG        BASEIMG=gcr.io/distroless/static-debian12:latest
+FROM       ${BASEIMG}
+ARG TARGETARCH
+
 COPY       migrations /migrations/
-COPY       cortex /bin/cortex
+COPY       cortex-$TARGETARCH /bin/cortex
 EXPOSE     80
 ENTRYPOINT [ "/bin/cortex" ]
 

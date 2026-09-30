@@ -6,13 +6,15 @@ import (
 	"strings"
 
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/histogram"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 )
 
 // ValidationError is an error returned by series validation.
 //
-// nolint:golint ignore stutter warning
+// Ignore stutter warning.
+// nolint:revive
 type ValidationError error
 
 // genericValidationError is a basic implementation of ValidationError which can be used when the
@@ -27,29 +29,66 @@ func (e *genericValidationError) Error() string {
 	return fmt.Sprintf(e.message, e.cause, formatLabelSet(e.series))
 }
 
-func newLabelNameTooLongError(series []cortexpb.LabelAdapter, labelName string) ValidationError {
-	return &genericValidationError{
-		message: "label name too long: %.200q metric %.200q",
-		cause:   labelName,
-		series:  series,
+// labelNameTooLongError is a customized ValidationError, in that the cause and the series are
+// formatted in different order in Error.
+type labelNameTooLongError struct {
+	labelName string
+	series    []cortexpb.LabelAdapter
+	limit     int
+}
+
+func (e *labelNameTooLongError) Error() string {
+	return fmt.Sprintf("label name too long for metric (actual: %d, limit: %d) metric: %.200q label name: %.200q", len(e.labelName), e.limit, formatLabelSet(e.series), e.labelName)
+}
+
+func newLabelNameTooLongError(series []cortexpb.LabelAdapter, labelName string, limit int) ValidationError {
+	return &labelNameTooLongError{
+		labelName: labelName,
+		series:    series,
+		limit:     limit,
 	}
 }
 
 // labelValueTooLongError is a customized ValidationError, in that the cause and the series are
-// are formatted in different order in Error.
+// formatted in different order in Error.
 type labelValueTooLongError struct {
+	labelName  string
 	labelValue string
 	series     []cortexpb.LabelAdapter
+	limit      int
 }
 
 func (e *labelValueTooLongError) Error() string {
-	return fmt.Sprintf("label value too long for metric: %.200q label value: %.200q", formatLabelSet(e.series), e.labelValue)
+	return fmt.Sprintf("label value too long for metric (actual: %d, limit: %d) metric: %.200q label name: %.200q label value: %.200q",
+		len(e.labelValue), e.limit, formatLabelSet(e.series), e.labelName, e.labelValue)
 }
 
-func newLabelValueTooLongError(series []cortexpb.LabelAdapter, labelValue string) ValidationError {
+func newLabelValueTooLongError(series []cortexpb.LabelAdapter, labelName, labelValue string, limit int) ValidationError {
 	return &labelValueTooLongError{
+		labelName:  labelName,
 		labelValue: labelValue,
 		series:     series,
+		limit:      limit,
+	}
+}
+
+// labelsSizeBytesExceededError is a customized ValidationError, in that the cause and the series are
+// formatted in different order in Error.
+type labelsSizeBytesExceededError struct {
+	labelsSizeBytes int
+	series          []cortexpb.LabelAdapter
+	limit           int
+}
+
+func (e *labelsSizeBytesExceededError) Error() string {
+	return fmt.Sprintf("labels size bytes exceeded for metric (actual: %d, limit: %d) metric: %.200q", e.labelsSizeBytes, e.limit, formatLabelSet(e.series))
+}
+
+func labelSizeBytesExceededError(series []cortexpb.LabelAdapter, labelsSizeBytes int, limit int) ValidationError {
+	return &labelsSizeBytesExceededError{
+		labelsSizeBytes: labelsSizeBytes,
+		series:          series,
+		limit:           limit,
 	}
 }
 
@@ -185,6 +224,78 @@ func newExemplarLabelLengthError(seriesLabels []cortexpb.LabelAdapter, exemplarL
 		exemplarLabels: exemplarLabels,
 		timestamp:      timestamp,
 	}
+}
+
+// histogramBucketLimitExceededError is a ValidationError implementation for samples with native histogram
+// exceeding max bucket limit and cannot reduce resolution further to be within the max bucket limit.
+type histogramBucketLimitExceededError struct {
+	series []cortexpb.LabelAdapter
+	limit  int
+}
+
+func newHistogramBucketLimitExceededError(series []cortexpb.LabelAdapter, limit int) ValidationError {
+	return &histogramBucketLimitExceededError{
+		series: series,
+		limit:  limit,
+	}
+}
+
+func (e *histogramBucketLimitExceededError) Error() string {
+	return fmt.Sprintf("native histogram bucket count exceeded for metric (limit: %d) metric: %.200q", e.limit, formatLabelSet(e.series))
+}
+
+// nativeHistogramSchemaInvalidError is a ValidationError implementation for samples with native histogram
+// exceeding the valid schema range.
+type nativeHistogramSchemaInvalidError struct {
+	series         []cortexpb.LabelAdapter
+	receivedSchema int
+}
+
+func newNativeHistogramSchemaInvalidError(series []cortexpb.LabelAdapter, receivedSchema int) ValidationError {
+	return &nativeHistogramSchemaInvalidError{
+		series:         series,
+		receivedSchema: receivedSchema,
+	}
+}
+
+func (e *nativeHistogramSchemaInvalidError) Error() string {
+	return fmt.Sprintf("invalid native histogram schema %d for metric: %.200q. supported schema from %d to %d", e.receivedSchema, formatLabelSet(e.series), histogram.ExponentialSchemaMin, histogram.ExponentialSchemaMax)
+}
+
+// nativeHistogramSampleSizeBytesExceededError is a ValidationError implementation for samples with native histogram
+// exceeding the sample size bytes limit
+type nativeHistogramSampleSizeBytesExceededError struct {
+	nhSampleSizeBytes int
+	series            []cortexpb.LabelAdapter
+	limit             int
+}
+
+func newNativeHistogramSampleSizeBytesExceededError(series []cortexpb.LabelAdapter, nhSampleSizeBytes int, limit int) ValidationError {
+	return &nativeHistogramSampleSizeBytesExceededError{
+		nhSampleSizeBytes: nhSampleSizeBytes,
+		series:            series,
+		limit:             limit,
+	}
+}
+
+func (e *nativeHistogramSampleSizeBytesExceededError) Error() string {
+	return fmt.Sprintf("native histogram sample size bytes exceeded for metric (actual: %d, limit: %d) metric: %.200q", e.nhSampleSizeBytes, e.limit, formatLabelSet(e.series))
+}
+
+type nativeHistogramInvalidError struct {
+	nhValidationErr error
+	series          []cortexpb.LabelAdapter
+}
+
+func newNativeHistogramInvalidError(series []cortexpb.LabelAdapter, nhValidationErr error) ValidationError {
+	return &nativeHistogramInvalidError{
+		series:          series,
+		nhValidationErr: nhValidationErr,
+	}
+}
+
+func (e *nativeHistogramInvalidError) Error() string {
+	return fmt.Sprintf("invalid native histogram, validation err: %v, metric: %.200q", e.nhValidationErr, formatLabelSet(e.series))
 }
 
 // formatLabelSet formats label adapters as a metric name with labels, while preserving

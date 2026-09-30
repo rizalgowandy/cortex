@@ -4,12 +4,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/ring"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func TestRingConfig_DefaultConfigToLifecyclerConfig(t *testing.T) {
+	t.Parallel()
 	cfg := RingConfig{}
 	expected := ring.LifecyclerConfig{}
 
@@ -29,6 +31,7 @@ func TestRingConfig_DefaultConfigToLifecyclerConfig(t *testing.T) {
 }
 
 func TestRingConfig_CustomConfigToLifecyclerConfig(t *testing.T) {
+	t.Parallel()
 	cfg := RingConfig{}
 	expected := ring.LifecyclerConfig{}
 

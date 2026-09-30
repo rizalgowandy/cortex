@@ -5,14 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/tsdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -45,8 +44,10 @@ func TestThanosBlockConverter(t *testing.T) {
 		assertions func(*testing.T, *bucket.ClientMock, Results, error)
 	}{
 		{
-			name:       "empty bucket is a noop",
-			bucketData: fakeBucket{},
+			name: "empty bucket is a noop",
+			bucketData: fakeBucket{
+				"__markers__": map[string]metadata.Meta{},
+			},
 			assertions: func(t *testing.T, bkt *bucket.ClientMock, results Results, err error) {
 				bkt.AssertNotCalled(t, "Get", mock.Anything, mock.Anything)
 				bkt.AssertNotCalled(t, "Upload", mock.Anything, mock.Anything, mock.Anything)
@@ -54,8 +55,11 @@ func TestThanosBlockConverter(t *testing.T) {
 			},
 		},
 		{
-			name:       "user with no blocks is a noop",
-			bucketData: fakeBucket{"user1": map[string]metadata.Meta{}},
+			name: "user with no blocks is a noop",
+			bucketData: fakeBucket{
+				"user1":       map[string]metadata.Meta{},
+				"__markers__": map[string]metadata.Meta{},
+			},
 			assertions: func(t *testing.T, bkt *bucket.ClientMock, results Results, err error) {
 				bkt.AssertNotCalled(t, "Get", mock.Anything, mock.Anything)
 				bkt.AssertNotCalled(t, "Upload", mock.Anything, mock.Anything, mock.Anything)
@@ -80,6 +84,7 @@ func TestThanosBlockConverter(t *testing.T) {
 				"user3": map[string]metadata.Meta{
 					block1: cortexMeta("user3"),
 				},
+				"__markers__": map[string]metadata.Meta{},
 			},
 			assertions: func(t *testing.T, bkt *bucket.ClientMock, results Results, err error) {
 				bkt.AssertNotCalled(t, "Upload", mock.Anything, mock.Anything, mock.Anything)
@@ -114,6 +119,7 @@ func TestThanosBlockConverter(t *testing.T) {
 				"user3": map[string]metadata.Meta{
 					block1: thanosMeta(),
 				},
+				"__markers__": map[string]metadata.Meta{},
 			},
 			assertions: func(t *testing.T, bkt *bucket.ClientMock, results Results, err error) {
 				assert.Len(t, results, 3, "expected users in results")
@@ -149,6 +155,7 @@ func TestThanosBlockConverter(t *testing.T) {
 					blockWithUploadFailure: thanosMeta(),
 					blockWithMalformedMeta: thanosMeta(),
 				},
+				"__markers__": map[string]metadata.Meta{},
 			},
 			assertions: func(t *testing.T, bkt *bucket.ClientMock, results Results, err error) {
 				assert.Len(t, results["user1"].FailedBlocks, 1)
@@ -179,9 +186,7 @@ func TestThanosBlockConverter(t *testing.T) {
 
 func cortexMeta(user string) metadata.Meta {
 	return metadata.Meta{
-		BlockMeta: tsdb.BlockMeta{
-			Version: metadata.ThanosVersion1,
-		},
+		Version: metadata.ThanosVersion1,
 		Thanos: metadata.Thanos{
 			Labels: map[string]string{
 				cortex_tsdb.TenantIDExternalLabel: user,
@@ -192,9 +197,7 @@ func cortexMeta(user string) metadata.Meta {
 
 func thanosMeta() metadata.Meta {
 	return metadata.Meta{
-		BlockMeta: tsdb.BlockMeta{
-			Version: metadata.ThanosVersion1,
-		},
+		Version: metadata.ThanosVersion1,
 		Thanos: metadata.Thanos{
 			Labels: map[string]string{
 				"cluster": "foo",
@@ -265,9 +268,9 @@ func mockBucket(data fakeBucket) *bucket.ClientMock {
 			case blockWithGetFailure:
 				bkt.On("Get", mock.Anything, key).Return(nil, errors.Errorf("test error in Get"))
 			case blockWithMalformedMeta:
-				bkt.On("Get", mock.Anything, key).Return(ioutil.NopCloser(bytes.NewBufferString("invalid json")), nil)
+				bkt.On("Get", mock.Anything, key).Return(io.NopCloser(bytes.NewBufferString("invalid json")), nil)
 			default:
-				bkt.On("Get", mock.Anything, key).Return(ioutil.NopCloser(&body), nil)
+				bkt.On("Get", mock.Anything, key).Return(io.NopCloser(&body), nil)
 			}
 
 			switch block {

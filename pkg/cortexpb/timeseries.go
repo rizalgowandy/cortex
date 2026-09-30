@@ -12,10 +12,11 @@ import (
 )
 
 var (
-	expectedTimeseries         = 100
-	expectedLabels             = 20
-	expectedSamplesPerSeries   = 10
-	expectedExemplarsPerSeries = 1
+	expectedTimeseries          = 100
+	expectedLabels              = 20
+	expectedSamplesPerSeries    = 10
+	expectedExemplarsPerSeries  = 1
+	expectedHistogramsPerSeries = 1
 
 	/*
 		We cannot pool these as pointer-to-slice because the place we use them is in WriteRequest which is generated from Protobuf
@@ -23,20 +24,30 @@ var (
 		is re-used. But since the slices are far far larger, we come out ahead.
 	*/
 	slicePool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return make([]PreallocTimeseries, 0, expectedTimeseries)
 		},
 	}
 
 	timeSeriesPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return &TimeSeries{
-				Labels:    make([]LabelAdapter, 0, expectedLabels),
-				Samples:   make([]Sample, 0, expectedSamplesPerSeries),
-				Exemplars: make([]Exemplar, 0, expectedExemplarsPerSeries),
+				Labels:     make([]LabelAdapter, 0, expectedLabels),
+				Samples:    make([]Sample, 0, expectedSamplesPerSeries),
+				Exemplars:  make([]Exemplar, 0, expectedExemplarsPerSeries),
+				Histograms: make([]WrappedHistogram, 0, expectedHistogramsPerSeries),
 			}
 		},
 	}
+
+	writeRequestPool = sync.Pool{
+		New: func() any {
+			return &PreallocWriteRequest{
+				WriteRequest: WriteRequest{},
+			}
+		},
+	}
+	bytePool = newSlicePool(20)
 )
 
 // PreallocConfig configures how structures will be preallocated to optimise
@@ -48,11 +59,13 @@ func (PreallocConfig) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&expectedTimeseries, "ingester-client.expected-timeseries", expectedTimeseries, "Expected number of timeseries per request, used for preallocations.")
 	f.IntVar(&expectedLabels, "ingester-client.expected-labels", expectedLabels, "Expected number of labels per timeseries, used for preallocations.")
 	f.IntVar(&expectedSamplesPerSeries, "ingester-client.expected-samples-per-series", expectedSamplesPerSeries, "Expected number of samples per timeseries, used for preallocations.")
+	f.IntVar(&maxWrappedHistogramSizeBytes, "validation.max-native-histogram-size-bytes", maxWrappedHistogramSizeBytes, "Maximum size in bytes of a single native histogram in raw protobuf before unmarshalling. 0 to disable.")
 }
 
 // PreallocWriteRequest is a WriteRequest which preallocs slices on Unmarshal.
 type PreallocWriteRequest struct {
 	WriteRequest
+	data *[]byte
 }
 
 // Unmarshal implements proto.Message.
@@ -70,6 +83,33 @@ type PreallocTimeseries struct {
 func (p *PreallocTimeseries) Unmarshal(dAtA []byte) error {
 	p.TimeSeries = TimeseriesFromPool()
 	return p.TimeSeries.Unmarshal(dAtA)
+}
+
+func (p *PreallocWriteRequest) Marshal() (dAtA []byte, err error) {
+	size := p.Size()
+	p.data = bytePool.getSlice(size)
+	dAtA = *p.data
+	n, err := p.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func ReuseWriteRequest(req *PreallocWriteRequest) {
+	if req.data != nil {
+		bytePool.reuseSlice(req.data)
+		req.data = nil
+	}
+	req.Source = 0
+	req.Metadata = nil
+	req.Timeseries = nil
+	req.DiscardOutOfOrder = false
+	writeRequestPool.Put(req)
+}
+
+func PreallocWriteRequestFromPool() *PreallocWriteRequest {
+	return writeRequestPool.Get().(*PreallocWriteRequest)
 }
 
 // LabelAdapter is a labels.Label that can be marshalled to/from protos.
@@ -304,6 +344,12 @@ func ReuseTimeseries(ts *TimeSeries) {
 			ts.Exemplars[i].Labels[j].Value = ""
 		}
 	}
+
+	for i := range ts.Histograms {
+		ts.Histograms[i].Reset()
+	}
+
 	ts.Exemplars = ts.Exemplars[:0]
+	ts.Histograms = ts.Histograms[:0]
 	timeSeriesPool.Put(ts)
 }

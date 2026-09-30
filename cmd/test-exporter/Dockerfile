@@ -1,6 +1,7 @@
-FROM       alpine:3.14
-RUN        apk add --no-cache ca-certificates
-COPY       test-exporter /
+ARG        BASEIMG=gcr.io/distroless/static-debian12:latest
+FROM       ${BASEIMG}
+ARG TARGETARCH
+COPY       test-exporter-$TARGETARCH /test-exporter
 ENTRYPOINT ["/test-exporter"]
 
 ARG revision

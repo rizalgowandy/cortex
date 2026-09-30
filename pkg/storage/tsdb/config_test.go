@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func TestConfig_Validate(t *testing.T) {
@@ -63,7 +63,7 @@ func TestConfig_Validate(t *testing.T) {
 		},
 		"should fail on too high compaction interval": {
 			setup: func(cfg *BlocksStorageConfig) {
-				cfg.TSDB.HeadCompactionInterval = 10 * time.Minute
+				cfg.TSDB.HeadCompactionInterval = 40 * time.Minute
 			},
 			expectedErr: errInvalidCompactionInterval,
 		},
@@ -115,10 +115,75 @@ func TestConfig_Validate(t *testing.T) {
 			},
 			expectedErr: errInvalidWALSegmentSizeBytes,
 		},
+		"should fail on out of order cap max": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.TSDB.OutOfOrderCapMax = 0
+			},
+			expectedErr: errInvalidOutOfOrderCapMax,
+		},
+		"should pass on valid wal compression type (snappy)": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.TSDB.WALCompressionType = "snappy"
+			},
+			expectedErr: nil,
+		},
+		"should pass on valid wal compression type (zstd)": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.TSDB.WALCompressionType = "zstd"
+			},
+			expectedErr: nil,
+		},
+		"should pass on valid wal compression type ('')": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.TSDB.WALCompressionType = ""
+			},
+			expectedErr: nil,
+		},
+		"should fail on invalid wal compression type": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.TSDB.WALCompressionType = "dummy"
+			},
+			expectedErr: errUnSupportedWALCompressionType,
+		},
+		"should fail on parquet query concurrency set to 0": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.BucketStore.ParquetQueryConcurrency = 0
+			},
+			expectedErr: errInvalidParquetQueryConcurrency,
+		},
+		"should fail on negative parquet query concurrency": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.BucketStore.ParquetQueryConcurrency = -1
+			},
+			expectedErr: errInvalidParquetQueryConcurrency,
+		},
+		"should pass on valid parquet query concurrency": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.BucketStore.ParquetQueryConcurrency = 4
+			},
+			expectedErr: nil,
+		},
+		"should fail on negative max concurrent data bytes": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.BucketStore.MaxConcurrentDataBytes = -1
+			},
+			expectedErr: ErrInvalidMaxConcurrentDataBytes,
+		},
+		"should pass on zero max concurrent data bytes (disabled)": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.BucketStore.MaxConcurrentDataBytes = 0
+			},
+			expectedErr: nil,
+		},
+		"should pass on positive max concurrent data bytes": {
+			setup: func(cfg *BlocksStorageConfig) {
+				cfg.BucketStore.MaxConcurrentDataBytes = 1024 * 1024 * 1024 // 1GB
+			},
+			expectedErr: nil,
+		},
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 
 		t.Run(testName, func(t *testing.T) {
 			cfg := &BlocksStorageConfig{}

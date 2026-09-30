@@ -20,6 +20,9 @@ package models
 // Editing this file might prove futile when you re-run the swagger generate command
 
 import (
+	"context"
+	stderrors "errors"
+
 	"github.com/go-openapi/errors"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
@@ -30,6 +33,9 @@ import (
 //
 // swagger:model silence
 type Silence struct {
+
+	// annotations
+	Annotations LabelSet `json:"annotations,omitempty"`
 
 	// comment
 	// Required: true
@@ -58,6 +64,10 @@ type Silence struct {
 func (m *Silence) Validate(formats strfmt.Registry) error {
 	var res []error
 
+	if err := m.validateAnnotations(formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.validateComment(formats); err != nil {
 		res = append(res, err)
 	}
@@ -81,6 +91,29 @@ func (m *Silence) Validate(formats strfmt.Registry) error {
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
+	return nil
+}
+
+func (m *Silence) validateAnnotations(formats strfmt.Registry) error {
+	if swag.IsZero(m.Annotations) { // not required
+		return nil
+	}
+
+	if m.Annotations != nil {
+		if err := m.Annotations.Validate(formats); err != nil {
+			ve := new(errors.Validation)
+			if stderrors.As(err, &ve) {
+				return ve.ValidateName("annotations")
+			}
+			ce := new(errors.CompositeError)
+			if stderrors.As(err, &ce) {
+				return ce.ValidateName("annotations")
+			}
+
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -122,9 +155,15 @@ func (m *Silence) validateMatchers(formats strfmt.Registry) error {
 	}
 
 	if err := m.Matchers.Validate(formats); err != nil {
-		if ve, ok := err.(*errors.Validation); ok {
+		ve := new(errors.Validation)
+		if stderrors.As(err, &ve) {
 			return ve.ValidateName("matchers")
 		}
+		ce := new(errors.CompositeError)
+		if stderrors.As(err, &ce) {
+			return ce.ValidateName("matchers")
+		}
+
 		return err
 	}
 
@@ -138,6 +177,64 @@ func (m *Silence) validateStartsAt(formats strfmt.Registry) error {
 	}
 
 	if err := validate.FormatOf("startsAt", "body", "date-time", m.StartsAt.String(), formats); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ContextValidate validate this silence based on the context it is used
+func (m *Silence) ContextValidate(ctx context.Context, formats strfmt.Registry) error {
+	var res []error
+
+	if err := m.contextValidateAnnotations(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
+	if err := m.contextValidateMatchers(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
+	if len(res) > 0 {
+		return errors.CompositeValidationError(res...)
+	}
+	return nil
+}
+
+func (m *Silence) contextValidateAnnotations(ctx context.Context, formats strfmt.Registry) error {
+
+	if swag.IsZero(m.Annotations) { // not required
+		return nil
+	}
+
+	if err := m.Annotations.ContextValidate(ctx, formats); err != nil {
+		ve := new(errors.Validation)
+		if stderrors.As(err, &ve) {
+			return ve.ValidateName("annotations")
+		}
+		ce := new(errors.CompositeError)
+		if stderrors.As(err, &ce) {
+			return ce.ValidateName("annotations")
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func (m *Silence) contextValidateMatchers(ctx context.Context, formats strfmt.Registry) error {
+
+	if err := m.Matchers.ContextValidate(ctx, formats); err != nil {
+		ve := new(errors.Validation)
+		if stderrors.As(err, &ve) {
+			return ve.ValidateName("matchers")
+		}
+		ce := new(errors.CompositeError)
+		if stderrors.As(err, &ce) {
+			return ce.ValidateName("matchers")
+		}
+
 		return err
 	}
 

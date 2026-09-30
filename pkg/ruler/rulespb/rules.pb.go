@@ -11,7 +11,7 @@ import (
 	proto "github.com/gogo/protobuf/proto"
 	github_com_gogo_protobuf_types "github.com/gogo/protobuf/types"
 	types "github.com/gogo/protobuf/types"
-	_ "github.com/golang/protobuf/ptypes/duration"
+	_ "google.golang.org/protobuf/types/known/durationpb"
 	io "io"
 	math "math"
 	math_bits "math/bits"
@@ -43,7 +43,13 @@ type RuleGroupDesc struct {
 	// having to repeatedly redefine the proto description. It can also be leveraged
 	// to create custom `ManagerOpts` based on rule configs which can then be passed
 	// to the Prometheus Manager.
-	Options []*types.Any `protobuf:"bytes,9,rep,name=options,proto3" json:"options,omitempty"`
+	Options     []*types.Any                                                `protobuf:"bytes,9,rep,name=options,proto3" json:"options,omitempty"`
+	Limit       int64                                                       `protobuf:"varint,10,opt,name=limit,proto3" json:"limit,omitempty"`
+	QueryOffset *time.Duration                                              `protobuf:"bytes,11,opt,name=queryOffset,proto3,stdduration" json:"queryOffset,omitempty"`
+	Labels      []github_com_cortexproject_cortex_pkg_cortexpb.LabelAdapter `protobuf:"bytes,12,rep,name=labels,proto3,customtype=github.com/cortexproject/cortex/pkg/cortexpb.LabelAdapter" json:"labels"`
+	// Tenants whose data is queried when evaluating this group. Empty means the
+	// owning tenant only. Non-empty makes this a federated rule group.
+	SourceTenants []string `protobuf:"bytes,13,rep,name=source_tenants,json=sourceTenants,proto3" json:"source_tenants,omitempty"`
 }
 
 func (m *RuleGroupDesc) Reset()      { *m = RuleGroupDesc{} }
@@ -120,14 +126,36 @@ func (m *RuleGroupDesc) GetOptions() []*types.Any {
 	return nil
 }
 
+func (m *RuleGroupDesc) GetLimit() int64 {
+	if m != nil {
+		return m.Limit
+	}
+	return 0
+}
+
+func (m *RuleGroupDesc) GetQueryOffset() *time.Duration {
+	if m != nil {
+		return m.QueryOffset
+	}
+	return nil
+}
+
+func (m *RuleGroupDesc) GetSourceTenants() []string {
+	if m != nil {
+		return m.SourceTenants
+	}
+	return nil
+}
+
 // RuleDesc is a proto representation of a Prometheus Rule
 type RuleDesc struct {
-	Expr        string                                                      `protobuf:"bytes,1,opt,name=expr,proto3" json:"expr,omitempty"`
-	Record      string                                                      `protobuf:"bytes,2,opt,name=record,proto3" json:"record,omitempty"`
-	Alert       string                                                      `protobuf:"bytes,3,opt,name=alert,proto3" json:"alert,omitempty"`
-	For         time.Duration                                               `protobuf:"bytes,4,opt,name=for,proto3,stdduration" json:"for"`
-	Labels      []github_com_cortexproject_cortex_pkg_cortexpb.LabelAdapter `protobuf:"bytes,5,rep,name=labels,proto3,customtype=github.com/cortexproject/cortex/pkg/cortexpb.LabelAdapter" json:"labels"`
-	Annotations []github_com_cortexproject_cortex_pkg_cortexpb.LabelAdapter `protobuf:"bytes,6,rep,name=annotations,proto3,customtype=github.com/cortexproject/cortex/pkg/cortexpb.LabelAdapter" json:"annotations"`
+	Expr          string                                                      `protobuf:"bytes,1,opt,name=expr,proto3" json:"expr,omitempty"`
+	Record        string                                                      `protobuf:"bytes,2,opt,name=record,proto3" json:"record,omitempty"`
+	Alert         string                                                      `protobuf:"bytes,3,opt,name=alert,proto3" json:"alert,omitempty"`
+	For           time.Duration                                               `protobuf:"bytes,4,opt,name=for,proto3,stdduration" json:"for"`
+	Labels        []github_com_cortexproject_cortex_pkg_cortexpb.LabelAdapter `protobuf:"bytes,5,rep,name=labels,proto3,customtype=github.com/cortexproject/cortex/pkg/cortexpb.LabelAdapter" json:"labels"`
+	Annotations   []github_com_cortexproject_cortex_pkg_cortexpb.LabelAdapter `protobuf:"bytes,6,rep,name=annotations,proto3,customtype=github.com/cortexproject/cortex/pkg/cortexpb.LabelAdapter" json:"annotations"`
+	KeepFiringFor time.Duration                                               `protobuf:"bytes,13,opt,name=keepFiringFor,proto3,stdduration" json:"keep_firing_for"`
 }
 
 func (m *RuleDesc) Reset()      { *m = RuleDesc{} }
@@ -190,6 +218,13 @@ func (m *RuleDesc) GetFor() time.Duration {
 	return 0
 }
 
+func (m *RuleDesc) GetKeepFiringFor() time.Duration {
+	if m != nil {
+		return m.KeepFiringFor
+	}
+	return 0
+}
+
 func init() {
 	proto.RegisterType((*RuleGroupDesc)(nil), "rules.RuleGroupDesc")
 	proto.RegisterType((*RuleDesc)(nil), "rules.RuleDesc")
@@ -198,37 +233,44 @@ func init() {
 func init() { proto.RegisterFile("rules.proto", fileDescriptor_8e722d3e922f0937) }
 
 var fileDescriptor_8e722d3e922f0937 = []byte{
-	// 476 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb4, 0x52, 0x3f, 0x6f, 0xd3, 0x40,
-	0x1c, 0xf5, 0x35, 0x8e, 0x63, 0x5f, 0x54, 0x11, 0x1d, 0x15, 0x72, 0x2b, 0x74, 0x89, 0x2a, 0x21,
-	0x65, 0xe1, 0x22, 0x15, 0x31, 0x30, 0x20, 0x94, 0xa8, 0x12, 0x52, 0xc4, 0x80, 0x3c, 0xb2, 0x9d,
-	0x9d, 0xab, 0x31, 0xb8, 0xbe, 0xd3, 0xf9, 0x8c, 0xda, 0x8d, 0x8f, 0xc0, 0xc8, 0x47, 0xe0, 0xa3,
-	0x74, 0xcc, 0x58, 0x31, 0x14, 0xe2, 0x2c, 0x8c, 0x95, 0xf8, 0x00, 0xa0, 0xfb, 0x63, 0x5a, 0xc1,
-	0x02, 0x03, 0x53, 0x7e, 0xef, 0xde, 0xbd, 0xbc, 0xf7, 0x7b, 0x67, 0x38, 0x94, 0x4d, 0xc9, 0x6a,
-	0x22, 0x24, 0x57, 0x1c, 0xf5, 0x0d, 0x38, 0x78, 0x98, 0x17, 0xea, 0x75, 0x93, 0x92, 0x8c, 0x9f,
-	0xce, 0x72, 0x9e, 0xf3, 0x99, 0x61, 0xd3, 0xe6, 0xc4, 0x20, 0x03, 0xcc, 0x64, 0x55, 0x07, 0x38,
-	0xe7, 0x3c, 0x2f, 0xd9, 0xcd, 0xad, 0x55, 0x23, 0xa9, 0x2a, 0x78, 0xe5, 0xf8, 0xfd, 0xdf, 0x79,
-	0x5a, 0x9d, 0x3b, 0xea, 0xc9, 0x2d, 0xa7, 0x8c, 0x4b, 0xc5, 0xce, 0x84, 0xe4, 0x6f, 0x58, 0xa6,
-	0x1c, 0x9a, 0x89, 0xb7, 0x79, 0x47, 0xa4, 0x6e, 0xb0, 0xd2, 0xc3, 0x1f, 0x00, 0xee, 0x26, 0x4d,
-	0xc9, 0x9e, 0x4b, 0xde, 0x88, 0x63, 0x56, 0x67, 0x08, 0x41, 0xbf, 0xa2, 0xa7, 0x2c, 0x06, 0x13,
-	0x30, 0x8d, 0x12, 0x33, 0xa3, 0xfb, 0x30, 0xd2, 0xbf, 0xb5, 0xa0, 0x19, 0x8b, 0x77, 0x0c, 0x71,
-	0x73, 0x80, 0x9e, 0xc1, 0xb0, 0xa8, 0x14, 0x93, 0xef, 0x68, 0x19, 0xf7, 0x26, 0x60, 0x3a, 0x3c,
-	0xda, 0x27, 0x36, 0x2c, 0xe9, 0xc2, 0x92, 0x63, 0xb7, 0xcc, 0x22, 0xbc, 0xb8, 0x1a, 0x7b, 0x1f,
-	0xbf, 0x8c, 0x41, 0xf2, 0x4b, 0x84, 0x1e, 0x40, 0x5b, 0x59, 0xec, 0x4f, 0x7a, 0xd3, 0xe1, 0xd1,
-	0x1d, 0x62, 0xdb, 0xd4, 0xb9, 0x74, 0xa4, 0xc4, 0xb2, 0x3a, 0x59, 0x53, 0x33, 0x19, 0x07, 0x36,
-	0x99, 0x9e, 0x11, 0x81, 0x03, 0x2e, 0xf4, 0x1f, 0xd7, 0x71, 0x64, 0xc4, 0x7b, 0x7f, 0x58, 0xcf,
-	0xab, 0xf3, 0xa4, 0xbb, 0xb4, 0xf4, 0xc3, 0xfe, 0x28, 0x58, 0xfa, 0xe1, 0x60, 0x14, 0x2e, 0xfd,
-	0x30, 0x1c, 0x45, 0x87, 0xdf, 0x77, 0x60, 0xd8, 0x39, 0x69, 0x0b, 0x5d, 0x5e, 0xb7, 0xbc, 0x9e,
-	0xd1, 0x3d, 0x18, 0x48, 0x96, 0x71, 0xb9, 0x72, 0x9b, 0x3b, 0x84, 0xf6, 0x60, 0x9f, 0x96, 0x4c,
-	0x2a, 0xb3, 0x73, 0x94, 0x58, 0x80, 0x1e, 0xc3, 0xde, 0x09, 0x97, 0xb1, 0xff, 0xf7, 0x3d, 0xe8,
-	0xfb, 0xa8, 0x82, 0x41, 0x49, 0x53, 0x56, 0xd6, 0x71, 0xdf, 0xac, 0x71, 0x97, 0x74, 0xef, 0x45,
-	0x5e, 0xe8, 0xf3, 0x97, 0xb4, 0x90, 0x8b, 0xb9, 0xd6, 0x7c, 0xbe, 0x1a, 0xff, 0xd3, 0x7b, 0x5b,
-	0xfd, 0x7c, 0x45, 0x85, 0x62, 0x32, 0x71, 0x2e, 0xe8, 0x0c, 0x0e, 0x69, 0x55, 0x71, 0x45, 0x6d,
-	0x77, 0xc1, 0x7f, 0x35, 0xbd, 0x6d, 0x65, 0xba, 0xdf, 0x5d, 0x3c, 0x5d, 0x6f, 0xb0, 0x77, 0xb9,
-	0xc1, 0xde, 0xf5, 0x06, 0x83, 0xf7, 0x2d, 0x06, 0x9f, 0x5a, 0x0c, 0x2e, 0x5a, 0x0c, 0xd6, 0x2d,
-	0x06, 0x5f, 0x5b, 0x0c, 0xbe, 0xb5, 0xd8, 0xbb, 0x6e, 0x31, 0xf8, 0xb0, 0xc5, 0xde, 0x7a, 0x8b,
-	0xbd, 0xcb, 0x2d, 0xf6, 0x5e, 0x0d, 0xcc, 0x87, 0x20, 0xd2, 0x34, 0x30, 0x85, 0x3e, 0xfa, 0x19,
-	0x00, 0x00, 0xff, 0xff, 0xa0, 0xd3, 0x9a, 0x1a, 0x78, 0x03, 0x00, 0x00,
+	// 577 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xbc, 0x53, 0x41, 0x6b, 0xd4, 0x4c,
+	0x18, 0xce, 0x7c, 0xd9, 0x4d, 0x93, 0xc9, 0x17, 0x5b, 0xc6, 0x22, 0xd3, 0x2a, 0xb3, 0x4b, 0xa1,
+	0xb0, 0xa7, 0x2c, 0x54, 0x3c, 0x78, 0x10, 0x69, 0xa9, 0x15, 0x8a, 0xa0, 0x04, 0x4f, 0x22, 0x94,
+	0x49, 0x3a, 0x89, 0xb1, 0x69, 0x26, 0x4e, 0x26, 0xd2, 0xde, 0xfc, 0x09, 0x1e, 0xfd, 0x09, 0xfe,
+	0x94, 0x1e, 0xeb, 0xad, 0x78, 0xa8, 0x36, 0xbd, 0x88, 0xa7, 0x82, 0x7f, 0x40, 0x66, 0x26, 0xd1,
+	0x55, 0x0f, 0xd6, 0x83, 0x9e, 0xf6, 0x7d, 0xde, 0x67, 0x9e, 0x79, 0x9f, 0x79, 0xde, 0x0d, 0xf4,
+	0x45, 0x53, 0xb0, 0x3a, 0xac, 0x04, 0x97, 0x1c, 0x0d, 0x35, 0x58, 0x5e, 0xcc, 0x78, 0xc6, 0x75,
+	0x67, 0xaa, 0x2a, 0x43, 0x2e, 0x93, 0x8c, 0xf3, 0xac, 0x60, 0x53, 0x8d, 0xe2, 0x26, 0x9d, 0xee,
+	0x36, 0x82, 0xca, 0x9c, 0x97, 0x1d, 0xbf, 0xf4, 0x33, 0x4f, 0xcb, 0xc3, 0x8e, 0xba, 0x9d, 0xe5,
+	0xf2, 0x59, 0x13, 0x87, 0x09, 0xdf, 0x9f, 0x26, 0x5c, 0x48, 0x76, 0x50, 0x09, 0xfe, 0x9c, 0x25,
+	0xb2, 0x43, 0xd3, 0x6a, 0x2f, 0xeb, 0x89, 0xb8, 0x2b, 0x8c, 0x74, 0xe5, 0x8b, 0x0d, 0x83, 0xa8,
+	0x29, 0xd8, 0x7d, 0xc1, 0x9b, 0x6a, 0x93, 0xd5, 0x09, 0x42, 0x70, 0x50, 0xd2, 0x7d, 0x86, 0xc1,
+	0x18, 0x4c, 0xbc, 0x48, 0xd7, 0xe8, 0x06, 0xf4, 0xd4, 0x6f, 0x5d, 0xd1, 0x84, 0xe1, 0xff, 0x34,
+	0xf1, 0xbd, 0x81, 0xee, 0x42, 0x37, 0x2f, 0x25, 0x13, 0x2f, 0x69, 0x81, 0xed, 0x31, 0x98, 0xf8,
+	0x6b, 0x4b, 0xa1, 0x31, 0x1b, 0xf6, 0x66, 0xc3, 0xcd, 0xee, 0x31, 0x1b, 0xee, 0xd1, 0xe9, 0xc8,
+	0x7a, 0xf3, 0x61, 0x04, 0xa2, 0x6f, 0x22, 0xb4, 0x0a, 0x4d, 0x32, 0x78, 0x30, 0xb6, 0x27, 0xfe,
+	0xda, 0x7c, 0xa8, 0x51, 0xa8, 0x7c, 0x29, 0x4b, 0x91, 0x61, 0x95, 0xb3, 0xa6, 0x66, 0x02, 0x3b,
+	0xc6, 0x99, 0xaa, 0x51, 0x08, 0xe7, 0x78, 0xa5, 0x2e, 0xae, 0xb1, 0xa7, 0xc5, 0x8b, 0xbf, 0x8c,
+	0x5e, 0x2f, 0x0f, 0xa3, 0xfe, 0x10, 0x5a, 0x84, 0xc3, 0x22, 0xdf, 0xcf, 0x25, 0x86, 0x63, 0x30,
+	0xb1, 0x23, 0x03, 0xd0, 0x3d, 0xe8, 0xbf, 0x68, 0x98, 0x38, 0x7c, 0x98, 0xa6, 0x35, 0x93, 0xd8,
+	0xbf, 0xcc, 0x23, 0x80, 0x7e, 0xc4, 0xac, 0x0e, 0x95, 0xd0, 0x29, 0x68, 0xcc, 0x8a, 0x1a, 0xff,
+	0xaf, 0xbd, 0x5c, 0x0d, 0xfb, 0xd0, 0xc3, 0x07, 0xaa, 0xff, 0x88, 0xe6, 0x62, 0x63, 0x5d, 0x05,
+	0xf0, 0xfe, 0x74, 0xf4, 0x47, 0x4b, 0x33, 0xfa, 0xf5, 0x5d, 0x5a, 0x49, 0x26, 0xa2, 0x6e, 0x0a,
+	0x5a, 0x85, 0x57, 0x6a, 0xde, 0x88, 0x84, 0xed, 0x48, 0x56, 0xd2, 0x52, 0xd6, 0x38, 0x18, 0xdb,
+	0x13, 0x2f, 0x0a, 0x4c, 0xf7, 0xb1, 0x69, 0x6e, 0x0f, 0xdc, 0xe1, 0x82, 0xb3, 0x3d, 0x70, 0xe7,
+	0x16, 0xdc, 0xed, 0x81, 0xeb, 0x2e, 0x78, 0x2b, 0xef, 0x6c, 0xe8, 0xf6, 0xe9, 0xaa, 0x58, 0xd5,
+	0xec, 0x7e, 0xe1, 0xaa, 0x46, 0xd7, 0xa0, 0x23, 0x58, 0xc2, 0xc5, 0x6e, 0xb7, 0xed, 0x0e, 0xa9,
+	0xf8, 0x68, 0xc1, 0x84, 0xd4, 0x7b, 0xf6, 0x22, 0x03, 0xd0, 0x2d, 0x68, 0xa7, 0x5c, 0xe0, 0xc1,
+	0xe5, 0x77, 0xaf, 0xce, 0xcf, 0xc4, 0x35, 0xfc, 0x27, 0x71, 0x1d, 0x40, 0x9f, 0x96, 0x25, 0x97,
+	0xd4, 0xfc, 0x5f, 0x9c, 0xbf, 0x3a, 0x74, 0x76, 0x14, 0x7a, 0x0a, 0x83, 0x3d, 0xc6, 0xaa, 0xad,
+	0x5c, 0xe4, 0x65, 0xb6, 0xc5, 0x05, 0x0e, 0x7e, 0x17, 0xd5, 0x75, 0xe5, 0xe0, 0xf3, 0xe9, 0x68,
+	0x5e, 0xe9, 0x76, 0x52, 0x2d, 0xdc, 0x49, 0xb9, 0xd0, 0xe9, 0xfd, 0x78, 0x99, 0xde, 0x6c, 0xb0,
+	0x71, 0xe7, 0xf8, 0x8c, 0x58, 0x27, 0x67, 0xc4, 0xba, 0x38, 0x23, 0xe0, 0x55, 0x4b, 0xc0, 0xdb,
+	0x96, 0x80, 0xa3, 0x96, 0x80, 0xe3, 0x96, 0x80, 0x8f, 0x2d, 0x01, 0x9f, 0x5a, 0x62, 0x5d, 0xb4,
+	0x04, 0xbc, 0x3e, 0x27, 0xd6, 0xf1, 0x39, 0xb1, 0x4e, 0xce, 0x89, 0xf5, 0x64, 0x4e, 0x7f, 0x5a,
+	0x55, 0x1c, 0x3b, 0xda, 0xc3, 0xcd, 0xaf, 0x03, 0x00, 0x34, 0xe6, 0xc9, 0xae, 0xb1, 0x04, 0x00,
+	0x00,
 }
 
 func (this *RuleGroupDesc) Equal(that interface{}) bool {
@@ -275,6 +317,34 @@ func (this *RuleGroupDesc) Equal(that interface{}) bool {
 	}
 	for i := range this.Options {
 		if !this.Options[i].Equal(that1.Options[i]) {
+			return false
+		}
+	}
+	if this.Limit != that1.Limit {
+		return false
+	}
+	if this.QueryOffset != nil && that1.QueryOffset != nil {
+		if *this.QueryOffset != *that1.QueryOffset {
+			return false
+		}
+	} else if this.QueryOffset != nil {
+		return false
+	} else if that1.QueryOffset != nil {
+		return false
+	}
+	if len(this.Labels) != len(that1.Labels) {
+		return false
+	}
+	for i := range this.Labels {
+		if !this.Labels[i].Equal(that1.Labels[i]) {
+			return false
+		}
+	}
+	if len(this.SourceTenants) != len(that1.SourceTenants) {
+		return false
+	}
+	for i := range this.SourceTenants {
+		if this.SourceTenants[i] != that1.SourceTenants[i] {
 			return false
 		}
 	}
@@ -327,13 +397,16 @@ func (this *RuleDesc) Equal(that interface{}) bool {
 			return false
 		}
 	}
+	if this.KeepFiringFor != that1.KeepFiringFor {
+		return false
+	}
 	return true
 }
 func (this *RuleGroupDesc) GoString() string {
 	if this == nil {
 		return "nil"
 	}
-	s := make([]string, 0, 10)
+	s := make([]string, 0, 14)
 	s = append(s, "&rulespb.RuleGroupDesc{")
 	s = append(s, "Name: "+fmt.Sprintf("%#v", this.Name)+",\n")
 	s = append(s, "Namespace: "+fmt.Sprintf("%#v", this.Namespace)+",\n")
@@ -345,6 +418,10 @@ func (this *RuleGroupDesc) GoString() string {
 	if this.Options != nil {
 		s = append(s, "Options: "+fmt.Sprintf("%#v", this.Options)+",\n")
 	}
+	s = append(s, "Limit: "+fmt.Sprintf("%#v", this.Limit)+",\n")
+	s = append(s, "QueryOffset: "+fmt.Sprintf("%#v", this.QueryOffset)+",\n")
+	s = append(s, "Labels: "+fmt.Sprintf("%#v", this.Labels)+",\n")
+	s = append(s, "SourceTenants: "+fmt.Sprintf("%#v", this.SourceTenants)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -352,7 +429,7 @@ func (this *RuleDesc) GoString() string {
 	if this == nil {
 		return "nil"
 	}
-	s := make([]string, 0, 10)
+	s := make([]string, 0, 11)
 	s = append(s, "&rulespb.RuleDesc{")
 	s = append(s, "Expr: "+fmt.Sprintf("%#v", this.Expr)+",\n")
 	s = append(s, "Record: "+fmt.Sprintf("%#v", this.Record)+",\n")
@@ -360,6 +437,7 @@ func (this *RuleDesc) GoString() string {
 	s = append(s, "For: "+fmt.Sprintf("%#v", this.For)+",\n")
 	s = append(s, "Labels: "+fmt.Sprintf("%#v", this.Labels)+",\n")
 	s = append(s, "Annotations: "+fmt.Sprintf("%#v", this.Annotations)+",\n")
+	s = append(s, "KeepFiringFor: "+fmt.Sprintf("%#v", this.KeepFiringFor)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -391,6 +469,44 @@ func (m *RuleGroupDesc) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	if len(m.SourceTenants) > 0 {
+		for iNdEx := len(m.SourceTenants) - 1; iNdEx >= 0; iNdEx-- {
+			i -= len(m.SourceTenants[iNdEx])
+			copy(dAtA[i:], m.SourceTenants[iNdEx])
+			i = encodeVarintRules(dAtA, i, uint64(len(m.SourceTenants[iNdEx])))
+			i--
+			dAtA[i] = 0x6a
+		}
+	}
+	if len(m.Labels) > 0 {
+		for iNdEx := len(m.Labels) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size := m.Labels[iNdEx].Size()
+				i -= size
+				if _, err := m.Labels[iNdEx].MarshalTo(dAtA[i:]); err != nil {
+					return 0, err
+				}
+				i = encodeVarintRules(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0x62
+		}
+	}
+	if m.QueryOffset != nil {
+		n1, err1 := github_com_gogo_protobuf_types.StdDurationMarshalTo(*m.QueryOffset, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(*m.QueryOffset):])
+		if err1 != nil {
+			return 0, err1
+		}
+		i -= n1
+		i = encodeVarintRules(dAtA, i, uint64(n1))
+		i--
+		dAtA[i] = 0x5a
+	}
+	if m.Limit != 0 {
+		i = encodeVarintRules(dAtA, i, uint64(m.Limit))
+		i--
+		dAtA[i] = 0x50
+	}
 	if len(m.Options) > 0 {
 		for iNdEx := len(m.Options) - 1; iNdEx >= 0; iNdEx-- {
 			{
@@ -426,12 +542,12 @@ func (m *RuleGroupDesc) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 			dAtA[i] = 0x22
 		}
 	}
-	n1, err1 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.Interval, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.Interval):])
-	if err1 != nil {
-		return 0, err1
+	n2, err2 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.Interval, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.Interval):])
+	if err2 != nil {
+		return 0, err2
 	}
-	i -= n1
-	i = encodeVarintRules(dAtA, i, uint64(n1))
+	i -= n2
+	i = encodeVarintRules(dAtA, i, uint64(n2))
 	i--
 	dAtA[i] = 0x1a
 	if len(m.Namespace) > 0 {
@@ -471,6 +587,14 @@ func (m *RuleDesc) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	n3, err3 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.KeepFiringFor, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.KeepFiringFor):])
+	if err3 != nil {
+		return 0, err3
+	}
+	i -= n3
+	i = encodeVarintRules(dAtA, i, uint64(n3))
+	i--
+	dAtA[i] = 0x6a
 	if len(m.Annotations) > 0 {
 		for iNdEx := len(m.Annotations) - 1; iNdEx >= 0; iNdEx-- {
 			{
@@ -499,12 +623,12 @@ func (m *RuleDesc) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 			dAtA[i] = 0x2a
 		}
 	}
-	n2, err2 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.For, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.For):])
-	if err2 != nil {
-		return 0, err2
+	n4, err4 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.For, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.For):])
+	if err4 != nil {
+		return 0, err4
 	}
-	i -= n2
-	i = encodeVarintRules(dAtA, i, uint64(n2))
+	i -= n4
+	i = encodeVarintRules(dAtA, i, uint64(n4))
 	i--
 	dAtA[i] = 0x22
 	if len(m.Alert) > 0 {
@@ -574,6 +698,25 @@ func (m *RuleGroupDesc) Size() (n int) {
 			n += 1 + l + sovRules(uint64(l))
 		}
 	}
+	if m.Limit != 0 {
+		n += 1 + sovRules(uint64(m.Limit))
+	}
+	if m.QueryOffset != nil {
+		l = github_com_gogo_protobuf_types.SizeOfStdDuration(*m.QueryOffset)
+		n += 1 + l + sovRules(uint64(l))
+	}
+	if len(m.Labels) > 0 {
+		for _, e := range m.Labels {
+			l = e.Size()
+			n += 1 + l + sovRules(uint64(l))
+		}
+	}
+	if len(m.SourceTenants) > 0 {
+		for _, s := range m.SourceTenants {
+			l = len(s)
+			n += 1 + l + sovRules(uint64(l))
+		}
+	}
 	return n
 }
 
@@ -609,6 +752,8 @@ func (m *RuleDesc) Size() (n int) {
 			n += 1 + l + sovRules(uint64(l))
 		}
 	}
+	l = github_com_gogo_protobuf_types.SizeOfStdDuration(m.KeepFiringFor)
+	n += 1 + l + sovRules(uint64(l))
 	return n
 }
 
@@ -635,10 +780,14 @@ func (this *RuleGroupDesc) String() string {
 	s := strings.Join([]string{`&RuleGroupDesc{`,
 		`Name:` + fmt.Sprintf("%v", this.Name) + `,`,
 		`Namespace:` + fmt.Sprintf("%v", this.Namespace) + `,`,
-		`Interval:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.Interval), "Duration", "duration.Duration", 1), `&`, ``, 1) + `,`,
+		`Interval:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.Interval), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
 		`Rules:` + repeatedStringForRules + `,`,
 		`User:` + fmt.Sprintf("%v", this.User) + `,`,
 		`Options:` + repeatedStringForOptions + `,`,
+		`Limit:` + fmt.Sprintf("%v", this.Limit) + `,`,
+		`QueryOffset:` + strings.Replace(fmt.Sprintf("%v", this.QueryOffset), "Duration", "durationpb.Duration", 1) + `,`,
+		`Labels:` + fmt.Sprintf("%v", this.Labels) + `,`,
+		`SourceTenants:` + fmt.Sprintf("%v", this.SourceTenants) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -651,9 +800,10 @@ func (this *RuleDesc) String() string {
 		`Expr:` + fmt.Sprintf("%v", this.Expr) + `,`,
 		`Record:` + fmt.Sprintf("%v", this.Record) + `,`,
 		`Alert:` + fmt.Sprintf("%v", this.Alert) + `,`,
-		`For:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.For), "Duration", "duration.Duration", 1), `&`, ``, 1) + `,`,
+		`For:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.For), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
 		`Labels:` + fmt.Sprintf("%v", this.Labels) + `,`,
 		`Annotations:` + fmt.Sprintf("%v", this.Annotations) + `,`,
+		`KeepFiringFor:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.KeepFiringFor), "Duration", "durationpb.Duration", 1), `&`, ``, 1) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -891,6 +1041,127 @@ func (m *RuleGroupDesc) Unmarshal(dAtA []byte) error {
 			if err := m.Options[len(m.Options)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
+			iNdEx = postIndex
+		case 10:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Limit", wireType)
+			}
+			m.Limit = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRules
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Limit |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 11:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field QueryOffset", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRules
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthRules
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthRules
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.QueryOffset == nil {
+				m.QueryOffset = new(time.Duration)
+			}
+			if err := github_com_gogo_protobuf_types.StdDurationUnmarshal(m.QueryOffset, dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 12:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Labels", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRules
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthRules
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthRules
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Labels = append(m.Labels, github_com_cortexproject_cortex_pkg_cortexpb.LabelAdapter{})
+			if err := m.Labels[len(m.Labels)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 13:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SourceTenants", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRules
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthRules
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthRules
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.SourceTenants = append(m.SourceTenants, string(dAtA[iNdEx:postIndex]))
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
@@ -1139,6 +1410,39 @@ func (m *RuleDesc) Unmarshal(dAtA []byte) error {
 			}
 			m.Annotations = append(m.Annotations, github_com_cortexproject_cortex_pkg_cortexpb.LabelAdapter{})
 			if err := m.Annotations[len(m.Annotations)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 13:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field KeepFiringFor", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRules
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthRules
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthRules
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := github_com_gogo_protobuf_types.StdDurationUnmarshal(&m.KeepFiringFor, dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex

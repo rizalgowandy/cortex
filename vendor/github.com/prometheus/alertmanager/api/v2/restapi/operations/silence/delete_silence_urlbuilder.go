@@ -60,12 +60,15 @@ func (o *DeleteSilenceURL) Build() (*url.URL, error) {
 
 	silenceID := o.SilenceID.String()
 	if silenceID != "" {
-		_path = strings.Replace(_path, "{silenceID}", silenceID, -1)
+		_path = strings.ReplaceAll(_path, "{silenceID}", silenceID)
 	} else {
 		return nil, errors.New("silenceId is required on DeleteSilenceURL")
 	}
 
 	_basePath := o._basePath
+	if _basePath == "" {
+		_basePath = "/api/v2/"
+	}
 	_result.Path = golangswaggerpaths.Join(_basePath, _path)
 
 	return &_result, nil

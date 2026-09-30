@@ -1,6 +1,7 @@
-FROM       alpine:3.14
-RUN        apk add --no-cache ca-certificates
-COPY       thanosconvert /
+ARG        BASEIMG=gcr.io/distroless/static-debian12:latest
+FROM       ${BASEIMG}
+ARG TARGETARCH
+COPY       thanosconvert-$TARGETARCH /thanosconvert
 ENTRYPOINT ["/thanosconvert"]
 
 ARG revision

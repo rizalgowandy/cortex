@@ -5,29 +5,29 @@ weight: 999
 slug: glossary
 ---
 
+### Active series
+
+An active series is a [series](#series) held in an ingester that has received at least one [sample](#sample) within the active-series idle timeout window (configured via `-ingester.active-series-metrics-idle-timeout`, default `10m`). Active series are a subset of [memory series](#memory-series): once a series stops receiving samples for longer than the idle timeout, it is no longer counted as active, even if it remains in the ingester's memory until the TSDB head garbage-collects it.
+
+Active series are tracked per-tenant and exposed via the `cortex_ingester_active_series` metric. The `max_global_series_per_user` and `max_global_series_per_metric` limits are enforced against this count. The feature is enabled by default and controlled by `-ingester.active-series-metrics-enabled`.
+
 ### Blocks storage
 
 The blocks storage is a Cortex storage engine based on Prometheus TSDB, which only requires an object store (eg. AWS S3, Google GCS, ...) as backend storage.
 
 For more information, please refer to the [Cortex blocks storage](../blocks-storage/_index.md) documentation.
 
-### Chunks storage (deprecated)
-
-The chunks storage is a Cortex storage engine which requires both an index store (eg. AWS DynamoDB, Google BigTable, Cassandra, ...) and an object store (eg. AWS S3, Google GCS, ...) as backend storage.
-
-The chunks storage is deprecated. You're encouraged to use the [blocks storage](#blocks-storage) instead.
-
 ### Chunk
 
 A chunk is an object containing compressed timestamp-value pairs.
 
-When running Cortex with the chunks storage, a single chunk object contains timestamp-value pairs for a single series, while when running Cortex with the [blocks storage](#blocks-storage) a single chunk contains timestamp-value pairs for several series.
+A single chunk contains timestamp-value pairs for several series.
 
 ### Churn
 
 Churn is the frequency at which series become idle.
 
-A series become idle once it's not exported anymore by the monitored targets. Typically, series become idle when the monitored target itself disappear (eg. the process or node gets terminated).
+A series becomes idle once it's not exported anymore by the monitored targets. Typically, series become idle when the monitored target itself disappears (eg. the process or node gets terminated).
 
 ### Flushing
 
@@ -39,17 +39,17 @@ The HA Tracker is a feature of Cortex distributor which is used to deduplicate r
 
 For more information, please refer to the guide "[Config for sending HA Pairs data to Cortex](../guides/ha-pair-handling.md)".
 
-### Hand-over
-
-Series hand-over is an operation supported by ingesters to transfer their state, on shutdown, to a new ingester in the `JOINING` state. Hand-over is typically used during [ingesters rollouts](./ingesters-rolling-updates.md) and is only supported by the Cortex chunks storage.
-
-For more information, please refer to the guide "[Ingesters rolling updates](./ingesters-rolling-updates.md)".
-
 ### Hash ring
 
-The hash ring is a distributed data structure used by Cortex for sharding, replication and service discovery. The hash ring data structure gets shared across Cortex replicas via gossip or a key-value store.
+The hash ring is a distributed data structure used by Cortex for sharding, replication, and service discovery. The hash ring data structure gets shared across Cortex replicas via gossip or a key-value store.
 
 For more information, please refer to the [Architecture](../architecture.md#the-hash-ring) documentation.
+
+### Memory series
+
+A memory series is a [series](#series) currently held in an ingester's in-memory TSDB head block. Memory series include both [active series](#active-series) and recently-idle series that the TSDB head has not yet garbage-collected.
+
+Memory series are exposed via the `cortex_ingester_memory_series` metric and drive ingester memory sizing (see [Capacity planning](capacity-planning.md)). The per-instance `-ingester.instance-limits.max-series` flag caps the total number of memory series an ingester will accept across all tenants.
 
 ### Org
 
@@ -74,12 +74,6 @@ For example, given the series `node_cpu_seconds_total{instance="10.0.0.1",mode="
 11834 @1603812194
 ```
 
-### Schema config
-
-The schema (or schema config) is a configuration file used by the Cortex chunks storage to configure the backend index and chunks store, and manage storage version upgrades. The schema config is **not** used by the Cortex [blocks storage](#blocks-storage).
-
-For more information, please refer to the [Schema config reference](../chunks-storage/schema-config.md).
-
 ### Series
 
 In the Prometheus ecosystem, a series (or time series) is a single stream of timestamped values belonging to the same metric, with the same set of label key-value pairs.
@@ -100,7 +94,7 @@ A tenant (also called "user" or "org") is the owner of a set of series written t
 For more information, please refer to:
 
 - [HTTP API authentication](../api/_index.md#authentication)
-- [Tenant ID limitations](./limitations.md#tenant-id-naming)
+- [Tenant ID naming conventions](tenantID-naming-conventions.md#tenant-id-naming)
 
 ### Time series
 
@@ -112,9 +106,6 @@ _See [Tenant](#tenant)._
 
 ### WAL
 
-The Write-Ahead Log (WAL) is an append only log stored on disk used by ingesters to recover their in-memory state after the process gets restarted, either after a clear shutdown or an abruptly termination. Despite the implementation is different, the WAL is supported both by Cortex chunks and blocks storage engines.
+The Write-Ahead Log (WAL) is an append-only log stored on disk used by ingesters to recover their in-memory state after the process gets restarted, either after a clear shutdown or an abrupt termination.
 
-For more information, please refer to:
-
-- [Ingesters with WAL](../chunks-storage/ingesters-with-wal.md) when running **chunks storage**.
-- [Ingesters with WAL](../blocks-storage/_index.md#the-write-path) when running **blocks storage**.
+For more information, please refer to [Ingesters with WAL](../blocks-storage/_index.md#the-write-path).

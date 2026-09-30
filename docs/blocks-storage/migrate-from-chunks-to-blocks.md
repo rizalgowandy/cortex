@@ -57,18 +57,6 @@ As chunks ingesters shut down, they flush chunks to the storage. They are then r
 to use blocks. Queriers cannot fetch recent chunks from ingesters directly (as blocks ingester don't reload chunks),
 and need to use storage instead.
 
-### Query-frontend
-
-Query-frontend needs to be reconfigured as follow:
-
-- `-querier.parallelise-shardable-queries=false`
-
-#### `-querier.parallelise-shardable-queries=false`
-
-Query frontend has an option `-querier.parallelise-shardable-queries` to split some incoming queries into multiple queries based on sharding factor used in v11 schema of chunk storage.
-As the description implies, it only works when using chunks storage.
-During and after the migration to blocks (and also after possible rollback), this option needs to be disabled otherwise query-frontend will generate queries that cannot be satisfied by blocks storage.
-
 ### Compactor and Store-gateway
 
 [Compactor](./compactor.md) and [store-gateway](./store-gateway.md) services should be deployed and successfully up and running before migrating ingesters.
@@ -104,7 +92,7 @@ Where parameters are:
 
 After starting new pod in `ingester-new` statefulset, script then triggers `/shutdown` endpoint on the old ingester. When the flushing on the old ingester is complete, scale down of statefulset continues, and process repeats.
 
-_The script supports both migration from chunks to blocks, and viceversa (eg. rollback)._
+_The script supports both migration from chunks to blocks, and vice versa (eg. rollback)._
 
 ### Known issues
 
@@ -124,7 +112,6 @@ Querier (and ruler) can be reconfigured to use `blocks` as "primary" store to se
 - `-store.engine=blocks`
 - `-querier.second-store-engine=chunks`
 - `-querier.use-second-store-before-time=<timestamp after ingesters migration has completed>`
-- `-querier.ingester-streaming=true`
 
 #### `-querier.use-second-store-before-time`
 
@@ -147,7 +134,6 @@ During the rollback, queriers and rulers need to use the same configuration chan
 - `-store.engine=chunks`
 - `-querier.second-store-engine=blocks`
 - `-querier.use-second-store-before-time` should not be set
-- `-querier.ingester-streaming=false`
 
 Once the rollback is complete, some configuration changes need to stay in place, because some data has already been stored to blocks:
 
@@ -253,16 +239,12 @@ Most important thing is generating resources with blocks configuration, and expo
 
   // Querier and ruler configuration used during migration, and after.
   query_config_during_migration:: {
-    // Disable streaming, as it is broken when querying both chunks and blocks ingesters at the same time.
-    'querier.ingester-streaming': 'false',
-
     // query-store-after is required during migration, since new ingesters running on blocks will not load any chunks from chunks-WAL.
     // All such chunks are however flushed to the store.
     'querier.query-store-after': '0',
   },
 
   query_config_after_migration:: {
-    'querier.ingester-streaming': 'true',
     'querier.query-ingesters-within': '13h',  // TSDB ingesters have data for up to 4d.
     'querier.query-store-after': '12h',  // Can be enabled once blocks ingesters are running for 12h.
 

@@ -1,27 +1,32 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"os"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/flagext"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	collectorversion "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/common/version"
-	"github.com/weaveworks/common/tracing"
+	_ "go.uber.org/automaxprocs"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/cortex"
+	"github.com/cortexproject/cortex/pkg/tracing"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -45,7 +50,7 @@ func init() {
 	version.Version = Version
 	version.Branch = Branch
 	version.Revision = Revision
-	prometheus.MustRegister(version.NewCollector("cortex"))
+	prometheus.MustRegister(collectorversion.NewCollector("cortex"))
 	prometheus.MustRegister(configHash)
 }
 
@@ -60,14 +65,14 @@ func main() {
 	var (
 		cfg                  cortex.Config
 		eventSampleRate      int
-		ballastBytes         int
 		mutexProfileFraction int
 		blockProfileRate     int
 		printVersion         bool
 		printModules         bool
 	)
 
-	configFile, expandENV := parseConfigFileParameter(os.Args[1:])
+	args := os.Args[1:]
+	configFile, expandENV := parseConfigFileParameter(args)
 
 	// This sets default values from flags to the config.
 	// It needs to be called before parsing the config file!
@@ -81,6 +86,12 @@ func main() {
 			}
 			os.Exit(1)
 		}
+	} else if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "please set configuration file. For example: -config.file=./docs/configuration/single-process-config-blocks-local.yaml\n")
+		if testMode {
+			return
+		}
+		os.Exit(1)
 	}
 
 	// Ignore -config.file and -config.expand-env here, since it was already parsed, but it's still present on command line.
@@ -88,11 +99,13 @@ func main() {
 	_ = flag.CommandLine.Bool(configExpandENV, false, "Expands ${var} or $var in config according to the values of the environment variables.")
 
 	flag.IntVar(&eventSampleRate, "event.sample-rate", 0, "How often to sample observability events (0 = never).")
-	flag.IntVar(&ballastBytes, "mem-ballast-size-bytes", 0, "Size of memory ballast to allocate.")
 	flag.IntVar(&mutexProfileFraction, "debug.mutex-profile-fraction", 0, "Fraction of mutex contention events that are reported in the mutex profile. On average 1/rate events are reported. 0 to disable.")
 	flag.IntVar(&blockProfileRate, "debug.block-profile-rate", 0, "Fraction of goroutine blocking events that are reported in the blocking profile. 1 to include every blocking event in the profile, 0 to disable.")
 	flag.BoolVar(&printVersion, "version", false, "Print Cortex version and exit.")
 	flag.BoolVar(&printModules, "modules", false, "List available values that can be used as target.")
+
+	//lint:ignore faillint Need to pass the global logger like this for warning on deprecated methods
+	flagext.DeprecatedFlag(flag.CommandLine, "mem-ballast-size-bytes", "Deprecated: Setting this flag will not take any effect, for similar functionality use GOMEMLIMIT. Size of memory ballast to allocate", util_log.Logger)
 
 	usage := flag.CommandLine.Usage
 	flag.CommandLine.Usage = func() { /* don't do anything by default, we will print usage ourselves, but only when requested. */ }
@@ -135,6 +148,20 @@ func main() {
 		return
 	}
 
+	// https://github.com/prometheus/prometheus/blob/release-3.7/cmd/prometheus/main.go#L331
+	// Unregister the default GoCollector, and reregister with our defaults.
+	if prometheus.Unregister(collectors.NewGoCollector()) {
+		prometheus.MustRegister(
+			collectors.NewGoCollector(
+				collectors.WithGoCollectorRuntimeMetrics(
+					collectors.MetricsGC,
+					collectors.MetricsScheduler,
+					collectors.GoRuntimeMetricsRule{Matcher: regexp.MustCompile(`^/sync/mutex/wait/total:seconds$`)},
+				),
+			),
+		)
+	}
+
 	if mutexProfileFraction > 0 {
 		runtime.SetMutexProfileFraction(mutexProfileFraction)
 	}
@@ -143,13 +170,10 @@ func main() {
 	}
 
 	util_log.InitLogger(&cfg.Server)
-
-	// Allocate a block of memory to alter GC behaviour. See https://github.com/golang/go/issues/23044
-	ballast := make([]byte, ballastBytes)
-
 	util.InitEvents(eventSampleRate)
 
-	// In testing mode skip JAEGER setup to avoid panic due to
+	ctx, cancelFn := context.WithCancel(context.Background())
+	// In testing mode skip tracing setup to avoid panic due to
 	// "duplicate metrics collector registration attempted"
 	if !testMode {
 		name := "cortex"
@@ -157,16 +181,15 @@ func main() {
 			name += "-" + cfg.Target[0]
 		}
 
-		// Setting the environment variable JAEGER_AGENT_HOST enables tracing.
-		if trace, err := tracing.NewFromEnv(name); err != nil {
+		if close, err := tracing.SetupTracing(ctx, name, cfg.Tracing); err != nil {
 			level.Error(util_log.Logger).Log("msg", "Failed to setup tracing", "err", err.Error())
 		} else {
-			defer trace.Close()
+			defer close(ctx) // nolint:errcheck
 		}
 	}
 
 	// Initialise seed for randomness usage.
-	rand.Seed(time.Now().UnixNano())
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	t, err := cortex.New(cfg)
 	util_log.CheckFatal("initializing cortex", err)
@@ -193,8 +216,8 @@ func main() {
 	level.Info(util_log.Logger).Log("msg", "Starting Cortex", "version", version.Info())
 
 	err = t.Run()
+	cancelFn()
 
-	runtime.KeepAlive(ballast)
 	util_log.CheckFatal("running cortex", err)
 }
 
@@ -202,7 +225,7 @@ func main() {
 func parseConfigFileParameter(args []string) (configFile string, expandEnv bool) {
 	// ignore errors and any output here. Any flag errors will be reported by main flag.Parse() call.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
-	fs.SetOutput(ioutil.Discard)
+	fs.SetOutput(io.Discard)
 
 	// usage not used in these functions.
 	fs.StringVar(&configFile, configFileOption, "", "")
@@ -221,7 +244,7 @@ func parseConfigFileParameter(args []string) (configFile string, expandEnv bool)
 
 // LoadConfig read YAML-formatted config from filename into cfg.
 func LoadConfig(filename string, expandENV bool, cfg *cortex.Config) error {
-	buf, err := ioutil.ReadFile(filename)
+	buf, err := os.ReadFile(filename)
 	if err != nil {
 		return errors.Wrap(err, "Error reading config file")
 	}
@@ -234,6 +257,11 @@ func LoadConfig(filename string, expandENV bool, cfg *cortex.Config) error {
 
 	if expandENV {
 		buf = expandEnv(buf)
+	}
+
+	err = cfg.SetYAMLRootNodeStates(buf)
+	if err != nil {
+		return errors.Wrap(err, "Error parsing config file")
 	}
 
 	err = yaml.UnmarshalStrict(buf, cfg)

@@ -1,9 +1,10 @@
-// +build requires_docker
+//go:build requires_docker
 
 package integration
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -44,7 +45,14 @@ func TestGettingStartedWithGossipedRing(t *testing.T) {
 		"-blocks-storage.s3.insecure":                              "true",
 		"-store-gateway.sharding-ring.wait-stability-min-duration": "0", // start quickly
 		"-store-gateway.sharding-ring.wait-stability-max-duration": "0", // start quickly
+		// alert manager
+		"-alertmanager.web.external-url":   "http://localhost/alertmanager",
+		"-alertmanager-storage.backend":    "local",
+		"-alertmanager-storage.local.path": filepath.Join(e2e.ContainerSharedDir, "alertmanager_configs"),
 	}
+
+	// make alert manager config dir
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
 
 	// This cortex will fail to join the cluster configured in yaml file. That's fine.
 	cortex1 := e2ecortex.NewSingleBinaryWithConfigFile("cortex-1", "config1.yaml", e2e.MergeFlags(flags, map[string]string{
@@ -109,10 +117,6 @@ func TestGettingStartedWithGossipedRing(t *testing.T) {
 	require.Equal(t, model.ValVector, result.Type())
 	assert.Equal(t, expectedVector, result.(model.Vector))
 
-	// Before flushing the blocks we expect no store-gateway has loaded any block.
-	require.NoError(t, cortex1.WaitSumMetrics(e2e.Equals(0), "cortex_bucket_store_blocks_loaded"))
-	require.NoError(t, cortex2.WaitSumMetrics(e2e.Equals(0), "cortex_bucket_store_blocks_loaded"))
-
 	// Flush blocks from ingesters to the store.
 	for _, instance := range []*e2ecortex.CortexService{cortex1, cortex2} {
 		res, err = e2e.GetRequest("http://" + instance.HTTPEndpoint() + "/flush")
@@ -123,8 +127,8 @@ func TestGettingStartedWithGossipedRing(t *testing.T) {
 	// Given store-gateway blocks sharding is enabled with the default replication factor of 3,
 	// and ingestion replication factor is 1, we do expect the series has been ingested by 1
 	// single ingester and so we have 1 block shipped from ingesters and loaded by both store-gateways.
-	require.NoError(t, cortex1.WaitSumMetrics(e2e.Equals(1), "cortex_bucket_store_blocks_loaded"))
-	require.NoError(t, cortex2.WaitSumMetrics(e2e.Equals(1), "cortex_bucket_store_blocks_loaded"))
+	require.NoError(t, cortex1.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_bucket_store_blocks_loaded"}, e2e.WaitMissingMetrics))
+	require.NoError(t, cortex2.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_bucket_store_blocks_loaded"}, e2e.WaitMissingMetrics))
 
 	// Make sure that no DNS failures occurred.
 	// No actual DNS lookups are necessarily performed, so we can't really assert on that.

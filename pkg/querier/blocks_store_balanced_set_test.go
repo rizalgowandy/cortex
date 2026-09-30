@@ -7,15 +7,18 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/services"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 func TestBlocksStoreBalancedSet_GetClientsFor(t *testing.T) {
+	t.Parallel()
+
 	const numGets = 1000
 	serviceAddrs := []string{"127.0.0.1", "127.0.0.2"}
 	block1 := ulid.MustNew(1, nil)
@@ -30,8 +33,8 @@ func TestBlocksStoreBalancedSet_GetClientsFor(t *testing.T) {
 	// of returned clients (we expect an even distribution).
 	clientsCount := map[string]int{}
 
-	for i := 0; i < numGets; i++ {
-		clients, err := s.GetClientsFor("", []ulid.ULID{block1}, map[ulid.ULID][]string{})
+	for range numGets {
+		clients, err := s.GetClientsFor("", []ulid.ULID{block1}, map[ulid.ULID][]string{}, nil)
 		require.NoError(t, err)
 		require.Len(t, clients, 1)
 
@@ -68,6 +71,8 @@ func TestBlocksStoreBalancedSet_GetClientsFor(t *testing.T) {
 }
 
 func TestBlocksStoreBalancedSet_GetClientsFor_Exclude(t *testing.T) {
+	t.Parallel()
+
 	block1 := ulid.MustNew(1, nil)
 	block2 := ulid.MustNew(2, nil)
 
@@ -126,7 +131,6 @@ func TestBlocksStoreBalancedSet_GetClientsFor_Exclude(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
@@ -136,7 +140,7 @@ func TestBlocksStoreBalancedSet_GetClientsFor_Exclude(t *testing.T) {
 			require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 			defer services.StopAndAwaitTerminated(ctx, s) //nolint:errcheck
 
-			clients, err := s.GetClientsFor("", testData.queryBlocks, testData.exclude)
+			clients, err := s.GetClientsFor("", testData.queryBlocks, testData.exclude, nil)
 			assert.Equal(t, testData.expectedErr, err)
 
 			if testData.expectedErr == nil {

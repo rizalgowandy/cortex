@@ -10,6 +10,45 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// NOTE: The functions in this file (Unquote, unquoteChar, contains, unhex)
+// have been adapted from the "strconv" package of the Go standard library
+// to work for Prometheus-style strings. Go's special-casing for single
+// quotes was removed and single quoted strings are now treated the same as
+// double-quoted ones.
+//
+// The original copyright notice from the Go project for these parts is
+// reproduced here:
+//
+// ========================================================================
+// Copyright (c) 2009 The Go Authors. All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//    * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+//    * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+//    * Neither the name of Google Inc. nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// ========================================================================
 
 package strutil
 
@@ -24,13 +63,6 @@ var ErrSyntax = errors.New("invalid syntax")
 // Unquote interprets s as a single-quoted, double-quoted, or backquoted
 // Prometheus query language string literal, returning the string value that s
 // quotes.
-//
-// NOTE: This function as well as the necessary helper functions below
-// (unquoteChar, contains, unhex) and associated tests have been adapted from
-// the corresponding functions in the "strconv" package of the Go standard
-// library to work for Prometheus-style strings. Go's special-casing for single
-// quotes was removed and single quoted strings are now treated the same as
-// double quoted ones.
 func Unquote(s string) (t string, err error) {
 	n := len(s)
 	if n < 2 {
@@ -82,10 +114,10 @@ func Unquote(s string) (t string, err error) {
 // or character literal represented by the string s.
 // It returns four values:
 //
-//	1) value, the decoded Unicode code point or byte value;
-//	2) multibyte, a boolean indicating whether the decoded character requires a multibyte UTF-8 representation;
-//	3) tail, the remainder of the string after the character; and
-//	4) an error that will be nil if the character is syntactically valid.
+//  1. value, the decoded Unicode code point or byte value;
+//  2. multibyte, a boolean indicating whether the decoded character requires a multibyte UTF-8 representation;
+//  3. tail, the remainder of the string after the character; and
+//  4. an error that will be nil if the character is syntactically valid.
 //
 // The second argument, quote, specifies the type of literal being parsed
 // and therefore which escaped quote character is permitted.
@@ -97,7 +129,7 @@ func unquoteChar(s string, quote byte) (value rune, multibyte bool, tail string,
 	switch c := s[0]; {
 	case c == quote && (quote == '\'' || quote == '"'):
 		err = ErrSyntax
-		return
+		return value, multibyte, tail, err
 	case c >= utf8.RuneSelf:
 		r, size := utf8.DecodeRuneInString(s)
 		return r, true, s[size:], nil
@@ -108,7 +140,7 @@ func unquoteChar(s string, quote byte) (value rune, multibyte bool, tail string,
 	// Hard case: c is backslash.
 	if len(s) <= 1 {
 		err = ErrSyntax
-		return
+		return value, multibyte, tail, err
 	}
 	c := s[1]
 	s = s[2:]
@@ -141,13 +173,13 @@ func unquoteChar(s string, quote byte) (value rune, multibyte bool, tail string,
 		var v rune
 		if len(s) < n {
 			err = ErrSyntax
-			return
+			return value, multibyte, tail, err
 		}
 		for j := 0; j < n; j++ {
 			x, ok := unhex(s[j])
 			if !ok {
 				err = ErrSyntax
-				return
+				return value, multibyte, tail, err
 			}
 			v = v<<4 | x
 		}
@@ -159,7 +191,7 @@ func unquoteChar(s string, quote byte) (value rune, multibyte bool, tail string,
 		}
 		if v > utf8.MaxRune {
 			err = ErrSyntax
-			return
+			return value, multibyte, tail, err
 		}
 		value = v
 		multibyte = true
@@ -167,20 +199,20 @@ func unquoteChar(s string, quote byte) (value rune, multibyte bool, tail string,
 		v := rune(c) - '0'
 		if len(s) < 2 {
 			err = ErrSyntax
-			return
+			return value, multibyte, tail, err
 		}
-		for j := 0; j < 2; j++ { // One digit already; two more.
+		for j := range 2 { // One digit already; two more.
 			x := rune(s[j]) - '0'
 			if x < 0 || x > 7 {
 				err = ErrSyntax
-				return
+				return value, multibyte, tail, err
 			}
 			v = (v << 3) | x
 		}
 		s = s[2:]
 		if v > 255 {
 			err = ErrSyntax
-			return
+			return value, multibyte, tail, err
 		}
 		value = v
 	case '\\':
@@ -188,15 +220,15 @@ func unquoteChar(s string, quote byte) (value rune, multibyte bool, tail string,
 	case '\'', '"':
 		if c != quote {
 			err = ErrSyntax
-			return
+			return value, multibyte, tail, err
 		}
 		value = rune(c)
 	default:
 		err = ErrSyntax
-		return
+		return value, multibyte, tail, err
 	}
 	tail = s
-	return
+	return value, multibyte, tail, err
 }
 
 // contains reports whether the string contains the byte c.
@@ -219,5 +251,5 @@ func unhex(b byte) (v rune, ok bool) {
 	case 'A' <= c && c <= 'F':
 		return c - 'A' + 10, true
 	}
-	return
+	return v, ok
 }

@@ -1,4 +1,4 @@
-
+# yaml-language-server: $schema=https://raw.githubusercontent.com/cortexproject/cortex/master/schemas/cortex-config-schema.json
 # Configuration for running Cortex in single-process mode.
 # This should not be used in production.  It is only for getting started
 # and development.
@@ -57,12 +57,10 @@ ingester:
 
 memberlist:
   bind_port: 7946
+  cluster_label: gossip-demo
   join_members:
     - localhost:7947
   abort_if_cluster_join_fails: false
-
-storage:
-  engine: blocks
 
 blocks_storage:
   tsdb:
@@ -99,3 +97,14 @@ ruler_storage:
   backend: local
   local:
     directory: /tmp/cortex/rules
+
+alertmanager:
+  external_url: http://localhost/alertmanager
+
+alertmanager_storage:
+  backend: local
+  local:
+    # Make sure file exist
+    path: /tmp/cortex/alerts
+compactor:
+  cleanup_interval: 10s

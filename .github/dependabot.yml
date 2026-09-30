@@ -1,0 +1,45 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      actions-dependencies:
+        dependency-type: "production"
+    labels:
+      - "ci/cd"
+  - package-ecosystem: "gomod"
+    directories:
+      - "/"
+      - "/website"
+    groups:
+      go-dependencies:
+        exclude-patterns:
+          - "github.com/thanos-io/thanos"
+    ignore:
+      # The Prometheus and Thanos module families must be upgraded in lockstep with
+      # github.com/prometheus/prometheus and github.com/thanos-io/thanos, which we do
+      # manually — Dependabot bumping one of them alone breaks the build. See
+      # https://github.com/cortexproject/cortex/pull/7781, where client_golang v1.24
+      # changed api/prometheus/v1.LabelNames to return model.LabelNames.
+      #
+      # prometheus/prometheus itself is never auto-bumped. Note it maps Prometheus
+      # 3.x.y to tags v0.30x.y, so its "minor" bumps are real releases.
+      - dependency-name: "github.com/prometheus/prometheus"
+      # For the rest of the Prometheus family, block major/minor (where the breaking
+      # changes land) but still allow patches, so security fixes land automatically.
+      - dependency-name: "github.com/prometheus/*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      # All thanos-io modules are on pseudo-versions, which don't classify as
+      # major/minor/patch, so update-types wouldn't filter them — ignore outright.
+      - dependency-name: "github.com/thanos-io/*"
+    schedule:
+      interval: "daily"

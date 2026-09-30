@@ -48,6 +48,7 @@ func init() {
     },
     "version": "0.0.1"
   },
+  "basePath": "/api/v2/",
   "paths": {
     "/alerts": {
       "get": {
@@ -60,28 +61,28 @@ func init() {
           {
             "type": "boolean",
             "default": true,
-            "description": "Show active alerts",
+            "description": "Include active alerts in results. If false, excludes active alerts and returns only suppressed (silenced or inhibited) alerts.",
             "name": "active",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show silenced alerts",
+            "description": "Include silenced alerts in results. If false, excludes silenced alerts. Note that true (default) shows both silenced and non-silenced alerts.",
             "name": "silenced",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show inhibited alerts",
+            "description": "Include inhibited alerts in results. If false, excludes inhibited alerts. Note that true (default) shows both inhibited and non-inhibited alerts.",
             "name": "inhibited",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show unprocessed alerts",
+            "description": "Include unprocessed alerts in results. If false, excludes unprocessed alerts. Note that true (default) shows both processed and unprocessed alerts.",
             "name": "unprocessed",
             "in": "query"
           },
@@ -91,7 +92,7 @@ func init() {
               "type": "string"
             },
             "collectionFormat": "multi",
-            "description": "A list of matchers to filter alerts by",
+            "description": "A matcher expression to filter alerts. For example ` + "`" + `alertname=\"MyAlert\"` + "`" + `. It can be repeated to apply multiple matchers.",
             "name": "filter",
             "in": "query"
           },
@@ -100,6 +101,9 @@ func init() {
             "description": "A regex matching receivers to filter alerts by",
             "name": "receiver",
             "in": "query"
+          },
+          {
+            "$ref": "#/parameters/receiverMatchers"
           }
         ],
         "responses": {
@@ -158,22 +162,29 @@ func init() {
           {
             "type": "boolean",
             "default": true,
-            "description": "Show active alerts",
+            "description": "Include active alerts within the returned groups. If false, excludes active alerts from groups and only shows suppressed (silenced or inhibited) alerts.",
             "name": "active",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show silenced alerts",
+            "description": "Include silenced alerts within the returned groups. If false, excludes silenced alerts from groups. Note that true (default) shows both silenced and non-silenced alerts.",
             "name": "silenced",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show inhibited alerts",
+            "description": "Include inhibited alerts within the returned groups. If false, excludes inhibited alerts from groups. Note that true (default) shows both inhibited and non-inhibited alerts.",
             "name": "inhibited",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "Include muted (silenced or inhibited) alert groups in results. If false, excludes entire groups where all alerts are muted.",
+            "name": "muted",
             "in": "query"
           },
           {
@@ -182,7 +193,7 @@ func init() {
               "type": "string"
             },
             "collectionFormat": "multi",
-            "description": "A list of matchers to filter alerts by",
+            "description": "A matcher expression to filter alert groups. For example ` + "`" + `alertname=\"MyAlert\"` + "`" + `. It can be repeated to apply multiple matchers.",
             "name": "filter",
             "in": "query"
           },
@@ -191,6 +202,9 @@ func init() {
             "description": "A regex matching receivers to filter alerts by",
             "name": "receiver",
             "in": "query"
+          },
+          {
+            "$ref": "#/parameters/receiverMatchers"
           }
         ],
         "responses": {
@@ -216,6 +230,11 @@ func init() {
           "receiver"
         ],
         "operationId": "getReceivers",
+        "parameters": [
+          {
+            "$ref": "#/parameters/receiverMatchers"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Get receivers response",
@@ -225,6 +244,9 @@ func init() {
                 "$ref": "#/definitions/receiver"
               }
             }
+          },
+          "400": {
+            "$ref": "#/responses/BadRequest"
           }
         }
       }
@@ -271,6 +293,9 @@ func init() {
           "200": {
             "description": "Delete silence response"
           },
+          "404": {
+            "description": "A silence with the specified ID was not found"
+          },
           "500": {
             "$ref": "#/responses/InternalServerError"
           }
@@ -301,8 +326,29 @@ func init() {
               "type": "string"
             },
             "collectionFormat": "multi",
-            "description": "A list of matchers to filter silences by",
+            "description": "A matcher expression to filter silences. For example ` + "`" + `alertname=\"MyAlert\"` + "`" + `. It can be repeated to apply multiple matchers.",
             "name": "filter",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "Include active silences in results. If false, excludes active silences.",
+            "name": "active",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "Include expired silences in results. If false, excludes expired silences.",
+            "name": "expired",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "Include pending silences in results. If false, excludes pending silences.",
+            "name": "pending",
             "in": "query"
           }
         ],
@@ -312,6 +358,9 @@ func init() {
             "schema": {
               "$ref": "#/definitions/gettableSilences"
             }
+          },
+          "400": {
+            "$ref": "#/responses/BadRequest"
           },
           "500": {
             "$ref": "#/responses/InternalServerError"
@@ -397,6 +446,7 @@ func init() {
       "type": "object",
       "required": [
         "labels",
+        "routeLabels",
         "receiver",
         "alerts"
       ],
@@ -411,7 +461,10 @@ func init() {
           "$ref": "#/definitions/labelSet"
         },
         "receiver": {
-          "$ref": "#/definitions/receiver"
+          "$ref": "#/definitions/receiverReference"
+        },
+        "routeLabels": {
+          "$ref": "#/definitions/labelSet"
         }
       }
     },
@@ -426,10 +479,17 @@ func init() {
       "required": [
         "state",
         "silencedBy",
-        "inhibitedBy"
+        "inhibitedBy",
+        "mutedBy"
       ],
       "properties": {
         "inhibitedBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mutedBy": {
           "type": "array",
           "items": {
             "type": "string"
@@ -538,7 +598,7 @@ func init() {
             "receivers": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/receiver"
+                "$ref": "#/definitions/receiverReference"
               }
             },
             "startsAt": {
@@ -572,7 +632,8 @@ func init() {
           "required": [
             "id",
             "status",
-            "updatedAt"
+            "updatedAt",
+            "annotations"
           ],
           "properties": {
             "id": {
@@ -699,6 +760,20 @@ func init() {
         "name"
       ],
       "properties": {
+        "labels": {
+          "$ref": "#/definitions/labelSet"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "receiverReference": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
         "name": {
           "type": "string"
         }
@@ -714,6 +789,9 @@ func init() {
         "comment"
       ],
       "properties": {
+        "annotations": {
+          "$ref": "#/definitions/labelSet"
+        },
         "comment": {
           "type": "string"
         },
@@ -779,6 +857,18 @@ func init() {
           "type": "string"
         }
       }
+    }
+  },
+  "parameters": {
+    "receiverMatchers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "collectionFormat": "multi",
+      "description": "A matcher expression to filter by receiver labels. For example ` + "`" + `owner=\"my-team\"` + "`" + `. Can be repeated to apply multiple matchers.",
+      "name": "receiver_matchers",
+      "in": "query"
     }
   },
   "responses": {
@@ -831,6 +921,7 @@ func init() {
     },
     "version": "0.0.1"
   },
+  "basePath": "/api/v2/",
   "paths": {
     "/alerts": {
       "get": {
@@ -843,28 +934,28 @@ func init() {
           {
             "type": "boolean",
             "default": true,
-            "description": "Show active alerts",
+            "description": "Include active alerts in results. If false, excludes active alerts and returns only suppressed (silenced or inhibited) alerts.",
             "name": "active",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show silenced alerts",
+            "description": "Include silenced alerts in results. If false, excludes silenced alerts. Note that true (default) shows both silenced and non-silenced alerts.",
             "name": "silenced",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show inhibited alerts",
+            "description": "Include inhibited alerts in results. If false, excludes inhibited alerts. Note that true (default) shows both inhibited and non-inhibited alerts.",
             "name": "inhibited",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show unprocessed alerts",
+            "description": "Include unprocessed alerts in results. If false, excludes unprocessed alerts. Note that true (default) shows both processed and unprocessed alerts.",
             "name": "unprocessed",
             "in": "query"
           },
@@ -874,7 +965,7 @@ func init() {
               "type": "string"
             },
             "collectionFormat": "multi",
-            "description": "A list of matchers to filter alerts by",
+            "description": "A matcher expression to filter alerts. For example ` + "`" + `alertname=\"MyAlert\"` + "`" + `. It can be repeated to apply multiple matchers.",
             "name": "filter",
             "in": "query"
           },
@@ -882,6 +973,16 @@ func init() {
             "type": "string",
             "description": "A regex matching receivers to filter alerts by",
             "name": "receiver",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "A matcher expression to filter by receiver labels. For example ` + "`" + `owner=\"my-team\"` + "`" + `. Can be repeated to apply multiple matchers.",
+            "name": "receiver_matchers",
             "in": "query"
           }
         ],
@@ -953,22 +1054,29 @@ func init() {
           {
             "type": "boolean",
             "default": true,
-            "description": "Show active alerts",
+            "description": "Include active alerts within the returned groups. If false, excludes active alerts from groups and only shows suppressed (silenced or inhibited) alerts.",
             "name": "active",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show silenced alerts",
+            "description": "Include silenced alerts within the returned groups. If false, excludes silenced alerts from groups. Note that true (default) shows both silenced and non-silenced alerts.",
             "name": "silenced",
             "in": "query"
           },
           {
             "type": "boolean",
             "default": true,
-            "description": "Show inhibited alerts",
+            "description": "Include inhibited alerts within the returned groups. If false, excludes inhibited alerts from groups. Note that true (default) shows both inhibited and non-inhibited alerts.",
             "name": "inhibited",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "Include muted (silenced or inhibited) alert groups in results. If false, excludes entire groups where all alerts are muted.",
+            "name": "muted",
             "in": "query"
           },
           {
@@ -977,7 +1085,7 @@ func init() {
               "type": "string"
             },
             "collectionFormat": "multi",
-            "description": "A list of matchers to filter alerts by",
+            "description": "A matcher expression to filter alert groups. For example ` + "`" + `alertname=\"MyAlert\"` + "`" + `. It can be repeated to apply multiple matchers.",
             "name": "filter",
             "in": "query"
           },
@@ -985,6 +1093,16 @@ func init() {
             "type": "string",
             "description": "A regex matching receivers to filter alerts by",
             "name": "receiver",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "A matcher expression to filter by receiver labels. For example ` + "`" + `owner=\"my-team\"` + "`" + `. Can be repeated to apply multiple matchers.",
+            "name": "receiver_matchers",
             "in": "query"
           }
         ],
@@ -1017,6 +1135,18 @@ func init() {
           "receiver"
         ],
         "operationId": "getReceivers",
+        "parameters": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi",
+            "description": "A matcher expression to filter by receiver labels. For example ` + "`" + `owner=\"my-team\"` + "`" + `. Can be repeated to apply multiple matchers.",
+            "name": "receiver_matchers",
+            "in": "query"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Get receivers response",
@@ -1025,6 +1155,12 @@ func init() {
               "items": {
                 "$ref": "#/definitions/receiver"
               }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "schema": {
+              "type": "string"
             }
           }
         }
@@ -1075,6 +1211,9 @@ func init() {
           "200": {
             "description": "Delete silence response"
           },
+          "404": {
+            "description": "A silence with the specified ID was not found"
+          },
           "500": {
             "description": "Internal server error",
             "schema": {
@@ -1108,8 +1247,29 @@ func init() {
               "type": "string"
             },
             "collectionFormat": "multi",
-            "description": "A list of matchers to filter silences by",
+            "description": "A matcher expression to filter silences. For example ` + "`" + `alertname=\"MyAlert\"` + "`" + `. It can be repeated to apply multiple matchers.",
             "name": "filter",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "Include active silences in results. If false, excludes active silences.",
+            "name": "active",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "Include expired silences in results. If false, excludes expired silences.",
+            "name": "expired",
+            "in": "query"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "Include pending silences in results. If false, excludes pending silences.",
+            "name": "pending",
             "in": "query"
           }
         ],
@@ -1118,6 +1278,12 @@ func init() {
             "description": "Get silences response",
             "schema": {
               "$ref": "#/definitions/gettableSilences"
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "schema": {
+              "type": "string"
             }
           },
           "500": {
@@ -1210,6 +1376,7 @@ func init() {
       "type": "object",
       "required": [
         "labels",
+        "routeLabels",
         "receiver",
         "alerts"
       ],
@@ -1224,7 +1391,10 @@ func init() {
           "$ref": "#/definitions/labelSet"
         },
         "receiver": {
-          "$ref": "#/definitions/receiver"
+          "$ref": "#/definitions/receiverReference"
+        },
+        "routeLabels": {
+          "$ref": "#/definitions/labelSet"
         }
       }
     },
@@ -1239,10 +1409,17 @@ func init() {
       "required": [
         "state",
         "silencedBy",
-        "inhibitedBy"
+        "inhibitedBy",
+        "mutedBy"
       ],
       "properties": {
         "inhibitedBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mutedBy": {
           "type": "array",
           "items": {
             "type": "string"
@@ -1351,7 +1528,7 @@ func init() {
             "receivers": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/receiver"
+                "$ref": "#/definitions/receiverReference"
               }
             },
             "startsAt": {
@@ -1385,7 +1562,8 @@ func init() {
           "required": [
             "id",
             "status",
-            "updatedAt"
+            "updatedAt",
+            "annotations"
           ],
           "properties": {
             "id": {
@@ -1512,6 +1690,20 @@ func init() {
         "name"
       ],
       "properties": {
+        "labels": {
+          "$ref": "#/definitions/labelSet"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "receiverReference": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
         "name": {
           "type": "string"
         }
@@ -1527,6 +1719,9 @@ func init() {
         "comment"
       ],
       "properties": {
+        "annotations": {
+          "$ref": "#/definitions/labelSet"
+        },
         "comment": {
           "type": "string"
         },
@@ -1592,6 +1787,18 @@ func init() {
           "type": "string"
         }
       }
+    }
+  },
+  "parameters": {
+    "receiverMatchers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "collectionFormat": "multi",
+      "description": "A matcher expression to filter by receiver labels. For example ` + "`" + `owner=\"my-team\"` + "`" + `. Can be repeated to apply multiple matchers.",
+      "name": "receiver_matchers",
+      "in": "query"
     }
   },
   "responses": {

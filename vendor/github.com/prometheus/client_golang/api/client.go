@@ -15,8 +15,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
-	"io/ioutil"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -26,19 +27,28 @@ import (
 )
 
 // DefaultRoundTripper is used if no RoundTripper is set in Config.
+// refer https://github.com/golang/go/blob/master/src/net/http/transport.go#L46
 var DefaultRoundTripper http.RoundTripper = &http.Transport{
 	Proxy: http.ProxyFromEnvironment,
 	DialContext: (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}).DialContext,
-	TLSHandshakeTimeout: 10 * time.Second,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
 }
 
 // Config defines configuration parameters for a new client.
 type Config struct {
 	// The address of the Prometheus to connect to.
 	Address string
+
+	// Client is used by the Client to drive HTTP requests. If not provided,
+	// a new one based on the provided RoundTripper (or DefaultRoundTripper) will be used.
+	Client *http.Client
 
 	// RoundTripper is used by the Client to drive HTTP requests. If not
 	// provided, DefaultRoundTripper will be used.
@@ -52,10 +62,30 @@ func (cfg *Config) roundTripper() http.RoundTripper {
 	return cfg.RoundTripper
 }
 
+func (cfg *Config) client() http.Client {
+	if cfg.Client == nil {
+		return http.Client{
+			Transport: cfg.roundTripper(),
+		}
+	}
+	return *cfg.Client
+}
+
+func (cfg *Config) validate() error {
+	if cfg.Client != nil && cfg.RoundTripper != nil {
+		return errors.New("api.Config.RoundTripper and api.Config.Client are mutually exclusive")
+	}
+	return nil
+}
+
 // Client is the interface for an API client.
 type Client interface {
 	URL(ep string, args map[string]string) *url.URL
 	Do(context.Context, *http.Request) (*http.Response, []byte, error)
+}
+
+type CloseIdler interface {
+	CloseIdleConnections()
 }
 
 // NewClient returns a new Client.
@@ -68,9 +98,13 @@ func NewClient(cfg Config) (Client, error) {
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
 
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
 	return &httpClient{
 		endpoint: u,
-		client:   http.Client{Transport: cfg.roundTripper()},
+		client:   cfg.client(),
 	}, nil
 }
 
@@ -84,7 +118,7 @@ func (c *httpClient) URL(ep string, args map[string]string) *url.URL {
 
 	for arg, val := range args {
 		arg = ":" + arg
-		p = strings.Replace(p, arg, val, -1)
+		p = strings.ReplaceAll(p, arg, val)
 	}
 
 	u := *c.endpoint
@@ -93,37 +127,35 @@ func (c *httpClient) URL(ep string, args map[string]string) *url.URL {
 	return &u
 }
 
+func (c *httpClient) CloseIdleConnections() {
+	c.client.CloseIdleConnections()
+}
+
 func (c *httpClient) Do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
 	if ctx != nil {
 		req = req.WithContext(ctx)
 	}
 	resp, err := c.client.Do(req)
-	defer func() {
-		if resp != nil {
-			resp.Body.Close()
-		}
-	}()
-
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var body []byte
 	done := make(chan struct{})
+	var readErr error
 	go func() {
-		body, err = ioutil.ReadAll(resp.Body)
-		close(done)
+		defer close(done)
+		var buf bytes.Buffer
+		_, readErr = buf.ReadFrom(resp.Body)
+		body = buf.Bytes()
 	}()
 
 	select {
 	case <-ctx.Done():
-		<-done
-		err = resp.Body.Close()
-		if err == nil {
-			err = ctx.Err()
-		}
+		resp.Body.Close()
+		return resp, nil, ctx.Err()
 	case <-done:
+		resp.Body.Close()
+		return resp, body, readErr
 	}
-
-	return resp, body, err
 }

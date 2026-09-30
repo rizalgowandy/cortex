@@ -8,34 +8,40 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/services"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
 
+	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketindex"
-	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/util/testutil"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 func TestBucketIndexBlocksFinder_GetBlocks(t *testing.T) {
+	t.Parallel()
+
 	const userID = "user-1"
 
 	ctx := context.Background()
 	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
 
 	// Mock a bucket index.
+	now := time.Now()
 	block1 := &bucketindex.Block{ID: ulid.MustNew(1, nil), MinTime: 10, MaxTime: 15}
 	block2 := &bucketindex.Block{ID: ulid.MustNew(2, nil), MinTime: 12, MaxTime: 20}
 	block3 := &bucketindex.Block{ID: ulid.MustNew(3, nil), MinTime: 20, MaxTime: 30}
 	block4 := &bucketindex.Block{ID: ulid.MustNew(4, nil), MinTime: 30, MaxTime: 40}
-	block5 := &bucketindex.Block{ID: ulid.MustNew(5, nil), MinTime: 30, MaxTime: 40} // Time range overlaps with block4, but this block deletion mark is above the threshold.
+	block5 := &bucketindex.Block{ID: ulid.MustNew(5, nil), MinTime: 30, MaxTime: 40}                                               // Time range overlaps with block4, but this block deletion mark is above the threshold.
+	block6 := &bucketindex.Block{ID: ulid.MustNew(6, nil), MinTime: now.Add(-2 * time.Hour).UnixMilli(), MaxTime: now.UnixMilli()} // This block is within ignoreBlocksWithin and shouldn't be loaded.
 	mark3 := &bucketindex.BlockDeletionMark{ID: block3.ID, DeletionTime: time.Now().Unix()}
 	mark5 := &bucketindex.BlockDeletionMark{ID: block5.ID, DeletionTime: time.Now().Add(-2 * time.Hour).Unix()}
 
 	require.NoError(t, bucketindex.WriteIndex(ctx, bkt, userID, nil, &bucketindex.Index{
 		Version:            bucketindex.IndexVersion1,
-		Blocks:             bucketindex.Blocks{block1, block2, block3, block4, block5},
+		Blocks:             bucketindex.Blocks{block1, block2, block3, block4, block5, block6},
 		BlockDeletionMarks: bucketindex.BlockDeletionMarks{mark3, mark5},
 		UpdatedAt:          time.Now().Unix(),
 	}))
@@ -102,11 +108,21 @@ func TestBucketIndexBlocksFinder_GetBlocks(t *testing.T) {
 				block3.ID: mark3,
 			},
 		},
+		"query range matching all blocks but should ignore non-queryable block": {
+			minT:           0,
+			maxT:           block5.MaxTime,
+			expectedBlocks: bucketindex.Blocks{block4, block3, block2, block1},
+			expectedMarks: map[ulid.ULID]*bucketindex.BlockDeletionMark{
+				block3.ID: mark3,
+			},
+		},
 	}
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			blocks, deletionMarks, err := finder.GetBlocks(ctx, userID, testData.minT, testData.maxT)
+			t.Parallel()
+
+			blocks, deletionMarks, err := finder.GetBlocks(ctx, userID, testData.minT, testData.maxT, nil)
 			require.NoError(t, err)
 			require.ElementsMatch(t, testData.expectedBlocks, blocks)
 			require.Equal(t, testData.expectedMarks, deletionMarks)
@@ -143,10 +159,8 @@ func BenchmarkBucketIndexBlocksFinder_GetBlocks(b *testing.B) {
 	require.NoError(b, bucketindex.WriteIndex(ctx, bkt, userID, nil, idx))
 	finder := prepareBucketIndexBlocksFinder(b, bkt)
 
-	b.ResetTimer()
-
-	for n := 0; n < b.N; n++ {
-		blocks, marks, err := finder.GetBlocks(ctx, userID, 100, 200)
+	for b.Loop() {
+		blocks, marks, err := finder.GetBlocks(ctx, userID, 100, 200, nil)
 		if err != nil || len(blocks) != 11 || len(marks) != 11 {
 			b.Fail()
 		}
@@ -154,19 +168,23 @@ func BenchmarkBucketIndexBlocksFinder_GetBlocks(b *testing.B) {
 }
 
 func TestBucketIndexBlocksFinder_GetBlocks_BucketIndexDoesNotExist(t *testing.T) {
+	t.Parallel()
+
 	const userID = "user-1"
 
 	ctx := context.Background()
 	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
 	finder := prepareBucketIndexBlocksFinder(t, bkt)
 
-	blocks, deletionMarks, err := finder.GetBlocks(ctx, userID, 10, 20)
+	blocks, deletionMarks, err := finder.GetBlocks(ctx, userID, 10, 20, nil)
 	require.NoError(t, err)
 	assert.Empty(t, blocks)
 	assert.Empty(t, deletionMarks)
 }
 
 func TestBucketIndexBlocksFinder_GetBlocks_BucketIndexIsCorrupted(t *testing.T) {
+	t.Parallel()
+
 	const userID = "user-1"
 
 	ctx := context.Background()
@@ -176,11 +194,13 @@ func TestBucketIndexBlocksFinder_GetBlocks_BucketIndexIsCorrupted(t *testing.T) 
 	// Upload a corrupted bucket index.
 	require.NoError(t, bkt.Upload(ctx, path.Join(userID, bucketindex.IndexCompressedFilename), strings.NewReader("invalid}!")))
 
-	_, _, err := finder.GetBlocks(ctx, userID, 10, 20)
+	_, _, err := finder.GetBlocks(ctx, userID, 10, 20, nil)
 	require.Equal(t, bucketindex.ErrIndexCorrupted, err)
 }
 
 func TestBucketIndexBlocksFinder_GetBlocks_BucketIndexIsTooOld(t *testing.T) {
+	t.Parallel()
+
 	const userID = "user-1"
 
 	ctx := context.Background()
@@ -194,8 +214,64 @@ func TestBucketIndexBlocksFinder_GetBlocks_BucketIndexIsTooOld(t *testing.T) {
 		UpdatedAt:          time.Now().Add(-2 * time.Hour).Unix(),
 	}))
 
-	_, _, err := finder.GetBlocks(ctx, userID, 10, 20)
+	_, _, err := finder.GetBlocks(ctx, userID, 10, 20, nil)
 	require.Equal(t, errBucketIndexTooOld, err)
+}
+
+func TestBucketIndexBlocksFinder_GetBlocks_BucketIndexIsTooOldWithCustomerKeyError(t *testing.T) {
+	t.Parallel()
+
+	const userID = "user-1"
+
+	ctx := context.Background()
+	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
+
+	require.NoError(t, bucketindex.WriteIndex(ctx, bkt, userID, nil, &bucketindex.Index{
+		Version:            bucketindex.IndexVersion1,
+		Blocks:             bucketindex.Blocks{},
+		BlockDeletionMarks: bucketindex.BlockDeletionMarks{},
+		UpdatedAt:          time.Now().Unix(),
+	}))
+
+	testCases := map[string]struct {
+		err error
+		ss  bucketindex.Status
+	}{
+		"should return AccessDeniedError when CustomerManagedKeyError and still not queryable": {
+			err: validation.AccessDeniedError(bucket.ErrCustomerManagedKeyAccessDenied.Error()),
+			ss: bucketindex.Status{
+				Version:            bucketindex.SyncStatusFileVersion,
+				SyncTime:           time.Now().Unix(),
+				Status:             bucketindex.Ok,
+				NonQueryableReason: bucketindex.CustomerManagedKeyError,
+				NonQueryableUntil:  time.Now().Add(time.Minute * 10).Unix(),
+			},
+		},
+		"should not return error after NonQueryableUntil": {
+			ss: bucketindex.Status{
+				Version:            bucketindex.SyncStatusFileVersion,
+				SyncTime:           time.Now().Unix(),
+				Status:             bucketindex.Ok,
+				NonQueryableReason: bucketindex.CustomerManagedKeyError,
+				NonQueryableUntil:  time.Now().Add(-time.Minute * 10).Unix(),
+			},
+		},
+		"should not return error when UnknownStatus": {
+			ss: bucketindex.UnknownStatus,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			bucketindex.WriteSyncStatus(ctx, bkt, userID, tc.ss, log.NewNopLogger())
+			finder := prepareBucketIndexBlocksFinder(t, bkt)
+			_, _, err := finder.GetBlocks(ctx, userID, 10, 20, nil)
+			require.Equal(t, tc.err, err)
+			// Doing 2 times to return from the cache
+			_, _, err = finder.GetBlocks(ctx, userID, 10, 20, nil)
+			require.Equal(t, tc.err, err)
+		})
+	}
 }
 
 func prepareBucketIndexBlocksFinder(t testing.TB, bkt objstore.Bucket) *BucketIndexBlocksFinder {
@@ -209,6 +285,7 @@ func prepareBucketIndexBlocksFinder(t testing.TB, bkt objstore.Bucket) *BucketIn
 		},
 		MaxStalePeriod:           time.Hour,
 		IgnoreDeletionMarksDelay: time.Hour,
+		IgnoreBlocksWithin:       10 * time.Hour,
 	}
 
 	finder := NewBucketIndexBlocksFinder(cfg, bkt, nil, log.NewNopLogger(), nil)
@@ -218,4 +295,22 @@ func prepareBucketIndexBlocksFinder(t testing.TB, bkt objstore.Bucket) *BucketIn
 	})
 
 	return finder
+}
+
+func TestBucketIndexBlocksFinder_GetBlocks_KeyPermissionDenied(t *testing.T) {
+	const userID = "user-1"
+	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
+
+	bkt = &cortex_testutil.MockBucketFailure{
+		Bucket: bkt,
+		GetFailures: map[string]error{
+			path.Join(userID, "bucket-index.json.gz"): cortex_testutil.ErrKeyAccessDeniedError,
+		},
+	}
+
+	finder := prepareBucketIndexBlocksFinder(t, bkt)
+
+	_, _, err := finder.GetBlocks(context.Background(), userID, 0, 100, nil)
+	expected := validation.AccessDeniedError("error")
+	require.IsType(t, expected, err)
 }

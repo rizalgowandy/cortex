@@ -54,12 +54,19 @@ The store-gateway supports two sharding strategies:
 
 - `default`
 - `shuffle-sharding`
+- `zone-stable-shuffle-sharding`
 
 The **`default`** sharding strategy spreads the blocks of each tenant across all store-gateway instances. It's the easiest form of sharding supported, but doesn't provide any workload isolation between different tenants.
 
 The **`shuffle-sharding`** strategy spreads the blocks of a tenant across a subset of store-gateway instances. This way, the number of store-gateway instances loading blocks of a single tenant is limited and the blast radius of any issue that could be introduced by the tenant's workload is limited to its shard instances.
 
 The shuffle sharding strategy can be enabled via `-store-gateway.sharding-strategy=shuffle-sharding` and requires the `-store-gateway.tenant-shard-size` flag (or their respective YAML config options) to be set to the default shard size, which is the default number of store-gateway instances each tenant should be sharded to. The shard size can then be overridden on a per-tenant basis setting the `store_gateway_tenant_shard_size` in the limits overrides.
+
+The **`zone-stable-shuffle-sharding`** strategy achieves the same as the **`shuffle-sharding`** strategy, but using a different sharding algorithm. The new sharding algorithm ensures that when zone awareness is enabled, when shard size increases or decreases by one, the replicas for any block should only change at most by one instance. This is important for querying store gateway because a block can be retried at most 3 times.
+
+Zone stable shuffle sharding can be enabled via `-store-gateway.sharding-ring.zone-stable-shuffle-sharding` CLI flag.
+
+It will become the default shuffle sharding strategy for store gateway in `v1.17.0` release and the previous shuffle sharding algorithm will be removed in `v1.18.0` release.
 
 _Please check out the [shuffle sharding documentation](../guides/shuffle-sharding.md) for more information about how it works._
 
@@ -117,6 +124,7 @@ The store-gateway can use a cache to speed up lookups of postings and series fro
 
 - `inmemory`
 - `memcached`
+- `redis`
 
 #### In-memory index cache
 
@@ -139,20 +147,26 @@ The Memcached client uses a jump hash algorithm to shard cached entries across a
 For example, if you're running Memcached in Kubernetes, you may:
 
 1. Deploy your Memcached cluster using a [StatefulSet](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/)
-2. Create an [headless service](https://kubernetes.io/docs/concepts/services-networking/service/#headless-services) for Memcached StatefulSet
+2. Create a [headless service](https://kubernetes.io/docs/concepts/services-networking/service/#headless-services) for Memcached StatefulSet
 3. Configure the Cortex's Memcached client address using the `dnssrvnoa+` [service discovery](../configuration/arguments.md#dns-service-discovery)
+
+#### Redis index cache
+
+The `redis` index cache allows to use [Redis](https://memcached.org/) as cache backend. This cache backend is configured using `-blocks-storage.bucket-store.index-cache.backend=redis` and requires the Redis server(s) addresses via `-blocks-storage.bucket-store.index-cache.redis.addresses` (or config file).
+
+Using `redis` as the cache backend has similar trade-offs as using `memcached` cache backend. However, client side caching can be enabled when using `redis` backend to avoid Store Gateway fetching data from cache each time. See [here](https://redis.io/docs/manual/client-side-caching/) for more info and it can be enabled by setting flag `-blocks-storage.bucket-store.index-cache.redis.cache-size` > 0.
 
 ### Chunks cache
 
 Store-gateway can also use a cache for storing chunks fetched from the storage. Chunks contain actual samples, and can be reused if user query hits the same series for the same time range.
 
-To enable chunks cache, please set `-blocks-storage.bucket-store.chunks-cache.backend`. Chunks can currently only be stored into Memcached cache. Memcached client can be configured via flags with `-blocks-storage.bucket-store.chunks-cache.memcached.*` prefix.
+To enable chunks cache, please set `-blocks-storage.bucket-store.chunks-cache.backend`. Chunks can be stored into Memcached or Redis cache. Memcached client can be configured via flags with `-blocks-storage.bucket-store.chunks-cache.memcached.*` prefix. Redis client can be configured via flags with `-blocks-storage.bucket-store.chunks-cache.redis.*` prefix.
 
 There are additional low-level options for configuring chunks cache. Please refer to other flags with `-blocks-storage.bucket-store.chunks-cache.*` prefix.
 
 ### Metadata cache
 
-Store-gateway and [querier](./querier.md) can use memcached for caching bucket metadata:
+Store-gateway and [querier](./querier.md) can use memcached or redis for caching bucket metadata:
 
 - List of tenants
 - List of blocks per tenant
@@ -162,11 +176,11 @@ Store-gateway and [querier](./querier.md) can use memcached for caching bucket m
 
 Using the metadata cache can significantly reduce the number of API calls to object storage and protects from linearly scale the number of these API calls with the number of querier and store-gateway instances (because the bucket is periodically scanned and synched by each querier and store-gateway).
 
-To enable metadata cache, please set `-blocks-storage.bucket-store.metadata-cache.backend`. Only `memcached` backend is supported currently. Memcached client has additional configuration available via flags with `-blocks-storage.bucket-store.metadata-cache.memcached.*` prefix.
+To enable metadata cache, please set `-blocks-storage.bucket-store.metadata-cache.backend`. `memcached` and `redis` backend are supported currently. Memcached client has additional configuration available via flags with `-blocks-storage.bucket-store.metadata-cache.memcached.*` prefix. Redis client has additional configuration available via flags with `-blocks-storage.bucket-store.metadata-cache.redis.*` prefix.
 
 Additional options for configuring metadata cache have `-blocks-storage.bucket-store.metadata-cache.*` prefix. By configuring TTL to zero or negative value, caching of given item type is disabled.
 
-_The same memcached backend cluster should be shared between store-gateways and queriers._
+_The same cache backend deployment should be shared between store-gateways and queriers._
 
 ## Store-gateway HTTP endpoints
 
@@ -196,8 +210,8 @@ store_gateway:
     # This option needs be set both on the store-gateway and querier when
     # running in microservices mode.
     kvstore:
-      # Backend storage to use for the ring. Supported values are: consul, etcd,
-      # inmemory, memberlist, multi.
+      # Backend storage to use for the ring. Supported values are: consul,
+      # dynamodb, etcd, inmemory, memberlist, multi.
       # CLI flag: -store-gateway.sharding-ring.store
       [store: <string> | default = "consul"]
 
@@ -209,6 +223,31 @@ store_gateway:
       # The CLI flags prefix for this block config is:
       # store-gateway.sharding-ring
       [consul: <consul_config>]
+
+      dynamodb:
+        # Region to access dynamodb.
+        # CLI flag: -store-gateway.sharding-ring.dynamodb.region
+        [region: <string> | default = ""]
+
+        # Table name to use on dynamodb.
+        # CLI flag: -store-gateway.sharding-ring.dynamodb.table-name
+        [table_name: <string> | default = ""]
+
+        # Time to expire items on dynamodb.
+        # CLI flag: -store-gateway.sharding-ring.dynamodb.ttl-time
+        [ttl: <duration> | default = 0s]
+
+        # Time to refresh local ring with information on dynamodb.
+        # CLI flag: -store-gateway.sharding-ring.dynamodb.puller-sync-time
+        [puller_sync_time: <duration> | default = 1m]
+
+        # Maximum number of retries for DDB KV CAS.
+        # CLI flag: -store-gateway.sharding-ring.dynamodb.max-cas-retries
+        [max_cas_retries: <int> | default = 10]
+
+        # Timeout of dynamoDbClient requests. Default is 2m.
+        # CLI flag: -store-gateway.sharding-ring.dynamodb.timeout
+        [timeout: <duration> | default = 2m]
 
       # The etcd_config configures the etcd client.
       # The CLI flags prefix for this block config is:
@@ -258,6 +297,18 @@ store_gateway:
     # CLI flag: -store-gateway.sharding-ring.zone-awareness-enabled
     [zone_awareness_enabled: <boolean> | default = false]
 
+    # True to keep the store gateway instance in the ring when it shuts down.
+    # The instance will then be auto-forgotten from the ring after
+    # 10*heartbeat_timeout.
+    # CLI flag: -store-gateway.sharding-ring.keep-instance-in-the-ring-on-shutdown
+    [keep_instance_in_the_ring_on_shutdown: <boolean> | default = false]
+
+    # Set to true to enable ring detailed metrics. These metrics provide
+    # detailed information, such as token count and ownership per tenant.
+    # Disabling them can significantly decrease the number of metrics emitted.
+    # CLI flag: -store-gateway.sharding-ring.detailed-metrics-enabled
+    [detailed_metrics_enabled: <boolean> | default = true]
+
     # Minimum time to wait for ring stability at startup. 0 to disable.
     # CLI flag: -store-gateway.sharding-ring.wait-stability-min-duration
     [wait_stability_min_duration: <duration> | default = 1m]
@@ -267,6 +318,15 @@ store_gateway:
     # start anyway.
     # CLI flag: -store-gateway.sharding-ring.wait-stability-max-duration
     [wait_stability_max_duration: <duration> | default = 5m]
+
+    # Timeout for waiting on store-gateway to become desired state in the ring.
+    # CLI flag: -store-gateway.sharding-ring.wait-instance-state-timeout
+    [wait_instance_state_timeout: <duration> | default = 10m]
+
+    # The sleep seconds when store-gateway is shutting down. Need to be close to
+    # or larger than KV Store information propagation delay
+    # CLI flag: -store-gateway.sharding-ring.final-sleep
+    [final_sleep: <duration> | default = 0s]
 
     # Name of network interface to read address from.
     # CLI flag: -store-gateway.sharding-ring.instance-interface-names
@@ -281,6 +341,95 @@ store_gateway:
   # shuffle-sharding.
   # CLI flag: -store-gateway.sharding-strategy
   [sharding_strategy: <string> | default = "default"]
+
+  # Comma separated list of tenants whose store metrics this storegateway can
+  # process. If specified, only these tenants will be handled by storegateway,
+  # otherwise this storegateway will be enabled for all the tenants in the
+  # store-gateway cluster.
+  # CLI flag: -store-gateway.enabled-tenants
+  [enabled_tenants: <string> | default = ""]
+
+  # Comma separated list of tenants whose store metrics this storegateway cannot
+  # process. If specified, a storegateway that would normally pick the specified
+  # tenant(s) for processing will ignore them instead.
+  # CLI flag: -store-gateway.disabled-tenants
+  [disabled_tenants: <string> | default = ""]
+
+  query_protection:
+    rejection:
+      threshold:
+        # EXPERIMENTAL: Max CPU utilization that this instance can reach before
+        # rejecting new query request (across all tenants) in percentage,
+        # between 0 and 1. monitored_resources config must include the resource
+        # type. 0 to disable.
+        # CLI flag: -store-gateway.query-protection.rejection.threshold.cpu-utilization
+        [cpu_utilization: <float> | default = 0]
+
+        # EXPERIMENTAL: Max heap utilization that this instance can reach before
+        # rejecting new query request (across all tenants) in percentage,
+        # between 0 and 1. monitored_resources config must include the resource
+        # type. 0 to disable.
+        # CLI flag: -store-gateway.query-protection.rejection.threshold.heap-utilization
+        [heap_utilization: <float> | default = 0]
+
+    eviction:
+      threshold:
+        # EXPERIMENTAL: Max CPU utilization that this instance can reach before
+        # evicting the heaviest running query (across all tenants) in
+        # percentage, between 0 and 1. monitored_resources config must include
+        # the resource type. 0 to disable.
+        # CLI flag: -store-gateway.query-protection.eviction.threshold.cpu-utilization
+        [cpu_utilization: <float> | default = 0]
+
+        # EXPERIMENTAL: Max heap utilization that this instance can reach before
+        # evicting the heaviest running query (across all tenants) in
+        # percentage, between 0 and 1. monitored_resources config must include
+        # the resource type. 0 to disable.
+        # CLI flag: -store-gateway.query-protection.eviction.threshold.heap-utilization
+        [heap_utilization: <float> | default = 0]
+
+      # EXPERIMENTAL: How frequently the evictor checks system resource
+      # utilization.
+      # CLI flag: -store-gateway.query-protection.eviction.check-interval
+      [check_interval: <duration> | default = 1s]
+
+      # EXPERIMENTAL: Number of check intervals to wait after an eviction before
+      # evicting again.
+      # CLI flag: -store-gateway.query-protection.eviction.cooldown-period
+      [cooldown_period: <int> | default = 3]
+
+      # EXPERIMENTAL: The query metric used to determine the heaviest query for
+      # eviction. Supported values: fetched_samples, fetched_series,
+      # fetched_chunks, fetched_chunk_bytes.
+      # CLI flag: -store-gateway.query-protection.eviction.eviction-metric
+      [eviction_metric: <string> | default = "fetched_samples"]
+
+      # EXPERIMENTAL: Minimum time a query must be running before it becomes
+      # eligible for eviction. Queries younger than this are ignored.
+      # CLI flag: -store-gateway.query-protection.eviction.min-query-age
+      [min_query_age: <duration> | default = 10s]
+
+      # EXPERIMENTAL: Maximum number of queries to evict in a single check cycle
+      # when resource thresholds are breached.
+      # CLI flag: -store-gateway.query-protection.eviction.max-evictions-per-cycle
+      [max_evictions_per_cycle: <int> | default = 1]
+
+  hedged_request:
+    # If true, hedged requests are applied to object store calls. It can help
+    # with reducing tail latency.
+    # CLI flag: -store-gateway.hedged-request.enabled
+    [enabled: <boolean> | default = false]
+
+    # Maximum number of hedged requests allowed for each initial request. A high
+    # number can reduce latency but increase internal calls.
+    # CLI flag: -store-gateway.hedged-request.max-requests
+    [max_requests: <int> | default = 3]
+
+    # It is used to calculate a latency threshold to trigger hedged requests.
+    # For example, additional requests are triggered when the initial request
+    # response time exceeds the 90th percentile.
+    # CLI flag: -store-gateway.hedged-request.quantile
+    [quantile: <float> | default = 0.9]
 ```
 
 ### `blocks_storage_config`
@@ -289,7 +438,7 @@ The `blocks_storage_config` configures the blocks storage.
 
 ```yaml
 blocks_storage:
-  # Backend storage to use. Supported backends are: s3, gcs, azure, swift,
+  # Backend storage to use. Supported backends are: s3, gcs, azure, swift, oci,
   # filesystem.
   # CLI flag: -blocks-storage.backend
   [backend: <string> | default = "s3"]
@@ -310,6 +459,10 @@ blocks_storage:
     # CLI flag: -blocks-storage.s3.bucket-name
     [bucket_name: <string> | default = ""]
 
+    # If enabled, S3 endpoint will use the non-dualstack variant.
+    # CLI flag: -blocks-storage.s3.disable-dualstack
+    [disable_dualstack: <boolean> | default = false]
+
     # S3 secret access key
     # CLI flag: -blocks-storage.s3.secret-access-key
     [secret_access_key: <string> | default = ""]
@@ -328,6 +481,21 @@ blocks_storage:
     # values are: v4, v2.
     # CLI flag: -blocks-storage.s3.signature-version
     [signature_version: <string> | default = "v4"]
+
+    # The s3 bucket lookup style. Supported values are: auto, virtual-hosted,
+    # path.
+    # CLI flag: -blocks-storage.s3.bucket-lookup-type
+    [bucket_lookup_type: <string> | default = "auto"]
+
+    # If true, attach MD5 checksum when upload objects and S3 uses MD5 checksum
+    # algorithm to verify the provided digest. If false, use CRC32C algorithm
+    # instead.
+    # CLI flag: -blocks-storage.s3.send-content-md5
+    [send_content_md5: <boolean> | default = true]
+
+    # The list api version. Supported values are: v1, v2, and ''.
+    # CLI flag: -blocks-storage.s3.list-objects-version
+    [list_objects_version: <string> | default = ""]
 
     # The s3_sse_config configures the S3 server-side encryption.
     # The CLI flags prefix for this block config is: blocks-storage
@@ -391,6 +559,13 @@ blocks_storage:
     # CLI flag: -blocks-storage.azure.account-key
     [account_key: <string> | default = ""]
 
+    # The values of `account-name` and `endpoint-suffix` values will not be
+    # ignored if `connection-string` is set. Use this method over `account-key`
+    # if you need to authenticate via a SAS token or if you use the Azurite
+    # emulator.
+    # CLI flag: -blocks-storage.azure.connection-string
+    [connection_string: <string> | default = ""]
+
     # Azure storage container name
     # CLI flag: -blocks-storage.azure.container-name
     [container_name: <string> | default = ""]
@@ -398,11 +573,22 @@ blocks_storage:
     # Azure storage endpoint suffix without schema. The account name will be
     # prefixed to this value to create the FQDN
     # CLI flag: -blocks-storage.azure.endpoint-suffix
-    [endpoint_suffix: <string> | default = ""]
+    [endpoint_suffix: <string> | default = "blob.core.windows.net"]
 
     # Number of retries for recoverable errors
     # CLI flag: -blocks-storage.azure.max-retries
     [max_retries: <int> | default = 20]
+
+    # Deprecated: Azure storage MSI resource. It will be set automatically by
+    # Azure SDK.
+    # CLI flag: -blocks-storage.azure.msi-resource
+    [msi_resource: <string> | default = ""]
+
+    # Azure storage MSI resource managed identity client Id. If not supplied
+    # default Azure credential will be used. Set it to empty if you need to
+    # authenticate via Azure Workload Identity.
+    # CLI flag: -blocks-storage.azure.user-assigned-id
+    [user_assigned_id: <string> | default = ""]
 
     http:
       # The time an idle connection will remain idle before closing.
@@ -450,6 +636,18 @@ blocks_storage:
     # OpenStack Swift authentication URL
     # CLI flag: -blocks-storage.swift.auth-url
     [auth_url: <string> | default = ""]
+
+    # OpenStack Swift application credential ID.
+    # CLI flag: -blocks-storage.swift.application-credential-id
+    [application_credential_id: <string> | default = ""]
+
+    # OpenStack Swift application credential name.
+    # CLI flag: -blocks-storage.swift.application-credential-name
+    [application_credential_name: <string> | default = ""]
+
+    # OpenStack Swift application credential secret.
+    # CLI flag: -blocks-storage.swift.application-credential-secret
+    [application_credential_secret: <string> | default = ""]
 
     # OpenStack Swift username.
     # CLI flag: -blocks-storage.swift.username
@@ -519,6 +717,60 @@ blocks_storage:
     # CLI flag: -blocks-storage.swift.request-timeout
     [request_timeout: <duration> | default = 5s]
 
+  oci:
+    # The OCI configuration provider to use. Supported values are: default,
+    # instance-principal, raw, oke-workload-identity.
+    # CLI flag: -blocks-storage.oci.provider
+    [provider: <string> | default = "default"]
+
+    # The OCI bucket name.
+    # CLI flag: -blocks-storage.oci.bucket
+    [bucket: <string> | default = ""]
+
+    # The OCID of the compartment that contains the bucket.
+    # CLI flag: -blocks-storage.oci.compartment-ocid
+    [compartment_ocid: <string> | default = ""]
+
+    # The OCID of the tenancy. Required when the provider is 'raw'.
+    # CLI flag: -blocks-storage.oci.tenancy-ocid
+    [tenancy_ocid: <string> | default = ""]
+
+    # The OCID of the user. Required when the provider is 'raw'.
+    # CLI flag: -blocks-storage.oci.user-ocid
+    [user_ocid: <string> | default = ""]
+
+    # The OCI region. Required when the provider is 'raw'.
+    # CLI flag: -blocks-storage.oci.region
+    [region: <string> | default = ""]
+
+    # The fingerprint of the API signing key. Required when the provider is
+    # 'raw'.
+    # CLI flag: -blocks-storage.oci.fingerprint
+    [fingerprint: <string> | default = ""]
+
+    # The API signing private key in PEM format. Required when the provider is
+    # 'raw'.
+    # CLI flag: -blocks-storage.oci.private-key
+    [privatekey: <string> | default = ""]
+
+    # The passphrase for the API signing private key, if the key is encrypted.
+    # CLI flag: -blocks-storage.oci.private-key-passphrase
+    [passphrase: <string> | default = ""]
+
+    # The part size in bytes used for multipart uploads. 0 uses the provider
+    # default.
+    # CLI flag: -blocks-storage.oci.part-size
+    [part_size: <int> | default = 0]
+
+    # The maximum number of request attempts when encountering recoverable
+    # errors. Values of 0 or 1 disable retries.
+    # CLI flag: -blocks-storage.oci.max-request-retries
+    [max_request_retries: <int> | default = 3]
+
+    # The fixed interval in seconds to wait between request retry attempts.
+    # CLI flag: -blocks-storage.oci.request-retry-interval
+    [request_retry_interval: <int> | default = 10]
+
   filesystem:
     # Local filesystem storage directory.
     # CLI flag: -blocks-storage.filesystem.dir
@@ -542,11 +794,24 @@ blocks_storage:
     # CLI flag: -blocks-storage.bucket-store.max-concurrent
     [max_concurrent: <int> | default = 100]
 
-    # Maximum number of concurrent tenants synching blocks.
+    # Max number of inflight queries to execute against the long-term storage.
+    # The limit is shared across all tenants. 0 to disable.
+    # CLI flag: -blocks-storage.bucket-store.max-inflight-requests
+    [max_inflight_requests: <int> | default = 0]
+
+    # [Experimental] Max number of data bytes (postings, series and chunks)
+    # fetched from object storage via the Series() API call and processed
+    # concurrently across all queries. The limit is shared across all tenants.
+    # When the limit is reached, new requests are rejected with HTTP 503. 0 to
+    # disable.
+    # CLI flag: -blocks-storage.bucket-store.max-concurrent-data-bytes
+    [max_concurrent_data_bytes: <int> | default = 0]
+
+    # Maximum number of concurrent tenants syncing blocks.
     # CLI flag: -blocks-storage.bucket-store.tenant-sync-concurrency
     [tenant_sync_concurrency: <int> | default = 10]
 
-    # Maximum number of concurrent blocks synching per tenant.
+    # Maximum number of concurrent blocks syncing per tenant.
     # CLI flag: -blocks-storage.bucket-store.block-sync-concurrency
     [block_sync_concurrency: <int> | default = 20]
 
@@ -562,7 +827,9 @@ blocks_storage:
     [consistency_delay: <duration> | default = 0s]
 
     index_cache:
-      # The index cache backend type. Supported values: inmemory, memcached.
+      # The index cache backend type. Multiple cache backend can be provided as
+      # a comma-separated ordered list to enable the implementation of a cache
+      # hierarchy. Supported values: inmemory, memcached, redis.
       # CLI flag: -blocks-storage.bucket-store.index-cache.backend
       [backend: <string> | default = "inmemory"]
 
@@ -571,6 +838,11 @@ blocks_storage:
         # index lookups (shared between all tenants).
         # CLI flag: -blocks-storage.bucket-store.index-cache.inmemory.max-size-bytes
         [max_size_bytes: <int> | default = 1073741824]
+
+        # Selectively cache index item types. Supported values are Postings,
+        # ExpandedPostings and Series
+        # CLI flag: -blocks-storage.bucket-store.index-cache.inmemory.enabled-items
+        [enabled_items: <list of string> | default = []]
 
       memcached:
         # Comma separated list of memcached addresses. Supported prefixes are:
@@ -591,7 +863,7 @@ blocks_storage:
 
         # The maximum number of concurrent asynchronous operations can occur.
         # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.max-async-concurrency
-        [max_async_concurrency: <int> | default = 50]
+        [max_async_concurrency: <int> | default = 3]
 
         # The maximum number of enqueued asynchronous operations allowed.
         # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.max-async-buffer-size
@@ -619,10 +891,198 @@ blocks_storage:
         # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.auto-discovery
         [auto_discovery: <boolean> | default = false]
 
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+        # Selectively cache index item types. Supported values are Postings,
+        # ExpandedPostings and Series
+        # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.enabled-items
+        [enabled_items: <list of string> | default = []]
+
+      redis:
+        # Comma separated list of redis addresses. Supported prefixes are: dns+
+        # (looked up as an A/AAAA query), dnssrv+ (looked up as a SRV query,
+        # dnssrvnoa+ (looked up as a SRV query, with no A/AAAA lookup made after
+        # that).
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.addresses
+        [addresses: <string> | default = ""]
+
+        # Redis username.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.username
+        [username: <string> | default = ""]
+
+        # Redis password.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.password
+        [password: <string> | default = ""]
+
+        # Database to be selected after connecting to the server.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.db
+        [db: <int> | default = 0]
+
+        # Specifies the master's name. Must be not empty for Redis Sentinel.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.master-name
+        [master_name: <string> | default = ""]
+
+        # The maximum number of concurrent GetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.max-get-multi-concurrency
+        [max_get_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for mget.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.get-multi-batch-size
+        [get_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent SetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.max-set-multi-concurrency
+        [max_set_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for pipeline set.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.set-multi-batch-size
+        [set_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent asynchronous operations can occur.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # Client dial timeout.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.dial-timeout
+        [dial_timeout: <duration> | default = 5s]
+
+        # Client read timeout.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.read-timeout
+        [read_timeout: <duration> | default = 3s]
+
+        # Client write timeout.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.write-timeout
+        [write_timeout: <duration> | default = 3s]
+
+        # Whether to enable tls for redis connection.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.tls-enabled
+        [tls_enabled: <boolean> | default = false]
+
+        # Path to the client certificate file, which will be used for
+        # authenticating with the server. Also requires the key path to be
+        # configured.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.tls-cert-path
+        [tls_cert_path: <string> | default = ""]
+
+        # Path to the key file for the client certificate. Also requires the
+        # client certificate to be configured.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.tls-key-path
+        [tls_key_path: <string> | default = ""]
+
+        # Path to the CA certificates file to validate server certificate
+        # against. If not set, the host's root CA certificates are used.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.tls-ca-path
+        [tls_ca_path: <string> | default = ""]
+
+        # Override the expected name on the server certificate.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.tls-server-name
+        [tls_server_name: <string> | default = ""]
+
+        # Skip validating server certificate.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.tls-insecure-skip-verify
+        [tls_insecure_skip_verify: <boolean> | default = false]
+
+        # If not zero then client-side caching is enabled. Client-side caching
+        # is when data is stored in memory instead of fetching data each time.
+        # See https://redis.io/docs/manual/client-side-caching/ for more info.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.cache-size
+        [cache_size: <int> | default = 0]
+
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.redis.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.redis.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.redis.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.redis.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.redis.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.index-cache.redis.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+        # Selectively cache index item types. Supported values are Postings,
+        # ExpandedPostings and Series
+        # CLI flag: -blocks-storage.bucket-store.index-cache.redis.enabled-items
+        [enabled_items: <list of string> | default = []]
+
+      multilevel:
+        # The maximum number of concurrent asynchronous operations can occur
+        # when backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.multilevel.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed when
+        # backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.multilevel.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # The maximum number of items to backfill per asynchronous operation.
+        # CLI flag: -blocks-storage.bucket-store.index-cache.multilevel.max-backfill-items
+        [max_backfill_items: <int> | default = 10000]
+
     chunks_cache:
-      # Backend for chunks cache, if not empty. Supported values: memcached.
+      # The chunks cache backend type. Single or Multiple cache backend can be
+      # provided. Supported values in single cache: memcached, redis, inmemory,
+      # and '' (disable). Supported values in multi level cache: a
+      # comma-separated list of (inmemory, memcached, redis)
       # CLI flag: -blocks-storage.bucket-store.chunks-cache.backend
       [backend: <string> | default = ""]
+
+      inmemory:
+        # Maximum size in bytes of in-memory chunks cache used (shared between
+        # all tenants).
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.inmemory.max-size-bytes
+        [max_size_bytes: <int> | default = 1073741824]
 
       memcached:
         # Comma separated list of memcached addresses. Supported prefixes are:
@@ -643,7 +1103,7 @@ blocks_storage:
 
         # The maximum number of concurrent asynchronous operations can occur.
         # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.max-async-concurrency
-        [max_async_concurrency: <int> | default = 50]
+        [max_async_concurrency: <int> | default = 3]
 
         # The maximum number of enqueued asynchronous operations allowed.
         # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.max-async-buffer-size
@@ -671,6 +1131,175 @@ blocks_storage:
         # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.auto-discovery
         [auto_discovery: <boolean> | default = false]
 
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+      redis:
+        # Comma separated list of redis addresses. Supported prefixes are: dns+
+        # (looked up as an A/AAAA query), dnssrv+ (looked up as a SRV query,
+        # dnssrvnoa+ (looked up as a SRV query, with no A/AAAA lookup made after
+        # that).
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.addresses
+        [addresses: <string> | default = ""]
+
+        # Redis username.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.username
+        [username: <string> | default = ""]
+
+        # Redis password.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.password
+        [password: <string> | default = ""]
+
+        # Database to be selected after connecting to the server.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.db
+        [db: <int> | default = 0]
+
+        # Specifies the master's name. Must be not empty for Redis Sentinel.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.master-name
+        [master_name: <string> | default = ""]
+
+        # The maximum number of concurrent GetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.max-get-multi-concurrency
+        [max_get_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for mget.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.get-multi-batch-size
+        [get_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent SetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.max-set-multi-concurrency
+        [max_set_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for pipeline set.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.set-multi-batch-size
+        [set_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent asynchronous operations can occur.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # Client dial timeout.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.dial-timeout
+        [dial_timeout: <duration> | default = 5s]
+
+        # Client read timeout.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.read-timeout
+        [read_timeout: <duration> | default = 3s]
+
+        # Client write timeout.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.write-timeout
+        [write_timeout: <duration> | default = 3s]
+
+        # Whether to enable tls for redis connection.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.tls-enabled
+        [tls_enabled: <boolean> | default = false]
+
+        # Path to the client certificate file, which will be used for
+        # authenticating with the server. Also requires the key path to be
+        # configured.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.tls-cert-path
+        [tls_cert_path: <string> | default = ""]
+
+        # Path to the key file for the client certificate. Also requires the
+        # client certificate to be configured.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.tls-key-path
+        [tls_key_path: <string> | default = ""]
+
+        # Path to the CA certificates file to validate server certificate
+        # against. If not set, the host's root CA certificates are used.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.tls-ca-path
+        [tls_ca_path: <string> | default = ""]
+
+        # Override the expected name on the server certificate.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.tls-server-name
+        [tls_server_name: <string> | default = ""]
+
+        # Skip validating server certificate.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.tls-insecure-skip-verify
+        [tls_insecure_skip_verify: <boolean> | default = false]
+
+        # If not zero then client-side caching is enabled. Client-side caching
+        # is when data is stored in memory instead of fetching data each time.
+        # See https://redis.io/docs/manual/client-side-caching/ for more info.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.cache-size
+        [cache_size: <int> | default = 0]
+
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.chunks-cache.redis.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+      multilevel:
+        # The maximum number of concurrent asynchronous operations can occur
+        # when backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.multilevel.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed when
+        # backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.multilevel.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # The maximum number of items to backfill per asynchronous operation.
+        # CLI flag: -blocks-storage.bucket-store.chunks-cache.multilevel.max-backfill-items
+        [max_backfill_items: <int> | default = 10000]
+
       # Size of each subrange that bucket object is split into for better
       # caching.
       # CLI flag: -blocks-storage.bucket-store.chunks-cache.subrange-size
@@ -691,9 +1320,18 @@ blocks_storage:
       [subrange_ttl: <duration> | default = 24h]
 
     metadata_cache:
-      # Backend for metadata cache, if not empty. Supported values: memcached.
+      # The metadata cache backend type. Single or Multiple cache backend can be
+      # provided. Supported values in single cache: memcached, redis, inmemory,
+      # and '' (disable). Supported values in multi level cache: a
+      # comma-separated list of (inmemory, memcached, redis)
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.backend
       [backend: <string> | default = ""]
+
+      inmemory:
+        # Maximum size in bytes of in-memory metadata cache used (shared between
+        # all tenants).
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.inmemory.max-size-bytes
+        [max_size_bytes: <int> | default = 1073741824]
 
       memcached:
         # Comma separated list of memcached addresses. Supported prefixes are:
@@ -714,7 +1352,7 @@ blocks_storage:
 
         # The maximum number of concurrent asynchronous operations can occur.
         # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.max-async-concurrency
-        [max_async_concurrency: <int> | default = 50]
+        [max_async_concurrency: <int> | default = 3]
 
         # The maximum number of enqueued asynchronous operations allowed.
         # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.max-async-buffer-size
@@ -741,6 +1379,175 @@ blocks_storage:
         # like GCP and AWS
         # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.auto-discovery
         [auto_discovery: <boolean> | default = false]
+
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+      redis:
+        # Comma separated list of redis addresses. Supported prefixes are: dns+
+        # (looked up as an A/AAAA query), dnssrv+ (looked up as a SRV query,
+        # dnssrvnoa+ (looked up as a SRV query, with no A/AAAA lookup made after
+        # that).
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.addresses
+        [addresses: <string> | default = ""]
+
+        # Redis username.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.username
+        [username: <string> | default = ""]
+
+        # Redis password.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.password
+        [password: <string> | default = ""]
+
+        # Database to be selected after connecting to the server.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.db
+        [db: <int> | default = 0]
+
+        # Specifies the master's name. Must be not empty for Redis Sentinel.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.master-name
+        [master_name: <string> | default = ""]
+
+        # The maximum number of concurrent GetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.max-get-multi-concurrency
+        [max_get_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for mget.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.get-multi-batch-size
+        [get_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent SetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.max-set-multi-concurrency
+        [max_set_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for pipeline set.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.set-multi-batch-size
+        [set_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent asynchronous operations can occur.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # Client dial timeout.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.dial-timeout
+        [dial_timeout: <duration> | default = 5s]
+
+        # Client read timeout.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.read-timeout
+        [read_timeout: <duration> | default = 3s]
+
+        # Client write timeout.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.write-timeout
+        [write_timeout: <duration> | default = 3s]
+
+        # Whether to enable tls for redis connection.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.tls-enabled
+        [tls_enabled: <boolean> | default = false]
+
+        # Path to the client certificate file, which will be used for
+        # authenticating with the server. Also requires the key path to be
+        # configured.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.tls-cert-path
+        [tls_cert_path: <string> | default = ""]
+
+        # Path to the key file for the client certificate. Also requires the
+        # client certificate to be configured.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.tls-key-path
+        [tls_key_path: <string> | default = ""]
+
+        # Path to the CA certificates file to validate server certificate
+        # against. If not set, the host's root CA certificates are used.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.tls-ca-path
+        [tls_ca_path: <string> | default = ""]
+
+        # Override the expected name on the server certificate.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.tls-server-name
+        [tls_server_name: <string> | default = ""]
+
+        # Skip validating server certificate.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.tls-insecure-skip-verify
+        [tls_insecure_skip_verify: <boolean> | default = false]
+
+        # If not zero then client-side caching is enabled. Client-side caching
+        # is when data is stored in memory instead of fetching data each time.
+        # See https://redis.io/docs/manual/client-side-caching/ for more info.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.cache-size
+        [cache_size: <int> | default = 0]
+
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.metadata-cache.redis.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+      multilevel:
+        # The maximum number of concurrent asynchronous operations can occur
+        # when backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.multilevel.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed when
+        # backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.multilevel.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # The maximum number of items to backfill per asynchronous operation.
+        # CLI flag: -blocks-storage.bucket-store.metadata-cache.multilevel.max-backfill-items
+        [max_backfill_items: <int> | default = 10000]
 
       # How long to cache list of tenants in the bucket.
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.tenants-list-ttl
@@ -784,7 +1591,7 @@ blocks_storage:
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.block-index-attributes-ttl
       [block_index_attributes_ttl: <duration> | default = 168h]
 
-      # How long to cache content of the bucket index.
+      # How long to cache content of the bucket index. 0 disables caching
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-content-ttl
       [bucket_index_content_ttl: <duration> | default = 5m]
 
@@ -796,6 +1603,498 @@ blocks_storage:
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-max-size-bytes
       [bucket_index_max_size_bytes: <int> | default = 1048576]
 
+      # How long to cache list of partitioned groups for an user. 0 disables
+      # caching
+      # CLI flag: -blocks-storage.bucket-store.metadata-cache.partitioned-groups-list-ttl
+      [partitioned_groups_list_ttl: <duration> | default = 0s]
+
+    parquet_labels_cache:
+      # The parquet labels cache backend type. Single or Multiple cache backend
+      # can be provided. Supported values in single cache: memcached, redis,
+      # inmemory, and '' (disable). Supported values in multi level cache: a
+      # comma-separated list of (inmemory, memcached, redis)
+      # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.backend
+      [backend: <string> | default = ""]
+
+      inmemory:
+        # Maximum size in bytes of in-memory parquet-labels cache used (shared
+        # between all tenants).
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.inmemory.max-size-bytes
+        [max_size_bytes: <int> | default = 1073741824]
+
+      memcached:
+        # Comma separated list of memcached addresses. Supported prefixes are:
+        # dns+ (looked up as an A/AAAA query), dnssrv+ (looked up as a SRV
+        # query, dnssrvnoa+ (looked up as a SRV query, with no A/AAAA lookup
+        # made after that).
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.addresses
+        [addresses: <string> | default = ""]
+
+        # The socket read/write timeout.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.timeout
+        [timeout: <duration> | default = 100ms]
+
+        # The maximum number of idle connections that will be maintained per
+        # address.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.max-idle-connections
+        [max_idle_connections: <int> | default = 16]
+
+        # The maximum number of concurrent asynchronous operations can occur.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # The maximum number of concurrent connections running get operations.
+        # If set to 0, concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.max-get-multi-concurrency
+        [max_get_multi_concurrency: <int> | default = 100]
+
+        # The maximum number of keys a single underlying get operation should
+        # run. If more keys are specified, internally keys are split into
+        # multiple batches and fetched concurrently, honoring the max
+        # concurrency. If set to 0, the max batch size is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.max-get-multi-batch-size
+        [max_get_multi_batch_size: <int> | default = 0]
+
+        # The maximum size of an item stored in memcached. Bigger items are not
+        # stored. If set to 0, no maximum size is enforced.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.max-item-size
+        [max_item_size: <int> | default = 1048576]
+
+        # Use memcached auto-discovery mechanism provided by some cloud provider
+        # like GCP and AWS
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.auto-discovery
+        [auto_discovery: <boolean> | default = false]
+
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.memcached.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+      redis:
+        # Comma separated list of redis addresses. Supported prefixes are: dns+
+        # (looked up as an A/AAAA query), dnssrv+ (looked up as a SRV query,
+        # dnssrvnoa+ (looked up as a SRV query, with no A/AAAA lookup made after
+        # that).
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.addresses
+        [addresses: <string> | default = ""]
+
+        # Redis username.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.username
+        [username: <string> | default = ""]
+
+        # Redis password.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.password
+        [password: <string> | default = ""]
+
+        # Database to be selected after connecting to the server.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.db
+        [db: <int> | default = 0]
+
+        # Specifies the master's name. Must be not empty for Redis Sentinel.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.master-name
+        [master_name: <string> | default = ""]
+
+        # The maximum number of concurrent GetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.max-get-multi-concurrency
+        [max_get_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for mget.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.get-multi-batch-size
+        [get_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent SetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.max-set-multi-concurrency
+        [max_set_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for pipeline set.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.set-multi-batch-size
+        [set_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent asynchronous operations can occur.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # Client dial timeout.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.dial-timeout
+        [dial_timeout: <duration> | default = 5s]
+
+        # Client read timeout.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.read-timeout
+        [read_timeout: <duration> | default = 3s]
+
+        # Client write timeout.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.write-timeout
+        [write_timeout: <duration> | default = 3s]
+
+        # Whether to enable tls for redis connection.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.tls-enabled
+        [tls_enabled: <boolean> | default = false]
+
+        # Path to the client certificate file, which will be used for
+        # authenticating with the server. Also requires the key path to be
+        # configured.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.tls-cert-path
+        [tls_cert_path: <string> | default = ""]
+
+        # Path to the key file for the client certificate. Also requires the
+        # client certificate to be configured.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.tls-key-path
+        [tls_key_path: <string> | default = ""]
+
+        # Path to the CA certificates file to validate server certificate
+        # against. If not set, the host's root CA certificates are used.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.tls-ca-path
+        [tls_ca_path: <string> | default = ""]
+
+        # Override the expected name on the server certificate.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.tls-server-name
+        [tls_server_name: <string> | default = ""]
+
+        # Skip validating server certificate.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.tls-insecure-skip-verify
+        [tls_insecure_skip_verify: <boolean> | default = false]
+
+        # If not zero then client-side caching is enabled. Client-side caching
+        # is when data is stored in memory instead of fetching data each time.
+        # See https://redis.io/docs/manual/client-side-caching/ for more info.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.cache-size
+        [cache_size: <int> | default = 0]
+
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.redis.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+      multilevel:
+        # The maximum number of concurrent asynchronous operations can occur
+        # when backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.multilevel.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed when
+        # backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.multilevel.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # The maximum number of items to backfill per asynchronous operation.
+        # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.multilevel.max-backfill-items
+        [max_backfill_items: <int> | default = 10000]
+
+      # Size of each subrange that bucket object is split into for better
+      # caching.
+      # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.subrange-size
+      [subrange_size: <int> | default = 16000]
+
+      # Maximum number of sub-GetRange requests that a single GetRange request
+      # can be split into when fetching parquet labels file. Zero or negative
+      # value = unlimited number of sub-requests.
+      # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.max-get-range-requests
+      [max_get_range_requests: <int> | default = 3]
+
+      # TTL for caching object attributes for parquet labels file.
+      # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.attributes-ttl
+      [attributes_ttl: <duration> | default = 168h]
+
+      # TTL for caching individual subranges.
+      # CLI flag: -blocks-storage.bucket-store.parquet-labels-cache.subrange-ttl
+      [subrange_ttl: <duration> | default = 24h]
+
+    parquet_row_ranges_cache:
+      # The parquet row ranges cache backend type. Single or Multiple cache
+      # backend can be provided. Supported values in single cache: memcached,
+      # redis, inmemory, and '' (disable). Supported values in multi level
+      # cache: a comma-separated list of (inmemory, memcached, redis)
+      # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.backend
+      [backend: <string> | default = ""]
+
+      inmemory:
+        # Maximum size in bytes of in-memory parquet-row-ranges cache used
+        # (shared between all tenants).
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.inmemory.max-size-bytes
+        [max_size_bytes: <int> | default = 1073741824]
+
+      memcached:
+        # Comma separated list of memcached addresses. Supported prefixes are:
+        # dns+ (looked up as an A/AAAA query), dnssrv+ (looked up as a SRV
+        # query, dnssrvnoa+ (looked up as a SRV query, with no A/AAAA lookup
+        # made after that).
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.addresses
+        [addresses: <string> | default = ""]
+
+        # The socket read/write timeout.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.timeout
+        [timeout: <duration> | default = 100ms]
+
+        # The maximum number of idle connections that will be maintained per
+        # address.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.max-idle-connections
+        [max_idle_connections: <int> | default = 16]
+
+        # The maximum number of concurrent asynchronous operations can occur.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # The maximum number of concurrent connections running get operations.
+        # If set to 0, concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.max-get-multi-concurrency
+        [max_get_multi_concurrency: <int> | default = 100]
+
+        # The maximum number of keys a single underlying get operation should
+        # run. If more keys are specified, internally keys are split into
+        # multiple batches and fetched concurrently, honoring the max
+        # concurrency. If set to 0, the max batch size is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.max-get-multi-batch-size
+        [max_get_multi_batch_size: <int> | default = 0]
+
+        # The maximum size of an item stored in memcached. Bigger items are not
+        # stored. If set to 0, no maximum size is enforced.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.max-item-size
+        [max_item_size: <int> | default = 1048576]
+
+        # Use memcached auto-discovery mechanism provided by some cloud provider
+        # like GCP and AWS
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.auto-discovery
+        [auto_discovery: <boolean> | default = false]
+
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.memcached.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+      redis:
+        # Comma separated list of redis addresses. Supported prefixes are: dns+
+        # (looked up as an A/AAAA query), dnssrv+ (looked up as a SRV query,
+        # dnssrvnoa+ (looked up as a SRV query, with no A/AAAA lookup made after
+        # that).
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.addresses
+        [addresses: <string> | default = ""]
+
+        # Redis username.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.username
+        [username: <string> | default = ""]
+
+        # Redis password.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.password
+        [password: <string> | default = ""]
+
+        # Database to be selected after connecting to the server.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.db
+        [db: <int> | default = 0]
+
+        # Specifies the master's name. Must be not empty for Redis Sentinel.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.master-name
+        [master_name: <string> | default = ""]
+
+        # The maximum number of concurrent GetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.max-get-multi-concurrency
+        [max_get_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for mget.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.get-multi-batch-size
+        [get_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent SetMulti() operations. If set to 0,
+        # concurrency is unlimited.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.max-set-multi-concurrency
+        [max_set_multi_concurrency: <int> | default = 100]
+
+        # The maximum size per batch for pipeline set.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.set-multi-batch-size
+        [set_multi_batch_size: <int> | default = 100]
+
+        # The maximum number of concurrent asynchronous operations can occur.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # Client dial timeout.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.dial-timeout
+        [dial_timeout: <duration> | default = 5s]
+
+        # Client read timeout.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.read-timeout
+        [read_timeout: <duration> | default = 3s]
+
+        # Client write timeout.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.write-timeout
+        [write_timeout: <duration> | default = 3s]
+
+        # Whether to enable tls for redis connection.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.tls-enabled
+        [tls_enabled: <boolean> | default = false]
+
+        # Path to the client certificate file, which will be used for
+        # authenticating with the server. Also requires the key path to be
+        # configured.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.tls-cert-path
+        [tls_cert_path: <string> | default = ""]
+
+        # Path to the key file for the client certificate. Also requires the
+        # client certificate to be configured.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.tls-key-path
+        [tls_key_path: <string> | default = ""]
+
+        # Path to the CA certificates file to validate server certificate
+        # against. If not set, the host's root CA certificates are used.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.tls-ca-path
+        [tls_ca_path: <string> | default = ""]
+
+        # Override the expected name on the server certificate.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.tls-server-name
+        [tls_server_name: <string> | default = ""]
+
+        # Skip validating server certificate.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.tls-insecure-skip-verify
+        [tls_insecure_skip_verify: <boolean> | default = false]
+
+        # If not zero then client-side caching is enabled. Client-side caching
+        # is when data is stored in memory instead of fetching data each time.
+        # See https://redis.io/docs/manual/client-side-caching/ for more info.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.cache-size
+        [cache_size: <int> | default = 0]
+
+        set_async_circuit_breaker_config:
+          # If true, enable circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.set-async.circuit-breaker.enabled
+          [enabled: <boolean> | default = false]
+
+          # Maximum number of requests allowed to pass through when the circuit
+          # breaker is half-open. If set to 0, by default it allows 1 request.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.set-async.circuit-breaker.half-open-max-requests
+          [half_open_max_requests: <int> | default = 10]
+
+          # Period of the open state after which the state of the circuit
+          # breaker becomes half-open. If set to 0, by default open duration is
+          # 60 seconds.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.set-async.circuit-breaker.open-duration
+          [open_duration: <duration> | default = 5s]
+
+          # Minimal requests to trigger the circuit breaker.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.set-async.circuit-breaker.min-requests
+          [min_requests: <int> | default = 50]
+
+          # Consecutive failures to determine if the circuit breaker should
+          # open.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.set-async.circuit-breaker.consecutive-failures
+          [consecutive_failures: <int> | default = 5]
+
+          # Failure percentage to determine if the circuit breaker should open.
+          # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.redis.set-async.circuit-breaker.failure-percent
+          [failure_percent: <float> | default = 0.05]
+
+      multilevel:
+        # The maximum number of concurrent asynchronous operations can occur
+        # when backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.multilevel.max-async-concurrency
+        [max_async_concurrency: <int> | default = 3]
+
+        # The maximum number of enqueued asynchronous operations allowed when
+        # backfilling cache items.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.multilevel.max-async-buffer-size
+        [max_async_buffer_size: <int> | default = 10000]
+
+        # The maximum number of items to backfill per asynchronous operation.
+        # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.multilevel.max-backfill-items
+        [max_backfill_items: <int> | default = 10000]
+
+      # TTL for caching parquet row ranges.
+      # CLI flag: -blocks-storage.bucket-store.parquet-row-ranges-cache.ttl
+      [ttl: <duration> | default = 10m]
+
+    # Maximum number of entries in the regex matchers cache. 0 to disable.
+    # CLI flag: -blocks-storage.bucket-store.matchers-cache-max-items
+    [matchers_cache_max_items: <int> | default = 0]
+
     # Duration after which the blocks marked for deletion will be filtered out
     # while fetching blocks. The idea of ignore-deletion-marks-delay is to
     # ignore blocks that are marked for deletion with some delay. This ensures
@@ -805,20 +2104,36 @@ blocks_storage:
     # CLI flag: -blocks-storage.bucket-store.ignore-deletion-marks-delay
     [ignore_deletion_mark_delay: <duration> | default = 6h]
 
+    # The blocks created since `now() - ignore_blocks_within` will not be
+    # synced. This should be used together with `-querier.query-store-after` to
+    # filter out the blocks that are too new to be queried. A reasonable value
+    # for this flag would be `-querier.query-store-after -
+    # blocks-storage.bucket-store.bucket-index.max-stale-period` to give some
+    # buffer. 0 to disable.
+    # CLI flag: -blocks-storage.bucket-store.ignore-blocks-within
+    [ignore_blocks_within: <duration> | default = 0s]
+
+    # The blocks created before `now() - ignore_blocks_before` will not be
+    # synced. 0 to disable.
+    # CLI flag: -blocks-storage.bucket-store.ignore-blocks-before
+    [ignore_blocks_before: <duration> | default = 0s]
+
     bucket_index:
       # True to enable querier and store-gateway to discover blocks in the
-      # storage via bucket index instead of bucket scanning.
+      # storage via bucket index instead of bucket scanning. Disabling the
+      # bucket index is not recommended for production.
       # CLI flag: -blocks-storage.bucket-store.bucket-index.enabled
-      [enabled: <boolean> | default = false]
+      [enabled: <boolean> | default = true]
 
       # How frequently a bucket index, which previously failed to load, should
-      # be tried to load again. This option is used only by querier.
+      # be tried to load again. This option is used by querier and store-gateway
+      # parquet mode.
       # CLI flag: -blocks-storage.bucket-store.bucket-index.update-on-error-interval
       [update_on_error_interval: <duration> | default = 1m]
 
       # How long a unused bucket index should be cached. Once this timeout
       # expires, the unused bucket index is removed from the in-memory cache.
-      # This option is used only by querier.
+      # This option is used by querier and store-gateway parquet mode.
       # CLI flag: -blocks-storage.bucket-store.bucket-index.idle-timeout
       [idle_timeout: <duration> | default = 1h]
 
@@ -829,21 +2144,88 @@ blocks_storage:
       # CLI flag: -blocks-storage.bucket-store.bucket-index.max-stale-period
       [max_stale_period: <duration> | default = 1h]
 
+    # One of concurrent, recursive, bucket_index. When set to concurrent, stores
+    # will concurrently issue one call per directory to discover active blocks
+    # in the bucket. The recursive strategy iterates through all objects in the
+    # bucket, recursively traversing into each directory. This avoids N+1 calls
+    # at the expense of having slower bucket iterations. bucket_index strategy
+    # can be used in Compactor only and utilizes the existing bucket index to
+    # fetch block IDs to sync. This avoids iterating the bucket but can be
+    # impacted by delays of cleaner creating bucket index.
+    # CLI flag: -blocks-storage.bucket-store.block-discovery-strategy
+    [block_discovery_strategy: <string> | default = "concurrent"]
+
+    # Type of bucket store to use (tsdb or parquet).
+    # CLI flag: -blocks-storage.bucket-store.bucket-store-type
+    [bucket_store_type: <string> | default = "tsdb"]
+
     # Max size - in bytes - of a chunks pool, used to reduce memory allocations.
     # The pool is shared across all tenants. 0 to disable the limit.
     # CLI flag: -blocks-storage.bucket-store.max-chunk-pool-bytes
     [max_chunk_pool_bytes: <int> | default = 2147483648]
 
-    # If enabled, store-gateway will lazy load an index-header only once
+    # If enabled, store-gateway will lazily memory-map an index-header only once
     # required by a query.
     # CLI flag: -blocks-storage.bucket-store.index-header-lazy-loading-enabled
     [index_header_lazy_loading_enabled: <boolean> | default = false]
 
     # If index-header lazy loading is enabled and this setting is > 0, the
-    # store-gateway will offload unused index-headers after 'idle timeout'
-    # inactivity.
+    # store-gateway will release memory-mapped index-headers after 'idle
+    # timeout' inactivity.
     # CLI flag: -blocks-storage.bucket-store.index-header-lazy-loading-idle-timeout
     [index_header_lazy_loading_idle_timeout: <duration> | default = 20m]
+
+    # If true, Store Gateway will estimate postings size and try to lazily
+    # expand postings if it downloads less data than expanding all postings.
+    # CLI flag: -blocks-storage.bucket-store.lazy-expanded-postings-enabled
+    [lazy_expanded_postings_enabled: <boolean> | default = false]
+
+    # Mark posting group as lazy if it fetches more keys than R * max series the
+    # query should fetch. With R set to 100, a posting group which fetches 100K
+    # keys will be marked as lazy if the current query only fetches 1000 series.
+    # This config is only valid if lazy expanded posting is enabled. 0 disables
+    # the limit.
+    # CLI flag: -blocks-storage.bucket-store.lazy-expanded-posting-group-max-key-series-ratio
+    [lazy_expanded_posting_group_max_key_series_ratio: <float> | default = 100]
+
+    # Controls how many series to fetch per batch in Store Gateway. Default
+    # value is 10000.
+    # CLI flag: -blocks-storage.bucket-store.series-batch-size
+    [series_batch_size: <int> | default = 10000]
+
+    token_bucket_bytes_limiter:
+      # Token bucket bytes limiter mode. Supported values are: disabled, dryrun,
+      # enabled
+      # CLI flag: -blocks-storage.bucket-store.token-bucket-bytes-limiter.mode
+      [mode: <string> | default = "disabled"]
+
+      # Instance token bucket size
+      # CLI flag: -blocks-storage.bucket-store.token-bucket-bytes-limiter.instance-token-bucket-size
+      [instance_token_bucket_size: <int> | default = 859832320]
+
+      # User token bucket size
+      # CLI flag: -blocks-storage.bucket-store.token-bucket-bytes-limiter.user-token-bucket-size
+      [user_token_bucket_size: <int> | default = 644874240]
+
+      # Request token bucket size
+      # CLI flag: -blocks-storage.bucket-store.token-bucket-bytes-limiter.request-token-bucket-size
+      [request_token_bucket_size: <int> | default = 4194304]
+
+    # [Experimental] Maximum size of the Parquet shard cache. 0 to disable.
+    # CLI flag: -blocks-storage.bucket-store.parquet-shard-cache-size
+    [parquet_shard_cache_size: <int> | default = 512]
+
+    # [Experimental] TTL of the Parquet shard cache. 0 to no TTL.
+    # CLI flag: -blocks-storage.bucket-store.parquet-shard-cache-ttl
+    [parquet_shard_cache_ttl: <duration> | default = 24h]
+
+    # Maximum number of concurrent goroutines per query applied at each level of
+    # parquet processing: shard querying, row group processing, and column
+    # materialization. Note: this limit is applied independently at each level,
+    # so the total goroutines per query can grow multiplicatively (up to N^3 in
+    # the worst case).
+    # CLI flag: -blocks-storage.bucket-store.parquet-query-concurrency
+    [parquet_query_concurrency: <int> | default = 4]
 
   tsdb:
     # Local directory to store TSDBs in the ingesters.
@@ -870,8 +2252,9 @@ blocks_storage:
     [ship_concurrency: <int> | default = 10]
 
     # How frequently does Cortex try to compact TSDB head. Block is only created
-    # if data covers smallest block range. Must be greater than 0 and max 5
-    # minutes.
+    # if data covers smallest block range. Must be greater than 0 and max 30
+    # minutes. Note that up to 50% jitter is added to the value for the first
+    # compaction to avoid ingesters compacting concurrently.
     # CLI flag: -blocks-storage.tsdb.head-compaction-interval
     [head_compaction_interval: <duration> | default = 1m]
 
@@ -898,9 +2281,10 @@ blocks_storage:
     # CLI flag: -blocks-storage.tsdb.stripe-size
     [stripe_size: <int> | default = 16384]
 
-    # True to enable TSDB WAL compression.
-    # CLI flag: -blocks-storage.tsdb.wal-compression-enabled
-    [wal_compression_enabled: <boolean> | default = false]
+    # TSDB WAL type. Supported values are: 'snappy', 'zstd' and '' (disable
+    # compression)
+    # CLI flag: -blocks-storage.tsdb.wal-compression-type
+    [wal_compression_type: <string> | default = ""]
 
     # TSDB WAL segments files max size (bytes).
     # CLI flag: -blocks-storage.tsdb.wal-segment-size-bytes
@@ -913,19 +2297,120 @@ blocks_storage:
 
     # If TSDB has not received any data for this duration, and all blocks from
     # TSDB have been shipped, TSDB is closed and deleted from local disk. If set
-    # to positive value, this value should be equal or higher than
-    # -querier.query-ingesters-within flag to make sure that TSDB is not closed
+    # to positive value, this value must be greater than
+    # -limits.query-ingesters-within flag to make sure that TSDB is not closed
     # prematurely, which could cause partial query results. 0 or negative value
     # disables closing of idle TSDB.
     # CLI flag: -blocks-storage.tsdb.close-idle-tsdb-timeout
     [close_idle_tsdb_timeout: <duration> | default = 0s]
 
+    # The size of the in-memory queue used before flushing chunks to the disk.
+    # CLI flag: -blocks-storage.tsdb.head-chunks-write-queue-size
+    [head_chunks_write_queue_size: <int> | default = 0]
+
     # limit the number of concurrently opening TSDB's on startup
     # CLI flag: -blocks-storage.tsdb.max-tsdb-opening-concurrency-on-startup
     [max_tsdb_opening_concurrency_on_startup: <int> | default = 10]
 
-    # Enables support for exemplars in TSDB and sets the maximum number that
-    # will be stored. 0 or less means disabled.
+    # Deprecated (use the per-tenant max_exemplars limit instead) and will be
+    # removed in v1.24.0: the global fallback for the maximum number of
+    # exemplars stored in TSDB, used only when the per-tenant max_exemplars
+    # limit is 0. 0 or less means exemplars are disabled.
     # CLI flag: -blocks-storage.tsdb.max-exemplars
     [max_exemplars: <int> | default = 0]
+
+    # True to enable snapshotting of in-memory TSDB data on disk when shutting
+    # down.
+    # CLI flag: -blocks-storage.tsdb.memory-snapshot-on-shutdown
+    [memory_snapshot_on_shutdown: <boolean> | default = false]
+
+    # [EXPERIMENTAL] Configures the maximum number of samples per chunk that can
+    # be out-of-order.
+    # CLI flag: -blocks-storage.tsdb.out-of-order-cap-max
+    [out_of_order_cap_max: <int> | default = 32]
+
+    # [EXPERIMENTAL] If enabled, ingesters will cache expanded postings when
+    # querying blocks. Caching can be configured separately for the head and
+    # compacted blocks.
+    expanded_postings_cache:
+      # If enabled, ingesters will cache expanded postings for the head block.
+      # Only queries with with an equal matcher for metric __name__ are cached.
+      head:
+        # Whether the postings cache is enabled or not
+        # CLI flag: -blocks-storage.expanded_postings_cache.head.enabled
+        [enabled: <boolean> | default = false]
+
+        # Max bytes for postings cache
+        # CLI flag: -blocks-storage.expanded_postings_cache.head.max-bytes
+        [max_bytes: <int> | default = 10485760]
+
+        # TTL for postings cache
+        # CLI flag: -blocks-storage.expanded_postings_cache.head.ttl
+        [ttl: <duration> | default = 10m]
+
+        # Timeout for fetching postings from TSDB index when cache miss occurs.
+        # This prevents runaway queries from consuming resources when all
+        # callers have given up.
+        # CLI flag: -blocks-storage.expanded_postings_cache.head.fetch-timeout
+        [fetch_timeout: <duration> | default = 0s]
+
+      # If enabled, ingesters will cache expanded postings for the compacted
+      # blocks. The cache is shared between all blocks.
+      blocks:
+        # Whether the postings cache is enabled or not
+        # CLI flag: -blocks-storage.expanded_postings_cache.block.enabled
+        [enabled: <boolean> | default = false]
+
+        # Max bytes for postings cache
+        # CLI flag: -blocks-storage.expanded_postings_cache.block.max-bytes
+        [max_bytes: <int> | default = 10485760]
+
+        # TTL for postings cache
+        # CLI flag: -blocks-storage.expanded_postings_cache.block.ttl
+        [ttl: <duration> | default = 10m]
+
+        # Timeout for fetching postings from TSDB index when cache miss occurs.
+        # This prevents runaway queries from consuming resources when all
+        # callers have given up.
+        # CLI flag: -blocks-storage.expanded_postings_cache.block.fetch-timeout
+        [fetch_timeout: <duration> | default = 0s]
+
+      # [EXPERIMENTAL] Maximum label cardinality for deferring regex matchers on
+      # the head block. When a regex matcher targets a label with more unique
+      # values than this threshold, it is applied lazily during iteration
+      # instead of postings lookup. 0 disables.
+      # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-max-cardinality
+      [lazy_matcher_max_cardinality: <int> | default = 0]
+
+      # [EXPERIMENTAL] Cardinality:postings ratio above which a simple regex
+      # (prefix-only, single contains) is deferred to lazy iteration. Lower =
+      # more aggressive deferral. Calibrated empirically; defaults to 6.
+      # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-simple-cost-ratio
+      [lazy_matcher_simple_cost_ratio: <int> | default = 6]
+
+      # [EXPERIMENTAL] Cardinality:postings ratio above which a complex regex
+      # (multi-substring, capture groups, character classes) is deferred. Lower
+      # = more aggressive deferral. Calibrated empirically; defaults to 2.
+      # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-complex-cost-ratio
+      [lazy_matcher_complex_cost_ratio: <int> | default = 2]
+
+  users_scanner:
+    # Strategy to use to scan users. Supported values are: list, user_index.
+    # CLI flag: -blocks-storage.users-scanner.strategy
+    [strategy: <string> | default = "list"]
+
+    # Maximum period of time to consider the user index as stale. Fall back to
+    # the base scanner if stale. Only valid when strategy is user_index.
+    # CLI flag: -blocks-storage.users-scanner.user-index.max-stale-period
+    [max_stale_period: <duration> | default = 1h]
+
+    # How frequently user index file is updated. It only takes effect when user
+    # scan strategy is user_index.
+    # CLI flag: -blocks-storage.users-scanner.user-index.update-interval
+    [update_interval: <duration> | default = 15m]
+
+    # TTL of the cached users. 0 disables caching and relies on caching at
+    # bucket client level.
+    # CLI flag: -blocks-storage.users-scanner.cache-ttl
+    [cache_ttl: <duration> | default = 0s]
 ```

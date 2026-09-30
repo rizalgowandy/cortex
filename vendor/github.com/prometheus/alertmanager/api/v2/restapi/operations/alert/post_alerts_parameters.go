@@ -20,18 +20,21 @@ package alert
 // Editing this file might prove futile when you re-run the swagger generate command
 
 import (
+	stderrors "errors"
 	"io"
 	"net/http"
 
 	"github.com/go-openapi/errors"
 	"github.com/go-openapi/runtime"
 	"github.com/go-openapi/runtime/middleware"
+	"github.com/go-openapi/validate"
 
 	"github.com/prometheus/alertmanager/api/v2/models"
 )
 
 // NewPostAlertsParams creates a new PostAlertsParams object
-// no default values defined in spec.
+//
+// There are no default values defined in the spec.
 func NewPostAlertsParams() PostAlertsParams {
 
 	return PostAlertsParams{}
@@ -42,7 +45,6 @@ func NewPostAlertsParams() PostAlertsParams {
 //
 // swagger:parameters postAlerts
 type PostAlertsParams struct {
-
 	// HTTP Request Object
 	HTTPRequest *http.Request `json:"-"`
 
@@ -63,10 +65,12 @@ func (o *PostAlertsParams) BindRequest(r *http.Request, route *middleware.Matche
 	o.HTTPRequest = r
 
 	if runtime.HasBody(r) {
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 		var body models.PostableAlerts
 		if err := route.Consumer.Consume(r.Body, &body); err != nil {
-			if err == io.EOF {
+			if stderrors.Is(err, io.EOF) {
 				res = append(res, errors.Required("alerts", "body", ""))
 			} else {
 				res = append(res, errors.NewParseError("alerts", "body", "", err))
@@ -74,6 +78,11 @@ func (o *PostAlertsParams) BindRequest(r *http.Request, route *middleware.Matche
 		} else {
 			// validate body object
 			if err := body.Validate(route.Formats); err != nil {
+				res = append(res, err)
+			}
+
+			ctx := validate.WithOperationRequest(r.Context())
+			if err := body.ContextValidate(ctx, route.Formats); err != nil {
 				res = append(res, err)
 			}
 

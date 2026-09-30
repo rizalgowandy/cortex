@@ -1,10 +1,13 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
 	"fmt"
 	"time"
 
-	"github.com/mitchellh/mapstructure"
+	"github.com/go-viper/mapstructure/v2"
 )
 
 // CAConfig is the structure for the Connect CA configuration.
@@ -38,6 +41,7 @@ type CAConfig struct {
 // CommonCAProviderConfig is the common options available to all CA providers.
 type CommonCAProviderConfig struct {
 	LeafCertTTL      time.Duration
+	RootCertTTL      time.Duration
 	SkipValidate     bool
 	CSRMaxPerSecond  float32
 	CSRMaxConcurrent int
@@ -99,6 +103,17 @@ type CARoot struct {
 	// cannot be active.
 	Active bool
 
+	// NotBefore is the certificate's validity start time.
+	NotBefore *time.Time `json:",omitempty"`
+
+	// NotAfter is the certificate's expiry time.
+	NotAfter *time.Time `json:",omitempty"`
+
+	// DaysRemaining is the number of days until the certificate expires.
+	// This is a computed field based on NotAfter and the current time.
+	// Negative values indicate the certificate has already expired.
+	DaysRemaining *int `json:",omitempty"`
+
 	CreateIndex uint64
 	ModifyIndex uint64
 }
@@ -133,11 +148,14 @@ type LeafCert struct {
 func (h *Connect) CARoots(q *QueryOptions) (*CARootList, *QueryMeta, error) {
 	r := h.c.newRequest("GET", "/v1/connect/ca/roots")
 	r.setQueryOptions(q)
-	rtt, resp, err := requireOK(h.c.doRequest(r))
+	rtt, resp, err := h.c.doRequest(r)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer closeResponseBody(resp)
+	if err := requireOK(resp); err != nil {
+		return nil, nil, err
+	}
 
 	qm := &QueryMeta{}
 	parseQueryMeta(resp, qm)
@@ -154,11 +172,14 @@ func (h *Connect) CARoots(q *QueryOptions) (*CARootList, *QueryMeta, error) {
 func (h *Connect) CAGetConfig(q *QueryOptions) (*CAConfig, *QueryMeta, error) {
 	r := h.c.newRequest("GET", "/v1/connect/ca/configuration")
 	r.setQueryOptions(q)
-	rtt, resp, err := requireOK(h.c.doRequest(r))
+	rtt, resp, err := h.c.doRequest(r)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer closeResponseBody(resp)
+	if err := requireOK(resp); err != nil {
+		return nil, nil, err
+	}
 
 	qm := &QueryMeta{}
 	parseQueryMeta(resp, qm)
@@ -176,11 +197,14 @@ func (h *Connect) CASetConfig(conf *CAConfig, q *WriteOptions) (*WriteMeta, erro
 	r := h.c.newRequest("PUT", "/v1/connect/ca/configuration")
 	r.setWriteOptions(q)
 	r.obj = conf
-	rtt, resp, err := requireOK(h.c.doRequest(r))
+	rtt, resp, err := h.c.doRequest(r)
 	if err != nil {
 		return nil, err
 	}
 	defer closeResponseBody(resp)
+	if err := requireOK(resp); err != nil {
+		return nil, err
+	}
 
 	wm := &WriteMeta{}
 	wm.RequestTime = rtt

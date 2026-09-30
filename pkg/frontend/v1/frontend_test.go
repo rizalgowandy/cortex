@@ -3,7 +3,7 @@ package v1
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -12,8 +12,6 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/services"
 	otgrpc "github.com/opentracing-contrib/go-grpc"
 	"github.com/opentracing-contrib/go-stdlib/nethttp"
 	"github.com/opentracing/opentracing-go"
@@ -31,8 +29,11 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/frontend/transport"
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
+	"github.com/cortexproject/cortex/pkg/querier/tenantfederation"
 	querier_worker "github.com/cortexproject/cortex/pkg/querier/worker"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 const (
@@ -55,7 +56,7 @@ func TestFrontend(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 200, resp.StatusCode)
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		assert.Equal(t, "Hello World", string(body))
@@ -105,7 +106,7 @@ func TestFrontendPropagateTrace(t *testing.T) {
 		require.Equal(t, 200, resp.StatusCode)
 
 		defer resp.Body.Close()
-		_, err = ioutil.ReadAll(resp.Body)
+		_, err = io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		// Query should do one call.
@@ -116,6 +117,7 @@ func TestFrontendPropagateTrace(t *testing.T) {
 }
 
 func TestFrontendCheckReady(t *testing.T) {
+	limits := MockLimits{MaxOutstanding: 100}
 	for _, tt := range []struct {
 		name             string
 		connectedClients int
@@ -128,9 +130,11 @@ func TestFrontendCheckReady(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := &Frontend{
 				log: log.NewNopLogger(),
-				requestQueue: queue.NewRequestQueue(5, 0,
+				requestQueue: queue.NewRequestQueue(5,
 					prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
 					prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user"}),
+					limits,
+					nil,
 				),
 			}
 			for i := 0; i < tt.connectedClients; i++ {
@@ -200,7 +204,7 @@ func TestFrontendMetricsCleanup(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 200, resp.StatusCode)
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
 			assert.Equal(t, "Hello World", string(body))
@@ -208,15 +212,15 @@ func TestFrontendMetricsCleanup(t *testing.T) {
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
 				# HELP cortex_query_frontend_queue_length Number of queries in the queue.
 				# TYPE cortex_query_frontend_queue_length gauge
-				cortex_query_frontend_queue_length{user="1"} 0
-			`), "cortex_query_frontend_queue_length"))
+				cortex_query_frontend_queue_length{priority="0",type="fifo",user="1"} 0
+				# HELP cortex_request_queue_requests_total Total number of query requests going to the request queue.
+				# TYPE cortex_request_queue_requests_total counter
+				cortex_request_queue_requests_total{priority="0",user="1"} 1
+			`), "cortex_query_frontend_queue_length", "cortex_request_queue_requests_total"))
 
 			fr.cleanupInactiveUserMetrics("1")
 
-			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-				# HELP cortex_query_frontend_queue_length Number of queries in the queue.
-				# TYPE cortex_query_frontend_queue_length gauge
-			`), "cortex_query_frontend_queue_length"))
+			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(""), "cortex_query_frontend_queue_length", "cortex_request_queue_requests_total"))
 		}
 
 		testFrontend(t, defaultFrontendConfig(), handler, test, matchMaxConcurrency, nil, reg)
@@ -243,7 +247,8 @@ func testFrontend(t *testing.T, config Config, handler http.Handler, test func(a
 	httpListen, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
 
-	v1, err := New(config, limits{}, logger, reg)
+	limits := MockLimits{MaxOutstanding: 100}
+	v1, err := New(config, limits, logger, reg, transport.NewRetry(0, nil))
 	require.NoError(t, err)
 	require.NotNil(t, v1)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), v1))
@@ -260,6 +265,8 @@ func testFrontend(t *testing.T, config Config, handler http.Handler, test func(a
 
 	// Default HTTP handler config.
 	handlerCfg := transport.HandlerConfig{}
+	tenantFederationCfg := tenantfederation.Config{}
+
 	flagext.DefaultValues(&handlerCfg)
 
 	rt := transport.AdaptGrpcRoundTripperToHTTPRoundTripper(v1)
@@ -267,7 +274,7 @@ func testFrontend(t *testing.T, config Config, handler http.Handler, test func(a
 	r.PathPrefix("/").Handler(middleware.Merge(
 		middleware.AuthenticateUser,
 		middleware.Tracer{},
-	).Wrap(transport.NewHandler(handlerCfg, rt, logger, nil)))
+	).Wrap(transport.NewHandler(handlerCfg, tenantFederationCfg, rt, logger, nil)))
 
 	httpServer := http.Server{
 		Handler: r,
@@ -291,12 +298,4 @@ func defaultFrontendConfig() Config {
 	config := Config{}
 	flagext.DefaultValues(&config)
 	return config
-}
-
-type limits struct {
-	queriers int
-}
-
-func (l limits) MaxQueriersPerUser(_ string) int {
-	return l.queriers
 }

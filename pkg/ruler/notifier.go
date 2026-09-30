@@ -11,7 +11,7 @@ import (
 
 	gklog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/crypto/tls"
+	"github.com/prometheus/client_golang/prometheus"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
@@ -20,6 +20,8 @@ import (
 	"github.com/prometheus/prometheus/notifier"
 
 	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/tls"
 )
 
 type NotifierConfig struct {
@@ -43,12 +45,13 @@ type rulerNotifier struct {
 	logger    gklog.Logger
 }
 
-func newRulerNotifier(o *notifier.Options, l gklog.Logger) *rulerNotifier {
+func newRulerNotifier(o *notifier.Options, nameValidationScheme model.ValidationScheme, l gklog.Logger, registerer prometheus.Registerer, sdMetrics map[string]discovery.DiscovererMetrics) *rulerNotifier {
 	sdCtx, sdCancel := context.WithCancel(context.Background())
+	slogger := util_log.GoKitLogToSlog(l)
 	return &rulerNotifier{
-		notifier:  notifier.NewManager(o, l),
+		notifier:  notifier.NewManager(o, nameValidationScheme, slogger),
 		sdCancel:  sdCancel,
-		sdManager: discovery.NewManager(sdCtx, l),
+		sdManager: discovery.NewManager(sdCtx, slogger, registerer, sdMetrics),
 		logger:    l,
 	}
 }
@@ -116,18 +119,15 @@ func buildNotifierConfig(rulerConfig *Config) (*config.Config, error) {
 	if len(validURLs) == 0 {
 		return &config.Config{}, nil
 	}
-
-	apiVersion := config.AlertmanagerAPIVersionV1
-	if rulerConfig.AlertmanangerEnableV2API {
-		apiVersion = config.AlertmanagerAPIVersionV2
-	}
-
 	amConfigs := make([]*config.AlertmanagerConfig, 0, len(validURLs))
 	for _, url := range validURLs {
-		amConfigs = append(amConfigs, amConfigFromURL(rulerConfig, url, apiVersion))
+		amConfigs = append(amConfigs, amConfigFromURL(rulerConfig, url, config.AlertmanagerAPIVersionV2))
 	}
 
 	promConfig := &config.Config{
+		GlobalConfig: config.GlobalConfig{
+			ExternalLabels: rulerConfig.ExternalLabels,
+		},
 		AlertingConfig: config.AlertingConfig{
 			AlertmanagerConfigs: amConfigs,
 		},
@@ -190,7 +190,7 @@ func amConfigFromURL(rulerConfig *Config, url *url.URL, apiVersion config.Alertm
 	if rulerConfig.Notifier.BasicAuth.IsEnabled() {
 		amConfig.HTTPClientConfig.BasicAuth = &config_util.BasicAuth{
 			Username: rulerConfig.Notifier.BasicAuth.Username,
-			Password: config_util.Secret(rulerConfig.Notifier.BasicAuth.Password),
+			Password: config_util.Secret(rulerConfig.Notifier.BasicAuth.Password.Value),
 		}
 	}
 

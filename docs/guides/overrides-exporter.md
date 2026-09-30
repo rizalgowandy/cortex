@@ -14,15 +14,15 @@ to their limits tenants are, the `overrides-exporter` module can expose limits a
 To update configuration without restarting, Cortex allows operators to supply a `runtime_config`
 file that will be periodically reloaded. This file can be specified under the `runtime_config` section
 of the main [configuration file](../configuration/arguments.md#runtime-configuration-file) or using the `-runtime-config.file`
-command line flag. This file is used to apply tenant-specific limits.
+command-line flag. This file is used to apply tenant-specific limits.
 
 ## Example
 
-The `overrides-exporter` is not enabled by default, it must be explicitly enabled. We recommend
+The `overrides-exporter` is not enabled by default; it must be explicitly enabled. We recommend
 only running a single instance of it in your cluster due to the cardinality of the metrics
 emitted.
 
-With a `runtime.yaml` file given below
+With a `runtime.yaml` file given below:
 
 [embedmd]:# (./overrides-exporter-runtime.yaml)
 ```yaml
@@ -36,17 +36,16 @@ overrides:
     max_global_series_per_user: 300000
     max_series_per_metric: 0
     max_series_per_user: 0
-    max_samples_per_query: 100000
-    max_series_per_query: 100000
+    max_fetched_series_per_query: 100000
 ```
 
-The `overrides-exporter` is configured to run as follows
+The `overrides-exporter` is configured to run as follows:
 
 ```
 cortex -target overrides-exporter -runtime-config.file runtime.yaml -server.http-listen-port=8080
 ```
 
-After the `overrides-exporter` starts, you can to use `curl` to inspect the tenant overrides.
+After the `overrides-exporter` starts, you can use `curl` to inspect the tenant overrides.
 
 ```text
 curl -s http://localhost:8080/metrics | grep cortex_overrides
@@ -59,8 +58,21 @@ cortex_overrides{limit_name="max_global_series_per_user",user="user1"} 300000
 cortex_overrides{limit_name="max_local_series_per_metric",user="user1"} 0
 cortex_overrides{limit_name="max_local_series_per_user",user="user1"} 0
 cortex_overrides{limit_name="max_samples_per_query",user="user1"} 100000
-cortex_overrides{limit_name="max_series_per_query",user="user1"} 100000
 ```
 
 With these metrics, you can set up alerts to know when tenants are close to hitting their limits
 before they exceed them.
+
+## Exposed Metrics
+Prior to version v1.20.0, the exporter only exposed the fixed, hardcoded list of limits shown in the example section above.
+
+As of version v1.20.0, the exporter automatically discovers and exposes all fields from the [limit_config](../configuration/config-file-reference.md#limits_config) configuration
+that are numerically representable.
+
+The exposes metrics based on the following rules:
+- Numerical types (`int`, `int64`, `uint`, `uint64`, `float64`) are converted directly to a `float64`.
+- bool types are converted to 1.0 (for `true`) or 0.0 (for `false`).
+- model.Duration types (which are internally `int64`) are converted to the total number of seconds as a `float64` (e.g, 1h becomes 3600.0).
+
+Fields with types such as `string`, `slice`, `map`, or other nested structs (like `metric_relabel_configs`) are ignored and not exported as metrics.
+

@@ -3,10 +3,12 @@ package bucketindex
 import (
 	"testing"
 
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+
+	"github.com/cortexproject/cortex/pkg/storage/parquet"
 )
 
 func TestIndex_RemoveBlock(t *testing.T) {
@@ -201,6 +203,37 @@ func TestBlockFromThanosMeta(t *testing.T) {
 				SegmentsNum:    3,
 			},
 		},
+		"meta.json with Files and Index Stats": {
+			meta: metadata.Meta{
+				BlockMeta: tsdb.BlockMeta{
+					ULID:    blockID,
+					MinTime: 10,
+					MaxTime: 20,
+				},
+				Thanos: metadata.Thanos{
+					Files: []metadata.File{
+						{RelPath: "index"},
+						{RelPath: "chunks/000001"},
+						{RelPath: "chunks/000002"},
+						{RelPath: "chunks/000003"},
+						{RelPath: "tombstone"},
+					},
+					IndexStats: metadata.IndexStats{
+						SeriesMaxSize: 1000,
+						ChunkMaxSize:  1000,
+					},
+				},
+			},
+			expected: Block{
+				ID:             blockID,
+				MinTime:        10,
+				MaxTime:        20,
+				SegmentsFormat: SegmentsFormat1Based6Digits,
+				SegmentsNum:    3,
+				SeriesMaxSize:  1000,
+				ChunkMaxSize:   1000,
+			},
+		},
 	}
 
 	for testName, testData := range tests {
@@ -272,12 +305,10 @@ func TestBlock_ThanosMeta(t *testing.T) {
 				SegmentsNum:    3,
 			},
 			expected: &metadata.Meta{
-				BlockMeta: tsdb.BlockMeta{
-					ULID:    blockID,
-					MinTime: 10,
-					MaxTime: 20,
-					Version: metadata.TSDBVersion1,
-				},
+				ULID:    blockID,
+				MinTime: 10,
+				MaxTime: 20,
+				Version: metadata.TSDBVersion1,
 				Thanos: metadata.Thanos{
 					Version: metadata.ThanosVersion1,
 					Labels: map[string]string{
@@ -300,16 +331,41 @@ func TestBlock_ThanosMeta(t *testing.T) {
 				SegmentsNum:    0,
 			},
 			expected: &metadata.Meta{
-				BlockMeta: tsdb.BlockMeta{
-					ULID:    blockID,
-					MinTime: 10,
-					MaxTime: 20,
-					Version: metadata.TSDBVersion1,
-				},
+				ULID:    blockID,
+				MinTime: 10,
+				MaxTime: 20,
+				Version: metadata.TSDBVersion1,
 				Thanos: metadata.Thanos{
 					Version: metadata.ThanosVersion1,
 					Labels: map[string]string{
 						"__org_id__": userID,
+					},
+				},
+			},
+		},
+		"block with index stats": {
+			block: Block{
+				ID:             blockID,
+				MinTime:        10,
+				MaxTime:        20,
+				SegmentsFormat: SegmentsFormatUnknown,
+				SegmentsNum:    0,
+				SeriesMaxSize:  1000,
+				ChunkMaxSize:   500,
+			},
+			expected: &metadata.Meta{
+				ULID:    blockID,
+				MinTime: 10,
+				MaxTime: 20,
+				Version: metadata.TSDBVersion1,
+				Thanos: metadata.Thanos{
+					Version: metadata.ThanosVersion1,
+					Labels: map[string]string{
+						"__org_id__": userID,
+					},
+					IndexStats: metadata.IndexStats{
+						SeriesMaxSize: 1000,
+						ChunkMaxSize:  500,
 					},
 				},
 			},
@@ -346,4 +402,64 @@ func TestBlockDeletionMarks_Clone(t *testing.T) {
 	// Changes to the original shouldn't be reflected to the clone.
 	orig[0].DeletionTime = -1
 	assert.Equal(t, int64(1), clone[0].DeletionTime)
+}
+
+func TestIndex_ParquetBlocks(t *testing.T) {
+	block1 := ulid.MustNew(1, nil)
+	block2 := ulid.MustNew(2, nil)
+	block3 := ulid.MustNew(3, nil)
+
+	tests := map[string]struct {
+		index    *Index
+		expected []*Block
+	}{
+		"empty index": {
+			index:    &Index{},
+			expected: []*Block{},
+		},
+		"no parquet blocks": {
+			index: &Index{
+				Blocks: Blocks{
+					{ID: block1},
+					{ID: block2},
+					{ID: block3},
+				},
+			},
+			expected: []*Block{},
+		},
+		"some parquet blocks": {
+			index: &Index{
+				Blocks: Blocks{
+					{ID: block1, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+					{ID: block2},
+					{ID: block3, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+				},
+			},
+			expected: []*Block{
+				{ID: block1, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+				{ID: block3, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+			},
+		},
+		"all parquet blocks": {
+			index: &Index{
+				Blocks: Blocks{
+					{ID: block1, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+					{ID: block2, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+					{ID: block3, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+				},
+			},
+			expected: []*Block{
+				{ID: block1, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+				{ID: block2, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+				{ID: block3, Parquet: &parquet.ConverterMarkMeta{Version: 1}},
+			},
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			actual := testData.index.ParquetBlocks()
+			assert.Equal(t, testData.expected, actual)
+		})
+	}
 }

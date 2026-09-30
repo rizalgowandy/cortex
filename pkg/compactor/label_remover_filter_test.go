@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -45,7 +45,7 @@ func TestLabelRemoverFilter(t *testing.T) {
 			}
 
 			f := NewLabelRemoverFilter(testData.labels)
-			err := f.Filter(context.Background(), metas, nil)
+			err := f.Filter(context.Background(), metas, nil, nil)
 			require.NoError(t, err)
 			assert.Len(t, metas, len(testData.expected))
 

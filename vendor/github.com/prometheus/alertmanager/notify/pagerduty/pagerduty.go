@@ -17,51 +17,56 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/alecthomas/units"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	commoncfg "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 
-	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/notify"
 	"github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/alertmanager/types"
 )
 
-const maxEventSize int = 512000
+const (
+	maxEventSize int = 512000
+	// https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTc4-send-a-v1-event - 1024 characters or runes.
+	maxV1DescriptionLenRunes = 1024
+	// https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTgx-send-an-alert-event - 1024 characters or runes.
+	maxV2SummaryLenRunes = 1024
+)
 
 // Notifier implements a Notifier for PagerDuty notifications.
 type Notifier struct {
-	conf    *config.PagerdutyConfig
+	conf    *PagerdutyConfig
 	tmpl    *template.Template
-	logger  log.Logger
+	logger  *slog.Logger
 	apiV1   string // for tests.
 	client  *http.Client
 	retrier *notify.Retrier
 }
 
 // New returns a new PagerDuty notifier.
-func New(c *config.PagerdutyConfig, t *template.Template, l log.Logger, httpOpts ...commoncfg.HTTPClientOption) (*Notifier, error) {
-	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "pagerduty", append(httpOpts, commoncfg.WithHTTP2Disabled())...)
+func New(c *PagerdutyConfig, t *template.Template, l *slog.Logger, httpOpts ...commoncfg.HTTPClientOption) (*Notifier, error) {
+	client, err := notify.NewClientWithTracing(*c.HTTPConfig, "pagerduty", httpOpts...)
 	if err != nil {
 		return nil, err
 	}
 	n := &Notifier{conf: c, tmpl: t, logger: l, client: client}
-	if c.ServiceKey != "" {
+	if c.ServiceKey != "" || c.ServiceKeyFile != "" {
 		n.apiV1 = "https://events.pagerduty.com/generic/2010-04-15/create_event.json"
 		// Retrying can solve the issue on 403 (rate limiting) and 5xx response codes.
-		// https://v2.developer.pagerduty.com/docs/trigger-events
+		// https://developer.pagerduty.com/docs/events-api-v1-overview#api-response-codes--retry-logic
 		n.retrier = &notify.Retrier{RetryCodes: []int{http.StatusForbidden}, CustomDetailsFunc: errDetails}
 	} else {
 		// Retrying can solve the issue on 429 (rate limiting) and 5xx response codes.
-		// https://v2.developer.pagerduty.com/docs/events-api-v2#api-response-codes--retry-logic
+		// https://developer.pagerduty.com/docs/events-api-v2-overview#response-codes--retry-logic
 		n.retrier = &notify.Retrier{RetryCodes: []int{http.StatusTooManyRequests}, CustomDetailsFunc: errDetails}
 	}
 	return n, nil
@@ -83,7 +88,7 @@ type pagerDutyMessage struct {
 	Payload     *pagerDutyPayload `json:"payload"`
 	Client      string            `json:"client,omitempty"`
 	ClientURL   string            `json:"client_url,omitempty"`
-	Details     map[string]string `json:"details,omitempty"`
+	Details     map[string]any    `json:"details,omitempty"`
 	Images      []pagerDutyImage  `json:"images,omitempty"`
 	Links       []pagerDutyLink   `json:"links,omitempty"`
 }
@@ -100,37 +105,37 @@ type pagerDutyImage struct {
 }
 
 type pagerDutyPayload struct {
-	Summary       string            `json:"summary"`
-	Source        string            `json:"source"`
-	Severity      string            `json:"severity"`
-	Timestamp     string            `json:"timestamp,omitempty"`
-	Class         string            `json:"class,omitempty"`
-	Component     string            `json:"component,omitempty"`
-	Group         string            `json:"group,omitempty"`
-	CustomDetails map[string]string `json:"custom_details,omitempty"`
+	Summary       string         `json:"summary"`
+	Source        string         `json:"source"`
+	Severity      string         `json:"severity"`
+	Timestamp     string         `json:"timestamp,omitempty"`
+	Class         string         `json:"class,omitempty"`
+	Component     string         `json:"component,omitempty"`
+	Group         string         `json:"group,omitempty"`
+	CustomDetails map[string]any `json:"custom_details,omitempty"`
 }
 
 func (n *Notifier) encodeMessage(msg *pagerDutyMessage) (bytes.Buffer, error) {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
-		return buf, errors.Wrap(err, "failed to encode PagerDuty message")
+		return buf, fmt.Errorf("failed to encode PagerDuty message: %w", err)
 	}
 
 	if buf.Len() > maxEventSize {
 		truncatedMsg := fmt.Sprintf("Custom details have been removed because the original event exceeds the maximum size of %s", units.MetricBytes(maxEventSize).String())
 
 		if n.apiV1 != "" {
-			msg.Details = map[string]string{"error": truncatedMsg}
+			msg.Details = map[string]any{"error": truncatedMsg}
 		} else {
-			msg.Payload.CustomDetails = map[string]string{"error": truncatedMsg}
+			msg.Payload.CustomDetails = map[string]any{"error": truncatedMsg}
 		}
 
 		warningMsg := fmt.Sprintf("Truncated Details because message of size %s exceeds limit %s", units.MetricBytes(buf.Len()).String(), units.MetricBytes(maxEventSize).String())
-		level.Warn(n.logger).Log("msg", warningMsg)
+		n.logger.Warn(warningMsg)
 
 		buf.Reset()
 		if err := json.NewEncoder(&buf).Encode(msg); err != nil {
-			return buf, errors.Wrap(err, "failed to encode PagerDuty message")
+			return buf, fmt.Errorf("failed to encode PagerDuty message: %w", err)
 		}
 	}
 
@@ -142,19 +147,27 @@ func (n *Notifier) notifyV1(
 	eventType string,
 	key notify.Key,
 	data *template.Data,
-	details map[string]string,
-	as ...*types.Alert,
+	details map[string]any,
 ) (bool, error) {
 	var tmplErr error
 	tmpl := notify.TmplText(n.tmpl, data, &tmplErr)
 
-	description, truncated := notify.Truncate(tmpl(n.conf.Description), 1024)
+	description, truncated := notify.TruncateInRunes(tmpl(n.conf.Description), maxV1DescriptionLenRunes)
 	if truncated {
-		level.Debug(n.logger).Log("msg", "Truncated description", "description", description, "key", key)
+		n.logger.Warn("Truncated description", "key", key, "max_runes", maxV1DescriptionLenRunes)
+	}
+
+	serviceKey := string(n.conf.ServiceKey)
+	if serviceKey == "" {
+		content, fileErr := os.ReadFile(n.conf.ServiceKeyFile)
+		if fileErr != nil {
+			return false, fmt.Errorf("failed to read service key from file: %w", fileErr)
+		}
+		serviceKey = strings.TrimSpace(string(content))
 	}
 
 	msg := &pagerDutyMessage{
-		ServiceKey:  tmpl(string(n.conf.ServiceKey)),
+		ServiceKey:  tmpl(serviceKey),
 		EventType:   eventType,
 		IncidentKey: key.Hash(),
 		Description: description,
@@ -167,7 +180,7 @@ func (n *Notifier) notifyV1(
 	}
 
 	if tmplErr != nil {
-		return false, errors.Wrap(tmplErr, "failed to template PagerDuty v1 message")
+		return false, fmt.Errorf("failed to template PagerDuty v1 message: %w", tmplErr)
 	}
 
 	// Ensure that the service key isn't empty after templating.
@@ -182,7 +195,7 @@ func (n *Notifier) notifyV1(
 
 	resp, err := notify.PostJSON(ctx, n.client, n.apiV1, &encodedMsg)
 	if err != nil {
-		return true, errors.Wrap(err, "failed to post message to PagerDuty v1")
+		return true, fmt.Errorf("failed to post message to PagerDuty v1: %w", err)
 	}
 	defer notify.Drain(resp)
 
@@ -194,8 +207,7 @@ func (n *Notifier) notifyV2(
 	eventType string,
 	key notify.Key,
 	data *template.Data,
-	details map[string]string,
-	as ...*types.Alert,
+	details map[string]any,
 ) (bool, error) {
 	var tmplErr error
 	tmpl := notify.TmplText(n.tmpl, data, &tmplErr)
@@ -204,22 +216,31 @@ func (n *Notifier) notifyV2(
 		n.conf.Severity = "error"
 	}
 
-	summary, truncated := notify.Truncate(tmpl(n.conf.Description), 1024)
+	summary, truncated := notify.TruncateInRunes(tmpl(n.conf.Description), maxV2SummaryLenRunes)
 	if truncated {
-		level.Debug(n.logger).Log("msg", "Truncated summary", "summary", summary, "key", key)
+		n.logger.Warn("Truncated summary", "key", key, "max_runes", maxV2SummaryLenRunes)
+	}
+
+	routingKey := string(n.conf.RoutingKey)
+	if routingKey == "" {
+		content, fileErr := os.ReadFile(n.conf.RoutingKeyFile)
+		if fileErr != nil {
+			return false, fmt.Errorf("failed to read routing key from file: %w", fileErr)
+		}
+		routingKey = strings.TrimSpace(string(content))
 	}
 
 	msg := &pagerDutyMessage{
 		Client:      tmpl(n.conf.Client),
 		ClientURL:   tmpl(n.conf.ClientURL),
-		RoutingKey:  tmpl(string(n.conf.RoutingKey)),
+		RoutingKey:  tmpl(routingKey),
 		EventAction: eventType,
 		DedupKey:    key.Hash(),
 		Images:      make([]pagerDutyImage, 0, len(n.conf.Images)),
 		Links:       make([]pagerDutyLink, 0, len(n.conf.Links)),
 		Payload: &pagerDutyPayload{
 			Summary:       summary,
-			Source:        tmpl(n.conf.Client),
+			Source:        tmpl(n.conf.Source),
 			Severity:      tmpl(n.conf.Severity),
 			CustomDetails: details,
 			Class:         tmpl(n.conf.Class),
@@ -252,7 +273,7 @@ func (n *Notifier) notifyV2(
 	}
 
 	if tmplErr != nil {
-		return false, errors.Wrap(tmplErr, "failed to template PagerDuty v2 message")
+		return false, fmt.Errorf("failed to template PagerDuty v2 message: %w", tmplErr)
 	}
 
 	// Ensure that the routing key isn't empty after templating.
@@ -267,11 +288,15 @@ func (n *Notifier) notifyV2(
 
 	resp, err := notify.PostJSON(ctx, n.client, n.conf.URL.String(), &encodedMsg)
 	if err != nil {
-		return true, errors.Wrap(err, "failed to post message to PagerDuty")
+		return true, fmt.Errorf("failed to post message to PagerDuty: %w", err)
 	}
 	defer notify.Drain(resp)
 
-	return n.retrier.Check(resp.StatusCode, resp.Body)
+	retry, err := n.retrier.Check(resp.StatusCode, resp.Body)
+	if err != nil {
+		return retry, notify.NewErrorWithReason(notify.GetFailureReasonFromStatusCode(resp.StatusCode), err)
+	}
+	return retry, err
 }
 
 // Notify implements the Notifier interface.
@@ -280,31 +305,43 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	if err != nil {
 		return false, err
 	}
+	logger := n.logger.With("group_key", key)
 
 	var (
 		alerts    = types.Alerts(as...)
-		data      = notify.GetTemplateData(ctx, n.tmpl, as, n.logger)
+		data      = notify.GetTemplateData(ctx, n.tmpl, as, logger)
 		eventType = pagerDutyEventTrigger
 	)
+
 	if alerts.Status() == model.AlertResolved {
 		eventType = pagerDutyEventResolve
 	}
 
-	level.Debug(n.logger).Log("incident", key, "eventType", eventType)
+	logger.Debug("extracted group key", "eventType", eventType)
 
-	details := make(map[string]string, len(n.conf.Details))
-	for k, v := range n.conf.Details {
-		detail, err := n.tmpl.ExecuteTextString(v, data)
-		if err != nil {
-			return false, errors.Wrapf(err, "%q: failed to template %q", k, v)
-		}
-		details[k] = detail
+	details, err := n.renderDetails(data)
+	if err != nil {
+		return false, fmt.Errorf("failed to render details: %w", err)
 	}
 
+	if n.conf.Timeout > 0 {
+		nfCtx, cancel := context.WithTimeoutCause(ctx, n.conf.Timeout, fmt.Errorf("configured pagerduty timeout reached (%s)", n.conf.Timeout))
+		defer cancel()
+		ctx = nfCtx
+	}
+
+	nf := n.notifyV2
 	if n.apiV1 != "" {
-		return n.notifyV1(ctx, eventType, key, data, details, as...)
+		nf = n.notifyV1
 	}
-	return n.notifyV2(ctx, eventType, key, data, details, as...)
+	retry, err := nf(ctx, eventType, key, data, details)
+	if err != nil {
+		if ctx.Err() != nil {
+			err = fmt.Errorf("%w: %w", err, context.Cause(ctx))
+		}
+		return retry, err
+	}
+	return retry, nil
 }
 
 func errDetails(status int, body io.Reader) string {
@@ -322,4 +359,25 @@ func errDetails(status int, body io.Reader) string {
 		return ""
 	}
 	return fmt.Sprintf("%s: %s", pgr.Message, strings.Join(pgr.Errors, ","))
+}
+
+func (n *Notifier) renderDetails(
+	data *template.Data,
+) (map[string]any, error) {
+	var (
+		tmplTextErr  error
+		tmplText     = notify.TmplText(n.tmpl, data, &tmplTextErr)
+		tmplTextFunc = func(tmpl string) (string, error) {
+			return tmplText(tmpl), tmplTextErr
+		}
+	)
+	var err error
+	rendered := make(map[string]any, len(n.conf.Details))
+	for k, v := range n.conf.Details {
+		rendered[k], err = template.DeepCopyWithTemplate(v, tmplTextFunc)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rendered, nil
 }

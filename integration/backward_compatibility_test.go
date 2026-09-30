@@ -1,122 +1,300 @@
-// +build requires_docker
+//go:build integration_backward_compatibility
 
 package integration
 
 import (
 	"fmt"
+	"path"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/integration/e2e"
 	e2edb "github.com/cortexproject/cortex/integration/e2e/db"
 	"github.com/cortexproject/cortex/integration/e2ecortex"
+	"github.com/cortexproject/cortex/pkg/storage/tsdb"
 )
+
+type versionsImagesFlags struct {
+	flagsForOldImage func(map[string]string) map[string]string
+	flagsForNewImage func(map[string]string) map[string]string
+}
 
 var (
 	// If you change the image tag, remember to update it in the preloading done
 	// by GitHub Actions too (see .github/workflows/test-build-deploy.yml).
-	previousVersionImages = map[string]func(map[string]string) map[string]string{
-		"quay.io/cortexproject/cortex:v1.0.0":  preCortex14Flags,
-		"quay.io/cortexproject/cortex:v1.1.0":  preCortex14Flags,
-		"quay.io/cortexproject/cortex:v1.2.0":  preCortex14Flags,
-		"quay.io/cortexproject/cortex:v1.3.0":  preCortex14Flags,
-		"quay.io/cortexproject/cortex:v1.4.0":  preCortex16Flags,
-		"quay.io/cortexproject/cortex:v1.5.0":  preCortex16Flags,
-		"quay.io/cortexproject/cortex:v1.6.0":  preCortex110Flags,
-		"quay.io/cortexproject/cortex:v1.7.0":  preCortex110Flags,
-		"quay.io/cortexproject/cortex:v1.8.0":  preCortex110Flags,
-		"quay.io/cortexproject/cortex:v1.9.0":  preCortex110Flags,
-		"quay.io/cortexproject/cortex:v1.10.0": nil,
+	// Per https://cortexmetrics.io/docs/configuration/v1guarantees/#flags-config-and-minor-version-upgrades,
+	// we only need to support backward compatibility for the last 3 minor versions.
+	previousVersionImages = map[string]*versionsImagesFlags{
+		"quay.io/cortexproject/cortex:v1.16.1": nil,
+		"quay.io/cortexproject/cortex:v1.17.2": nil,
+		"quay.io/cortexproject/cortex:v1.18.1": nil,
+		"quay.io/cortexproject/cortex:v1.19.1": nil,
+		"quay.io/cortexproject/cortex:v1.20.1": nil,
+		"quay.io/cortexproject/cortex:v1.21.0": nil,
+		"quay.io/cortexproject/cortex:v1.21.1": nil,
 	}
 )
 
-func preCortex14Flags(flags map[string]string) map[string]string {
-	return e2e.MergeFlagsWithoutRemovingEmpty(flags, map[string]string{
-		// Blocks storage CLI flags removed the "experimental" prefix in 1.4.
-		"-store-gateway.sharding-enabled":                 "",
-		"-store-gateway.sharding-ring.store":              "",
-		"-store-gateway.sharding-ring.consul.hostname":    "",
-		"-store-gateway.sharding-ring.replication-factor": "",
-		// Query-scheduler has been introduced in 1.6.0
-		"-frontend.scheduler-dns-lookup-period": "",
-		// Store-gateway "wait ring stability" has been introduced in 1.10.0
-		"-store-gateway.sharding-ring.wait-stability-min-duration": "",
-		"-store-gateway.sharding-ring.wait-stability-max-duration": "",
-	})
-}
-
-func preCortex16Flags(flags map[string]string) map[string]string {
-	return e2e.MergeFlagsWithoutRemovingEmpty(flags, map[string]string{
-		// Query-scheduler has been introduced in 1.6.0
-		"-frontend.scheduler-dns-lookup-period": "",
-		// Store-gateway "wait ring stability" has been introduced in 1.10.0
-		"-store-gateway.sharding-ring.wait-stability-min-duration": "",
-		"-store-gateway.sharding-ring.wait-stability-max-duration": "",
-	})
-}
-
-func preCortex110Flags(flags map[string]string) map[string]string {
-	return e2e.MergeFlagsWithoutRemovingEmpty(flags, map[string]string{
-		// Store-gateway "wait ring stability" has been introduced in 1.10.0
-		"-store-gateway.sharding-ring.wait-stability-min-duration": "",
-		"-store-gateway.sharding-ring.wait-stability-max-duration": "",
-	})
-}
-
-func TestBackwardCompatibilityWithChunksStorage(t *testing.T) {
-	for previousImage, flagsFn := range previousVersionImages {
+func TestBackwardCompatibilityWithBlocksStorage(t *testing.T) {
+	for previousImage, imagesFlags := range previousVersionImages {
 		t.Run(fmt.Sprintf("Backward compatibility upgrading from %s", previousImage), func(t *testing.T) {
-			flags := ChunksStorageFlags()
-			if flagsFn != nil {
-				flags = flagsFn(flags)
+			flags := blocksStorageFlagsWithFlushOnShutdown()
+			var flagsForNewImage func(map[string]string) map[string]string
+			if imagesFlags != nil {
+				if imagesFlags.flagsForOldImage != nil {
+					flags = imagesFlags.flagsForOldImage(flags)
+				}
+
+				if imagesFlags.flagsForNewImage != nil {
+					flagsForNewImage = imagesFlags.flagsForNewImage
+				}
 			}
 
-			runBackwardCompatibilityTestWithChunksStorage(t, previousImage, flags)
+			runBackwardCompatibilityTestWithBlocksStorage(t, previousImage, flags, flagsForNewImage)
 		})
 	}
 }
 
 func TestNewDistributorsCanPushToOldIngestersWithReplication(t *testing.T) {
-	for previousImage, flagsFn := range previousVersionImages {
+	for previousImage, imagesFlags := range previousVersionImages {
 		t.Run(fmt.Sprintf("Backward compatibility upgrading from %s", previousImage), func(t *testing.T) {
-			flags := ChunksStorageFlags()
-			if flagsFn != nil {
-				flags = flagsFn(flags)
+			flags := blocksStorageFlagsWithFlushOnShutdown()
+			var flagsForNewImage func(map[string]string) map[string]string
+			if imagesFlags != nil {
+				if imagesFlags.flagsForOldImage != nil {
+					flags = imagesFlags.flagsForOldImage(flags)
+				}
+
+				if imagesFlags.flagsForNewImage != nil {
+					flagsForNewImage = imagesFlags.flagsForNewImage
+				}
 			}
 
-			runNewDistributorsCanPushToOldIngestersWithReplication(t, previousImage, flags)
+			runNewDistributorsCanPushToOldIngestersWithReplication(t, previousImage, flags, flagsForNewImage)
 		})
 	}
 }
 
-func runBackwardCompatibilityTestWithChunksStorage(t *testing.T, previousImage string, flagsForOldImage map[string]string) {
+// Test for #6744. When the querier is running on an older version, while the ingester is running on a newer
+// version, the ingester should return all metadata.
+func TestMetadataAPIWhenDeployment(t *testing.T) {
+	oldImage := "quay.io/cortexproject/cortex:v1.19.0"
 	s, err := e2e.NewScenario(networkName)
 	require.NoError(t, err)
 	defer s.Close()
 
 	// Start dependencies.
-	dynamo := e2edb.NewDynamoDB()
+	consul := e2edb.NewConsulWithName("consul")
+	require.NoError(t, s.StartAndWaitReady(consul))
+
+	baseFlags := mergeFlags(AlertmanagerLocalFlags(), BlocksStorageFlags())
+
+	minio := e2edb.NewMinio(9000, baseFlags["-blocks-storage.s3.bucket-name"])
+	require.NoError(t, s.StartAndWaitReady(minio))
+
+	oldFlags := mergeFlags(baseFlags, map[string]string{
+		// alert manager
+		"-alertmanager.web.external-url": "http://localhost/alertmanager",
+		// consul
+		"-ring.store":      "consul",
+		"-consul.hostname": consul.NetworkHTTPEndpoint(),
+	})
+
+	newFlags := mergeFlags(oldFlags, map[string]string{
+		// ingester
+		"-ingester.skip-metadata-limits": "true",
+	})
+
+	// Start Cortex components
+	distributor := e2ecortex.NewDistributor("distributor", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), newFlags, "")
+	ingester := e2ecortex.NewIngester("ingester", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), newFlags, "")
+	querier := e2ecortex.NewQuerier("querier", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), oldFlags, oldImage)
+	require.NoError(t, s.StartAndWaitReady(distributor, ingester, querier))
+
+	// Wait until distributor has updated the ring.
+	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	// Wait until querier has updated the ring.
+	require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	client, err := e2ecortex.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", "user-1")
+	require.NoError(t, err)
+
+	metadataMetricNum := 5
+	metadataPerMetrics := 2
+	metadata := make([]prompb.MetricMetadata, 0, metadataMetricNum)
+	for i := range metadataMetricNum {
+		for j := range metadataPerMetrics {
+			metadata = append(metadata, prompb.MetricMetadata{
+				MetricFamilyName: fmt.Sprintf("metadata_name_%d", i),
+				Help:             fmt.Sprintf("metadata_help_%d_%d", i, j),
+				Unit:             fmt.Sprintf("metadata_unit_%d_%d", i, j),
+			})
+		}
+	}
+	res, err := client.Push(nil, metadata...)
+	require.NoError(t, err)
+	require.Equal(t, 200, res.StatusCode)
+
+	// should return all metadata regardless of the limit
+	maxLimit := metadataMetricNum * metadataPerMetrics
+	for i := -1; i <= maxLimit; i++ {
+		result, err := client.Metadata("", strconv.Itoa(i))
+		require.NoError(t, err)
+		require.Equal(t, metadataMetricNum, len(result))
+		for _, metadata := range result {
+			require.Equal(t, metadataPerMetrics, len(metadata))
+		}
+	}
+}
+
+// Test cortex which uses Prometheus v3.x can support holt_winters function
+func TestCanSupportHoltWintersFunc(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Start dependencies.
+	consul := e2edb.NewConsulWithName("consul")
+	require.NoError(t, s.StartAndWaitReady(consul))
+
+	flags := mergeFlags(
+		AlertmanagerLocalFlags(),
+		map[string]string{
+			"-store.engine":                                     blocksStorageEngine,
+			"-blocks-storage.backend":                           "filesystem",
+			"-blocks-storage.tsdb.head-compaction-interval":     "4m",
+			"-blocks-storage.tsdb.block-ranges-period":          "2h",
+			"-blocks-storage.tsdb.ship-interval":                "1h",
+			"-blocks-storage.bucket-store.sync-interval":        "15m",
+			"-blocks-storage.tsdb.retention-period":             "2h",
+			"-blocks-storage.bucket-store.index-cache.backend":  tsdb.IndexCacheBackendInMemory,
+			"-blocks-storage.bucket-store.bucket-index.enabled": "true",
+			// Ingester.
+			"-ring.store":      "consul",
+			"-consul.hostname": consul.NetworkHTTPEndpoint(),
+			// Distributor.
+			"-distributor.replication-factor": "1",
+			// Store-gateway.
+			"-store-gateway.sharding-enabled": "false",
+			// alert manager
+			"-alertmanager.web.external-url": "http://localhost/alertmanager",
+			// enable experimental promQL funcs
+			"-querier.enable-promql-experimental-functions": "true",
+		},
+	)
+	// make alert manager config dir
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
+
+	path := path.Join(s.SharedDir(), "cortex-1")
+
+	flags = mergeFlags(flags, map[string]string{"-blocks-storage.filesystem.dir": path})
+	// Start Cortex replicas.
+	cortex := e2ecortex.NewSingleBinary("cortex", flags, "")
+	require.NoError(t, s.StartAndWaitReady(cortex))
+
+	// Wait until Cortex replicas have updated the ring state.
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Equals(float64(512)), "cortex_ring_tokens_total"))
+
+	c, err := e2ecortex.NewClient(cortex.HTTPEndpoint(), cortex.HTTPEndpoint(), "", "", "user-1")
+	require.NoError(t, err)
+
+	now := time.Now()
+	// Push some series to Cortex.
+	start := now.Add(-time.Minute * 120)
+	end := now
+	scrapeInterval := 30 * time.Second
+
+	numSeries := 10
+	numSamples := 240
+	serieses := make([]prompb.TimeSeries, numSeries)
+	lbls := make([]labels.Labels, numSeries)
+	for i := range numSeries {
+		series := e2e.GenerateSeriesWithSamples("test_series", start, scrapeInterval, i*numSamples, numSamples, prompb.Label{Name: "job", Value: "test"}, prompb.Label{Name: "series", Value: strconv.Itoa(i)})
+		serieses[i] = series
+
+		builder := labels.NewBuilder(labels.EmptyLabels())
+		for _, lbl := range series.Labels {
+			builder.Set(lbl.Name, lbl.Value)
+		}
+		lbls[i] = builder.Labels()
+	}
+
+	res, err := c.Push(serieses)
+	require.NoError(t, err)
+	require.Equal(t, 200, res.StatusCode)
+
+	// Test holt_winters range query
+	hQuery := "holt_winters(test_series[2h], 0.5, 0.5)"
+	hRangeResult, err := c.QueryRange(hQuery, start, end, scrapeInterval)
+	require.NoError(t, err)
+	hMatrix, ok := hRangeResult.(model.Matrix)
+	require.True(t, ok)
+	require.True(t, hMatrix.Len() > 0)
+
+	// Test holt_winters instant query
+	hInstantResult, err := c.Query(hQuery, now)
+	require.NoError(t, err)
+	hVector, ok := hInstantResult.(model.Vector)
+	require.True(t, ok)
+	require.True(t, hVector.Len() > 0)
+
+	// Test double_exponential_smoothing range query
+	dQuery := "double_exponential_smoothing(test_series[2h], 0.5, 0.5)"
+	dRangeResult, err := c.QueryRange(dQuery, start, end, scrapeInterval)
+	require.NoError(t, err)
+	dMatrix, ok := dRangeResult.(model.Matrix)
+	require.True(t, ok)
+	require.True(t, dMatrix.Len() > 0)
+
+	// Test double_exponential_smoothing instant query
+	dInstantResult, err := c.Query(dQuery, now)
+	require.NoError(t, err)
+	dVector, ok := dInstantResult.(model.Vector)
+	require.True(t, ok)
+	require.True(t, dVector.Len() > 0)
+
+	// compare lengths of query results
+	require.True(t, hMatrix.Len() == dMatrix.Len())
+	require.True(t, hVector.Len() == dVector.Len())
+}
+
+func blocksStorageFlagsWithFlushOnShutdown() map[string]string {
+	return mergeFlags(BlocksStorageFlags(), map[string]string{
+		"-blocks-storage.tsdb.flush-blocks-on-shutdown": "true",
+	})
+}
+
+func runBackwardCompatibilityTestWithBlocksStorage(t *testing.T, previousImage string, flagsForOldImage map[string]string, flagsForNewImageFn func(map[string]string) map[string]string) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Start dependencies.
+	minio := e2edb.NewMinio(9000, flagsForOldImage["-blocks-storage.s3.bucket-name"])
 	consul := e2edb.NewConsul()
-	require.NoError(t, s.StartAndWaitReady(dynamo, consul))
+	require.NoError(t, s.StartAndWaitReady(minio, consul))
 
-	require.NoError(t, writeFileToSharedDir(s, cortexSchemaConfigFile, []byte(cortexSchemaConfigYaml)))
+	flagsForNewImage := blocksStorageFlagsWithFlushOnShutdown()
 
-	// Start Cortex table-manager (running on current version since the backward compatibility
-	// test is about testing a rolling update of other services).
-	tableManager := e2ecortex.NewTableManager("table-manager", ChunksStorageFlags(), "")
-	require.NoError(t, s.StartAndWaitReady(tableManager))
-
-	// Wait until the first table-manager sync has completed, so that we're
-	// sure the tables have been created.
-	require.NoError(t, tableManager.WaitSumMetrics(e2e.Greater(0), "cortex_table_manager_sync_success_timestamp_seconds"))
+	if flagsForNewImageFn != nil {
+		flagsForNewImage = flagsForNewImageFn(flagsForNewImage)
+	}
 
 	// Start other Cortex components (ingester running on previous version).
-	ingester1 := e2ecortex.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), flagsForOldImage, previousImage)
-	distributor := e2ecortex.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), ChunksStorageFlags(), "")
+	ingester1 := e2ecortex.NewIngester("ingester-1", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flagsForOldImage, previousImage)
+	distributor := e2ecortex.NewDistributor("distributor", "consul", consul.NetworkHTTPEndpoint(), flagsForNewImage, "")
 	require.NoError(t, s.StartAndWaitReady(distributor, ingester1))
 
 	// Wait until the distributor has updated the ring.
@@ -133,21 +311,20 @@ func runBackwardCompatibilityTestWithChunksStorage(t *testing.T, previousImage s
 	require.NoError(t, err)
 	require.Equal(t, 200, res.StatusCode)
 
-	ingester2 := e2ecortex.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), mergeFlags(ChunksStorageFlags(), map[string]string{
+	ingester2 := e2ecortex.NewIngester("ingester-2", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), mergeFlags(flagsForNewImage, map[string]string{
 		"-ingester.join-after": "10s",
 	}), "")
-	// Start ingester-2 on new version, to ensure the transfer is backward compatible.
 	require.NoError(t, s.Start(ingester2))
 
 	// Stop ingester-1. This function will return once the ingester-1 is successfully
-	// stopped, which means the transfer to ingester-2 is completed.
+	// stopped, which means it has uploaded all its data to the object store.
 	require.NoError(t, s.Stop(ingester1))
 
 	checkQueries(t, consul,
 		expectedVector,
 		previousImage,
 		flagsForOldImage,
-		ChunksStorageFlags(),
+		flagsForNewImage,
 		now,
 		s,
 		1,
@@ -155,36 +332,29 @@ func runBackwardCompatibilityTestWithChunksStorage(t *testing.T, previousImage s
 }
 
 // Check for issues like https://github.com/cortexproject/cortex/issues/2356
-func runNewDistributorsCanPushToOldIngestersWithReplication(t *testing.T, previousImage string, flagsForPreviousImage map[string]string) {
+func runNewDistributorsCanPushToOldIngestersWithReplication(t *testing.T, previousImage string, flagsForPreviousImage map[string]string, flagsForNewImageFn func(map[string]string) map[string]string) {
 	s, err := e2e.NewScenario(networkName)
 	require.NoError(t, err)
 	defer s.Close()
 
 	// Start dependencies.
-	dynamo := e2edb.NewDynamoDB()
+	minio := e2edb.NewMinio(9000, flagsForPreviousImage["-blocks-storage.s3.bucket-name"])
 	consul := e2edb.NewConsul()
-	require.NoError(t, s.StartAndWaitReady(dynamo, consul))
+	require.NoError(t, s.StartAndWaitReady(minio, consul))
 
-	flagsForNewImage := mergeFlags(ChunksStorageFlags(), map[string]string{
+	flagsForNewImage := mergeFlags(blocksStorageFlagsWithFlushOnShutdown(), map[string]string{
 		"-distributor.replication-factor": "3",
 	})
 
-	require.NoError(t, writeFileToSharedDir(s, cortexSchemaConfigFile, []byte(cortexSchemaConfigYaml)))
-
-	// Start Cortex table-manager (running on current version since the backward compatibility
-	// test is about testing a rolling update of other services).
-	tableManager := e2ecortex.NewTableManager("table-manager", ChunksStorageFlags(), "")
-	require.NoError(t, s.StartAndWaitReady(tableManager))
-
-	// Wait until the first table-manager sync has completed, so that we're
-	// sure the tables have been created.
-	require.NoError(t, tableManager.WaitSumMetrics(e2e.Greater(0), "cortex_table_manager_sync_success_timestamp_seconds"))
+	if flagsForNewImageFn != nil {
+		flagsForNewImage = flagsForNewImageFn(flagsForNewImage)
+	}
 
 	// Start other Cortex components (ingester running on previous version).
-	ingester1 := e2ecortex.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), flagsForPreviousImage, previousImage)
-	ingester2 := e2ecortex.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), flagsForPreviousImage, previousImage)
-	ingester3 := e2ecortex.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), flagsForPreviousImage, previousImage)
-	distributor := e2ecortex.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flagsForNewImage, "")
+	ingester1 := e2ecortex.NewIngester("ingester-1", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flagsForPreviousImage, previousImage)
+	ingester2 := e2ecortex.NewIngester("ingester-2", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flagsForPreviousImage, previousImage)
+	ingester3 := e2ecortex.NewIngester("ingester-3", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flagsForPreviousImage, previousImage)
+	distributor := e2ecortex.NewDistributor("distributor", "consul", consul.NetworkHTTPEndpoint(), flagsForNewImage, "")
 	require.NoError(t, s.StartAndWaitReady(distributor, ingester1, ingester2, ingester3))
 
 	// Wait until the distributor has updated the ring.
@@ -227,23 +397,44 @@ func checkQueries(
 		queryFrontendFlags map[string]string
 		querierImage       string
 		querierFlags       map[string]string
+		storeGatewayImage  string
+		storeGatewayFlags  map[string]string
 	}{
-		"old query-frontend, new querier": {
+		"old query-frontend, new querier, old store-gateway": {
 			queryFrontendImage: previousImage,
 			queryFrontendFlags: flagsForOldImage,
 			querierImage:       "",
 			querierFlags:       flagsForNewImage,
+			storeGatewayImage:  previousImage,
+			storeGatewayFlags:  flagsForOldImage,
 		},
-		"new query-frontend, old querier": {
+		"new query-frontend, old querier, new store-gateway": {
 			queryFrontendImage: "",
 			queryFrontendFlags: flagsForNewImage,
 			querierImage:       previousImage,
 			querierFlags:       flagsForOldImage,
+			storeGatewayImage:  "",
+			storeGatewayFlags:  flagsForNewImage,
 		},
 	}
 
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
+			// Start compactor to create the bucket index.
+			compactor := e2ecortex.NewCompactor("compactor", consul.NetworkHTTPEndpoint(), c.storeGatewayFlags, c.storeGatewayImage)
+			require.NoError(t, s.StartAndWaitReady(compactor))
+			defer func() {
+				require.NoError(t, s.Stop(compactor))
+			}()
+
+			// Start store gateway.
+			storeGateway := e2ecortex.NewStoreGateway("store-gateway", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), c.storeGatewayFlags, c.storeGatewayImage)
+
+			require.NoError(t, s.Start(storeGateway))
+			defer func() {
+				require.NoError(t, s.Stop(storeGateway))
+			}()
+
 			// Start query-frontend.
 			queryFrontend := e2ecortex.NewQueryFrontend("query-frontend", c.queryFrontendFlags, c.queryFrontendImage)
 			require.NoError(t, s.Start(queryFrontend))
@@ -252,7 +443,7 @@ func checkQueries(
 			}()
 
 			// Start querier.
-			querier := e2ecortex.NewQuerier("querier", consul.NetworkHTTPEndpoint(), e2e.MergeFlagsWithoutRemovingEmpty(c.querierFlags, map[string]string{
+			querier := e2ecortex.NewQuerier("querier", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), e2e.MergeFlagsWithoutRemovingEmpty(c.querierFlags, map[string]string{
 				"-querier.frontend-address": queryFrontend.NetworkGRPCEndpoint(),
 			}), c.querierImage)
 
@@ -262,8 +453,21 @@ func checkQueries(
 			}()
 
 			// Wait until querier and query-frontend are ready, and the querier has updated the ring.
-			require.NoError(t, s.WaitReady(querier, queryFrontend))
-			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(float64(numIngesters*512)), "cortex_ring_tokens_total"))
+			require.NoError(t, s.WaitReady(querier, queryFrontend, storeGateway))
+			expectedTokens := float64((numIngesters + 1) * 512) // Ingesters and Store Gateway.
+			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(expectedTokens), "cortex_ring_tokens_total"))
+			require.NoError(t, storeGateway.WaitSumMetrics(e2e.Greater(0), "cortex_storegateway_bucket_sync_total"))
+
+			// Wait store-gateways and ingesters appears on querier ring
+			require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+				labels.MustNewMatcher(labels.MatchEqual, "name", "store-gateway-client"),
+				labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"),
+			)))
+
+			require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Greater(0), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+				labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+				labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"),
+			)))
 
 			// Query the series.
 			for _, endpoint := range []string{queryFrontend.HTTPEndpoint(), querier.HTTPEndpoint()} {

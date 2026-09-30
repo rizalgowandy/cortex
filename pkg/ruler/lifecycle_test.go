@@ -2,18 +2,17 @@ package ruler
 
 import (
 	"context"
-	"sort"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/kv"
-	"github.com/grafana/dskit/kv/consul"
-	"github.com/grafana/dskit/ring"
-	"github.com/grafana/dskit/services"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
 )
 
@@ -21,11 +20,10 @@ import (
 func TestRulerShutdown(t *testing.T) {
 	ctx := context.Background()
 
-	config, cleanup := defaultRulerConfig(t, newMockRuleStore(mockRules))
-	defer cleanup()
+	store := newMockRuleStore(mockRules, nil)
+	config := defaultRulerConfig(t)
 
-	r, rcleanup := buildRuler(t, config, nil, nil)
-	defer rcleanup()
+	r, _ := buildRuler(t, config, nil, store, nil)
 
 	r.cfg.EnableSharding = true
 	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
@@ -38,8 +36,8 @@ func TestRulerShutdown(t *testing.T) {
 	defer services.StopAndAwaitTerminated(ctx, r) //nolint:errcheck
 
 	// Wait until the tokens are registered in the ring
-	test.Poll(t, 100*time.Millisecond, config.Ring.NumTokens, func() interface{} {
-		return numTokens(ringStore, "localhost", ring.RulerRingKey)
+	test.Poll(t, 100*time.Millisecond, config.Ring.NumTokens, func() any {
+		return numTokens(ringStore, "localhost", ringKey)
 	})
 
 	require.Equal(t, ring.ACTIVE, r.lifecycler.GetState())
@@ -47,8 +45,8 @@ func TestRulerShutdown(t *testing.T) {
 	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), r))
 
 	// Wait until the tokens are unregistered from the ring
-	test.Poll(t, 100*time.Millisecond, 0, func() interface{} {
-		return numTokens(ringStore, "localhost", ring.RulerRingKey)
+	test.Poll(t, 100*time.Millisecond, 0, func() any {
+		return numTokens(ringStore, "localhost", ringKey)
 	})
 }
 
@@ -57,10 +55,9 @@ func TestRuler_RingLifecyclerShouldAutoForgetUnhealthyInstances(t *testing.T) {
 	const heartbeatTimeout = time.Minute
 
 	ctx := context.Background()
-	config, cleanup := defaultRulerConfig(t, newMockRuleStore(mockRules))
-	defer cleanup()
-	r, rcleanup := buildRuler(t, config, nil, nil)
-	defer rcleanup()
+	store := newMockRuleStore(mockRules, nil)
+	config := defaultRulerConfig(t)
+	r, _ := buildRuler(t, config, nil, store, nil)
 	r.cfg.EnableSharding = true
 	r.cfg.Ring.HeartbeatPeriod = 100 * time.Millisecond
 	r.cfg.Ring.HeartbeatTimeout = heartbeatTimeout
@@ -75,10 +72,11 @@ func TestRuler_RingLifecyclerShouldAutoForgetUnhealthyInstances(t *testing.T) {
 	defer services.StopAndAwaitTerminated(ctx, r) //nolint:errcheck
 
 	// Add an unhealthy instance to the ring.
-	require.NoError(t, ringStore.CAS(ctx, ring.RulerRingKey, func(in interface{}) (interface{}, bool, error) {
+	tg := ring.NewRandomTokenGenerator()
+	require.NoError(t, ringStore.CAS(ctx, ringKey, func(in any) (any, bool, error) {
 		ringDesc := ring.GetOrCreateRingDesc(in)
 
-		instance := ringDesc.AddIngester(unhealthyInstanceID, "1.1.1.1", "", generateSortedTokens(config.Ring.NumTokens), ring.ACTIVE, time.Now())
+		instance := ringDesc.AddIngester(unhealthyInstanceID, "1.1.1.1", "", tg.GenerateTokens(ringDesc, unhealthyInstanceID, "", config.Ring.NumTokens, true), ring.ACTIVE, time.Now())
 		instance.Timestamp = time.Now().Add(-(ringAutoForgetUnhealthyPeriods + 1) * heartbeatTimeout).Unix()
 		ringDesc.Ingesters[unhealthyInstanceID] = instance
 
@@ -86,8 +84,8 @@ func TestRuler_RingLifecyclerShouldAutoForgetUnhealthyInstances(t *testing.T) {
 	}))
 
 	// Ensure the unhealthy instance is removed from the ring.
-	test.Poll(t, time.Second*5, false, func() interface{} {
-		d, err := ringStore.Get(ctx, ring.RulerRingKey)
+	test.Poll(t, time.Second*5, false, func() any {
+		d, err := ringStore.Get(ctx, ringKey)
 		if err != nil {
 			return err
 		}
@@ -95,17 +93,6 @@ func TestRuler_RingLifecyclerShouldAutoForgetUnhealthyInstances(t *testing.T) {
 		_, ok := ring.GetOrCreateRingDesc(d).Ingesters[unhealthyInstanceID]
 		return ok
 	})
-}
-
-func generateSortedTokens(numTokens int) ring.Tokens {
-	tokens := ring.GenerateTokens(numTokens, nil)
-
-	// Ensure generated tokens are sorted.
-	sort.Slice(tokens, func(i, j int) bool {
-		return tokens[i] < tokens[j]
-	})
-
-	return ring.Tokens(tokens)
 }
 
 // numTokens determines the number of tokens owned by the specified

@@ -3,16 +3,14 @@ package querier
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/services"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -20,15 +18,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketindex"
-	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/util/testutil"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 func TestBucketScanBlocksFinder_InitialScan(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, bucket, _, reg := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
 
@@ -39,7 +40,7 @@ func TestBucketScanBlocksFinder_InitialScan(t *testing.T) {
 
 	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 
-	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(blocks))
 	assert.Equal(t, user1Block2.ULID, blocks[0].ID)
@@ -48,7 +49,7 @@ func TestBucketScanBlocksFinder_InitialScan(t *testing.T) {
 	assert.WithinDuration(t, time.Now(), blocks[1].GetUploadedAt(), 5*time.Second)
 	assert.Empty(t, deletionMarks)
 
-	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-2", 0, 30)
+	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-2", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(blocks))
 	assert.Equal(t, user2Block1.ULID, blocks[0].ID)
@@ -79,18 +80,21 @@ func TestBucketScanBlocksFinder_InitialScan(t *testing.T) {
 }
 
 func TestBucketScanBlocksFinder_InitialScanFailure(t *testing.T) {
-	cacheDir, err := ioutil.TempDir(os.TempDir(), "blocks-scanner-test-cache")
-	require.NoError(t, err)
-	defer os.RemoveAll(cacheDir) //nolint: errcheck
-
+	t.Parallel()
 	ctx := context.Background()
 	bucket := &bucket.ClientMock{}
 	reg := prometheus.NewPedanticRegistry()
 
 	cfg := prepareBucketScanBlocksFinderConfig()
-	cfg.CacheDir = cacheDir
+	cfg.CacheDir = t.TempDir()
 
-	s := NewBucketScanBlocksFinder(cfg, bucket, nil, log.NewNopLogger(), reg)
+	usersScanner, err := users.NewScanner(users.UsersScannerConfig{
+		Strategy:       users.UserScanStrategyList,
+		MaxStalePeriod: time.Hour,
+		CacheTTL:       0,
+	}, bucket, log.NewNopLogger(), reg)
+	require.NoError(t, err)
+	s := NewBucketScanBlocksFinder(cfg, usersScanner, bucket, nil, log.NewNopLogger(), reg)
 	defer func() {
 		s.StopAsync()
 		s.AwaitTerminated(context.Background()) //nolint: errcheck
@@ -98,14 +102,16 @@ func TestBucketScanBlocksFinder_InitialScanFailure(t *testing.T) {
 
 	// Mock the storage to simulate a failure when reading objects.
 	bucket.MockIter("", []string{"user-1"}, nil)
-	bucket.MockIter("user-1/", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D"}, nil)
-	bucket.MockExists(path.Join("user-1", cortex_tsdb.TenantDeletionMarkPath), false, nil)
+	bucket.MockIter("__markers__", []string{}, nil)
+	bucket.MockIter("user-1/", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json"}, nil)
+	bucket.MockExists(users.GetGlobalDeletionMarkPath("user-1"), false, nil)
+	bucket.MockExists(users.GetLocalDeletionMarkPath("user-1"), false, nil)
 	bucket.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", "invalid", errors.New("mocked error"))
 
 	require.NoError(t, s.StartAsync(ctx))
 	require.Error(t, s.AwaitRunning(ctx))
 
-	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	assert.Equal(t, errBucketScanBlocksFinderNotRunning, err)
 	assert.Nil(t, blocks)
 	assert.Nil(t, deletionMarks)
@@ -135,28 +141,35 @@ func TestBucketScanBlocksFinder_InitialScanFailure(t *testing.T) {
 }
 
 func TestBucketScanBlocksFinder_StopWhileRunningTheInitialScanOnManyTenants(t *testing.T) {
+	t.Parallel()
+
 	tenantIDs := []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
 
 	// Mock the bucket to introduce a 1s sleep while iterating each tenant in the bucket.
 	bucket := &bucket.ClientMock{}
 	bucket.MockIter("", tenantIDs, nil)
+	bucket.MockIter("__markers__", []string{}, nil)
 	for _, tenantID := range tenantIDs {
 		bucket.MockIterWithCallback(tenantID+"/", []string{}, nil, func() {
 			time.Sleep(time.Second)
 		})
-		bucket.MockExists(path.Join(tenantID, cortex_tsdb.TenantDeletionMarkPath), false, nil)
+		bucket.MockExists(users.GetGlobalDeletionMarkPath(tenantID), false, nil)
+		bucket.MockExists(users.GetLocalDeletionMarkPath(tenantID), false, nil)
 	}
 
-	cacheDir, err := ioutil.TempDir(os.TempDir(), "blocks-scanner-test-cache")
-	require.NoError(t, err)
-	defer os.RemoveAll(cacheDir)
-
 	cfg := prepareBucketScanBlocksFinderConfig()
-	cfg.CacheDir = cacheDir
+	cfg.CacheDir = t.TempDir()
 	cfg.MetasConcurrency = 1
 	cfg.TenantsConcurrency = 1
 
-	s := NewBucketScanBlocksFinder(cfg, bucket, nil, log.NewLogfmtLogger(os.Stdout), nil)
+	reg := prometheus.NewRegistry()
+	usersScanner, err := users.NewScanner(users.UsersScannerConfig{
+		Strategy:       users.UserScanStrategyList,
+		MaxStalePeriod: time.Hour,
+		CacheTTL:       0,
+	}, bucket, log.NewNopLogger(), reg)
+	require.NoError(t, err)
+	s := NewBucketScanBlocksFinder(cfg, usersScanner, bucket, nil, log.NewLogfmtLogger(os.Stdout), reg)
 
 	// Start the scanner, let it run for 1s and then issue a stop.
 	require.NoError(t, s.StartAsync(context.Background()))
@@ -171,6 +184,8 @@ func TestBucketScanBlocksFinder_StopWhileRunningTheInitialScanOnManyTenants(t *t
 }
 
 func TestBucketScanBlocksFinder_StopWhileRunningTheInitialScanOnManyBlocks(t *testing.T) {
+	t.Parallel()
+
 	var blockPaths []string
 	for i := 1; i <= 10; i++ {
 		blockPaths = append(blockPaths, "user-1/"+ulid.MustNew(uint64(i), nil).String())
@@ -179,22 +194,26 @@ func TestBucketScanBlocksFinder_StopWhileRunningTheInitialScanOnManyBlocks(t *te
 	// Mock the bucket to introduce a 1s sleep while syncing each block in the bucket.
 	bucket := &bucket.ClientMock{}
 	bucket.MockIter("", []string{"user-1"}, nil)
+	bucket.MockIter("__markers__", []string{}, nil)
 	bucket.MockIter("user-1/", blockPaths, nil)
 	bucket.On("Exists", mock.Anything, mock.Anything).Return(false, nil).Run(func(args mock.Arguments) {
 		// We return the meta.json doesn't exist, but introduce a 1s delay for each call.
 		time.Sleep(time.Second)
 	})
 
-	cacheDir, err := ioutil.TempDir(os.TempDir(), "blocks-scanner-test-cache")
-	require.NoError(t, err)
-	defer os.RemoveAll(cacheDir)
-
 	cfg := prepareBucketScanBlocksFinderConfig()
-	cfg.CacheDir = cacheDir
+	cfg.CacheDir = t.TempDir()
 	cfg.MetasConcurrency = 1
 	cfg.TenantsConcurrency = 1
 
-	s := NewBucketScanBlocksFinder(cfg, bucket, nil, log.NewLogfmtLogger(os.Stdout), nil)
+	reg := prometheus.NewRegistry()
+	usersScanner, err := users.NewScanner(users.UsersScannerConfig{
+		Strategy:       users.UserScanStrategyList,
+		MaxStalePeriod: time.Hour,
+		CacheTTL:       0,
+	}, bucket, log.NewNopLogger(), reg)
+	require.NoError(t, err)
+	s := NewBucketScanBlocksFinder(cfg, usersScanner, bucket, nil, log.NewLogfmtLogger(os.Stdout), reg)
 
 	// Start the scanner, let it run for 1s and then issue a stop.
 	require.NoError(t, s.StartAsync(context.Background()))
@@ -209,12 +228,13 @@ func TestBucketScanBlocksFinder_StopWhileRunningTheInitialScanOnManyBlocks(t *te
 }
 
 func TestBucketScanBlocksFinder_PeriodicScanFindsNewUser(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
 
 	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 
-	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 0, len(blocks))
 	assert.Empty(t, deletionMarks)
@@ -226,7 +246,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsNewUser(t *testing.T) {
 	// Trigger a periodic sync
 	require.NoError(t, s.scan(ctx))
 
-	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(blocks))
 	assert.Equal(t, block2.ULID, blocks[0].ID)
@@ -239,6 +259,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsNewUser(t *testing.T) {
 }
 
 func TestBucketScanBlocksFinder_PeriodicScanFindsNewBlock(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
 
@@ -246,7 +267,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsNewBlock(t *testing.T) {
 
 	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 
-	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(blocks))
 	assert.Equal(t, block1.ULID, blocks[0].ID)
@@ -258,7 +279,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsNewBlock(t *testing.T) {
 	// Trigger a periodic sync
 	require.NoError(t, s.scan(ctx))
 
-	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(blocks))
 	assert.Equal(t, block2.ULID, blocks[0].ID)
@@ -269,6 +290,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsNewBlock(t *testing.T) {
 }
 
 func TestBucketScanBlocksFinder_PeriodicScanFindsBlockMarkedForDeletion(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
 
@@ -277,7 +299,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsBlockMarkedForDeletion(t *testi
 
 	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 
-	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(blocks))
 	assert.Equal(t, block2.ULID, blocks[0].ID)
@@ -289,7 +311,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsBlockMarkedForDeletion(t *testi
 	// Trigger a periodic sync
 	require.NoError(t, s.scan(ctx))
 
-	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(blocks))
 	assert.Equal(t, block2.ULID, blocks[0].ID)
@@ -300,6 +322,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsBlockMarkedForDeletion(t *testi
 }
 
 func TestBucketScanBlocksFinder_PeriodicScanFindsDeletedBlock(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
 
@@ -308,7 +331,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsDeletedBlock(t *testing.T) {
 
 	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 
-	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(blocks))
 	assert.Equal(t, block2.ULID, blocks[0].ID)
@@ -320,7 +343,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsDeletedBlock(t *testing.T) {
 	// Trigger a periodic sync
 	require.NoError(t, s.scan(ctx))
 
-	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(blocks))
 	assert.Equal(t, block2.ULID, blocks[0].ID)
@@ -328,6 +351,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsDeletedBlock(t *testing.T) {
 }
 
 func TestBucketScanBlocksFinder_PeriodicScanFindsDeletedUser(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
 
@@ -336,7 +360,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsDeletedUser(t *testing.T) {
 
 	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 
-	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(blocks))
 	assert.Equal(t, block2.ULID, blocks[0].ID)
@@ -348,13 +372,14 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsDeletedUser(t *testing.T) {
 	// Trigger a periodic sync
 	require.NoError(t, s.scan(ctx))
 
-	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30)
+	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 30, nil)
 	require.NoError(t, err)
 	require.Equal(t, 0, len(blocks))
 	assert.Empty(t, deletionMarks)
 }
 
 func TestBucketScanBlocksFinder_PeriodicScanFindsUserWhichWasPreviouslyDeleted(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
 
@@ -363,7 +388,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsUserWhichWasPreviouslyDeleted(t
 
 	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 
-	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 40)
+	blocks, deletionMarks, err := s.GetBlocks(ctx, "user-1", 0, 40, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(blocks))
 	assert.Equal(t, block2.ULID, blocks[0].ID)
@@ -375,7 +400,7 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsUserWhichWasPreviouslyDeleted(t
 	// Trigger a periodic sync
 	require.NoError(t, s.scan(ctx))
 
-	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 40)
+	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 40, nil)
 	require.NoError(t, err)
 	require.Equal(t, 0, len(blocks))
 	assert.Empty(t, deletionMarks)
@@ -385,21 +410,222 @@ func TestBucketScanBlocksFinder_PeriodicScanFindsUserWhichWasPreviouslyDeleted(t
 	// Trigger a periodic sync
 	require.NoError(t, s.scan(ctx))
 
-	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 40)
+	blocks, deletionMarks, err = s.GetBlocks(ctx, "user-1", 0, 40, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(blocks))
 	assert.Equal(t, block3.ULID, blocks[0].ID)
 	assert.Empty(t, deletionMarks)
 }
 
-func TestBucketScanBlocksFinder_GetBlocks(t *testing.T) {
+func TestBucketScanBlocksFinder_PeriodicScanEvictsDeletedUserFetcher(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, bucket, _, reg := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
+
+	cortex_testutil.MockStorageBlock(t, bucket, "user-1", 10, 20)
+	cortex_testutil.MockStorageBlock(t, bucket, "user-1", 20, 30)
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
+
+	// The initial scan must have created and cached a per-tenant metadata fetcher, registered a
+	// per-tenant Prometheus registry, and created an on-disk meta cache for the active tenant.
+	s.fetchersMx.Lock()
+	require.Equal(t, 1, len(s.fetchers))
+	s.fetchersMx.Unlock()
+
+	userCacheDir := filepath.Join(s.cfg.CacheDir, "user-1")
+	metaSyncerDir := filepath.Join(userCacheDir, metaSyncerCacheDirName)
+	require.DirExists(t, metaSyncerDir)
+
+	// The per-tenant registry contributes to the aggregated cortex_blocks_meta_synced gauge.
+	syncedBefore, err := testutil.GatherAndCount(reg, "cortex_blocks_meta_synced")
+	require.NoError(t, err)
+	require.Greater(t, syncedBefore, 0)
+
+	// Delete the user from the bucket so it is no longer active.
+	require.NoError(t, bucket.Delete(ctx, "user-1"))
+
+	// Trigger a periodic scan.
+	require.NoError(t, s.scan(ctx))
+
+	// Once the user is no longer active, its cached fetcher, per-tenant Prometheus registry and
+	// on-disk meta cache must all be released, otherwise they leak for the lifetime of the process.
+	s.fetchersMx.Lock()
+	assert.Equal(t, 0, len(s.fetchers))
+	s.fetchersMx.Unlock()
+
+	// The fetcher's own meta-syncer cache must be removed; the now-empty parent dir is then
+	// removed on a best-effort basis.
+	assert.NoDirExists(t, metaSyncerDir)
+	assert.NoDirExists(t, userCacheDir)
+
+	// The per-tenant registry was unregistered, so its gauge series no longer appear.
+	syncedAfter, err := testutil.GatherAndCount(reg, "cortex_blocks_meta_synced")
+	require.NoError(t, err)
+	assert.Equal(t, 0, syncedAfter)
+}
+
+func TestBucketScanBlocksFinder_PeriodicScanEvictsOnlyInactiveUserFetchers(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
 
+	cortex_testutil.MockStorageBlock(t, bucket, "user-1", 10, 20)
+	cortex_testutil.MockStorageBlock(t, bucket, "user-2", 10, 20)
+	cortex_testutil.MockStorageBlock(t, bucket, "user-3", 10, 20)
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
+
+	s.fetchersMx.Lock()
+	require.Equal(t, 3, len(s.fetchers))
+	s.fetchersMx.Unlock()
+
+	// Delete only user-2.
+	require.NoError(t, bucket.Delete(ctx, "user-2"))
+	require.NoError(t, s.scan(ctx))
+
+	// Only the inactive tenant's fetcher is evicted; the active tenants' fetchers are retained.
+	s.fetchersMx.Lock()
+	_, has1 := s.fetchers["user-1"]
+	_, has2 := s.fetchers["user-2"]
+	_, has3 := s.fetchers["user-3"]
+	require.Equal(t, 2, len(s.fetchers))
+	s.fetchersMx.Unlock()
+	assert.True(t, has1)
+	assert.False(t, has2)
+	assert.True(t, has3)
+
+	// A returning tenant gets its fetcher re-created on the next scan.
+	cortex_testutil.MockStorageBlock(t, bucket, "user-2", 20, 30)
+	require.NoError(t, s.scan(ctx))
+
+	s.fetchersMx.Lock()
+	_, has2 = s.fetchers["user-2"]
+	require.Equal(t, 3, len(s.fetchers))
+	s.fetchersMx.Unlock()
+	assert.True(t, has2)
+}
+
+// failUserBucket makes the per-tenant block listing fail for a single user, so that scanning that
+// user returns an error (resErrs != 0) while the top-level user listing used by ScanUsers (Iter
+// with an empty prefix) still succeeds.
+type failUserBucket struct {
+	objstore.InstrumentedBucket
+	failUser string
+}
+
+func (b *failUserBucket) Iter(ctx context.Context, dir string, f func(string) error, options ...objstore.IterOption) error {
+	if strings.HasPrefix(dir, b.failUser) {
+		return errors.New("injected listing failure")
+	}
+	return b.InstrumentedBucket.Iter(ctx, dir, f, options...)
+}
+
+func (b *failUserBucket) IterWithAttributes(ctx context.Context, dir string, f func(objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	if strings.HasPrefix(dir, b.failUser) {
+		return errors.New("injected listing failure")
+	}
+	return b.InstrumentedBucket.IterWithAttributes(ctx, dir, f, options...)
+}
+
+func (b *failUserBucket) WithExpectedErrs(objstore.IsOpFailureExpectedFunc) objstore.Bucket {
+	return b
+}
+
+func (b *failUserBucket) ReaderWithExpectedErrs(objstore.IsOpFailureExpectedFunc) objstore.BucketReader {
+	return b
+}
+
+func TestBucketScanBlocksFinder_PeriodicScanEvictsInactiveUserDespiteOtherTenantScanError(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
+	wrapped := &failUserBucket{InstrumentedBucket: bkt, failUser: "user-2"}
+
+	cfg := prepareBucketScanBlocksFinderConfig()
+	cfg.CacheDir = t.TempDir()
+	usersScanner, err := users.NewScanner(users.UsersScannerConfig{
+		Strategy:       users.UserScanStrategyList,
+		MaxStalePeriod: time.Hour,
+		CacheTTL:       0,
+	}, wrapped, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+
+	s := NewBucketScanBlocksFinder(cfg, usersScanner, wrapped, nil, log.NewNopLogger(), nil)
+	t.Cleanup(func() {
+		s.StopAsync()
+		require.NoError(t, s.AwaitTerminated(context.Background()))
+	})
+
+	// Only user-1 is active at startup, so the initial scan succeeds and caches its fetcher.
+	cortex_testutil.MockStorageBlock(t, bkt, "user-1", 10, 20)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
+
+	s.fetchersMx.Lock()
+	require.Equal(t, 1, len(s.fetchers))
+	s.fetchersMx.Unlock()
+
+	// Introduce an active-but-erroring tenant and delete user-1.
+	cortex_testutil.MockStorageBlock(t, bkt, "user-2", 10, 20)
+	require.NoError(t, bkt.Delete(ctx, "user-1"))
+
+	// This scan collects a per-tenant error for user-2 (resErrs != 0). The failing tenant is
+	// retried with the finder's hardcoded backoff, so this scan takes a few seconds; that cost is
+	// intrinsic and must not be "optimised" with a short-deadline context, which would cancel the
+	// context and make scanBucket skip eviction entirely (eviction is gated on ctx.Err() == nil).
+	require.Error(t, s.scanBucket(ctx))
+
+	// ...but eviction is decoupled from per-tenant scan errors, so the now-inactive user-1 is still
+	// evicted while the erroring (but still active) user-2 is retained.
+	s.fetchersMx.Lock()
+	_, has1 := s.fetchers["user-1"]
+	_, has2 := s.fetchers["user-2"]
+	s.fetchersMx.Unlock()
+	assert.False(t, has1)
+	assert.True(t, has2)
+}
+
+// TestBucketScanBlocksFinder_PeriodicScanPreservesNonMetaSyncerDataOnEviction guards the
+// single-binary safety property: CacheDir is the store-gateway's SyncDir, whose block data lives
+// under the same per-tenant directory, so evicting a tenant must remove only the fetcher's own
+// meta-syncer cache and never the sibling block data.
+func TestBucketScanBlocksFinder_PeriodicScanPreservesNonMetaSyncerDataOnEviction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
+
+	cortex_testutil.MockStorageBlock(t, bucket, "user-1", 10, 20)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
+
+	metaSyncerDir := filepath.Join(s.cfg.CacheDir, "user-1", metaSyncerCacheDirName)
+	require.DirExists(t, metaSyncerDir)
+
+	// Simulate a co-located store-gateway's block data under the same per-tenant directory.
+	sgBlockFile := filepath.Join(s.cfg.CacheDir, "user-1", "01DTVP434PA9VFXSW2JKB3392D", "index")
+	require.NoError(t, os.MkdirAll(filepath.Dir(sgBlockFile), 0o755))
+	require.NoError(t, os.WriteFile(sgBlockFile, []byte("block-data"), 0o644))
+
+	require.NoError(t, bucket.Delete(ctx, "user-1"))
+	require.NoError(t, s.scan(ctx))
+
+	// The fetcher's own meta-syncer cache is deleted...
+	assert.NoDirExists(t, metaSyncerDir)
+	// ...but the co-located store-gateway block data under the same per-tenant dir must survive.
+	assert.FileExists(t, sgBlockFile)
+}
+
+func TestBucketScanBlocksFinder_GetBlocks(t *testing.T) {
+	//parallel testing causes data race
+	ctx := context.Background()
+	s, bucket, _, _ := prepareBucketScanBlocksFinder(t, prepareBucketScanBlocksFinderConfig())
+
+	now := time.Now()
 	block1 := cortex_testutil.MockStorageBlock(t, bucket, "user-1", 10, 15)
 	block2 := cortex_testutil.MockStorageBlock(t, bucket, "user-1", 12, 20)
 	block3 := cortex_testutil.MockStorageBlock(t, bucket, "user-1", 20, 30)
 	block4 := cortex_testutil.MockStorageBlock(t, bucket, "user-1", 30, 40)
+	block5 := cortex_testutil.MockStorageBlock(t, bucket, "user-1", now.Add(-2*time.Hour).UnixMilli(), now.UnixMilli()) // This block is within ignoreBlocksWithin
 	mark3 := bucketindex.BlockDeletionMarkFromThanosMarker(cortex_testutil.MockStorageDeletionMark(t, bucket, "user-1", block3))
 
 	require.NoError(t, services.StartAndAwaitRunning(ctx, s))
@@ -464,11 +690,21 @@ func TestBucketScanBlocksFinder_GetBlocks(t *testing.T) {
 				block3.ULID: mark3,
 			},
 		},
+		"query range matching all blocks but should ignore non-queryable block": {
+			minT:          0,
+			maxT:          block5.MaxTime,
+			expectedMetas: []tsdb.BlockMeta{block4, block3, block2, block1},
+			expectedMarks: map[ulid.ULID]*bucketindex.BlockDeletionMark{
+				block3.ULID: mark3,
+			},
+		},
 	}
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			metas, deletionMarks, err := s.GetBlocks(ctx, "user-1", testData.minT, testData.maxT)
+			t.Parallel()
+
+			metas, deletionMarks, err := s.GetBlocks(ctx, "user-1", testData.minT, testData.maxT, nil)
 			require.NoError(t, err)
 			require.Equal(t, len(testData.expectedMetas), len(metas))
 			require.Equal(t, testData.expectedMarks, deletionMarks)
@@ -481,17 +717,22 @@ func TestBucketScanBlocksFinder_GetBlocks(t *testing.T) {
 }
 
 func prepareBucketScanBlocksFinder(t *testing.T, cfg BucketScanBlocksFinderConfig) (*BucketScanBlocksFinder, objstore.Bucket, string, *prometheus.Registry) {
-	cacheDir, err := ioutil.TempDir(os.TempDir(), "blocks-scanner-test-cache")
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, os.RemoveAll(cacheDir))
-	})
+	//parallel testing causes data race
 
 	bkt, storageDir := cortex_testutil.PrepareFilesystemBucket(t)
 
 	reg := prometheus.NewPedanticRegistry()
-	cfg.CacheDir = cacheDir
-	s := NewBucketScanBlocksFinder(cfg, bkt, nil, log.NewNopLogger(), reg)
+	cfg.CacheDir = t.TempDir()
+
+	// Create a user scanner with list strategy
+	usersScanner, err := users.NewScanner(users.UsersScannerConfig{
+		Strategy:       users.UserScanStrategyList,
+		MaxStalePeriod: time.Hour,
+		CacheTTL:       0,
+	}, bkt, log.NewNopLogger(), reg)
+	require.NoError(t, err)
+
+	s := NewBucketScanBlocksFinder(cfg, usersScanner, bkt, nil, log.NewNopLogger(), reg)
 
 	t.Cleanup(func() {
 		s.StopAsync()
@@ -507,5 +748,7 @@ func prepareBucketScanBlocksFinderConfig() BucketScanBlocksFinderConfig {
 		TenantsConcurrency:       10,
 		MetasConcurrency:         10,
 		IgnoreDeletionMarksDelay: time.Hour,
+		IgnoreBlocksWithin:       10 * time.Hour, // All blocks created in the last 10 hour shouldn't be scanned.
+		BlockDiscoveryStrategy:   string(cortex_tsdb.RecursiveDiscovery),
 	}
 }

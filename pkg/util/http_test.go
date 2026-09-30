@@ -2,9 +2,10 @@ package util_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"html/template"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -123,7 +124,7 @@ func TestStreamWriteYAMLResponse(t *testing.T) {
 	w := httptest.NewRecorder()
 
 	done := make(chan struct{})
-	iter := make(chan interface{})
+	iter := make(chan any)
 	go func() {
 		util.StreamWriteYAMLResponse(w, iter, util_log.Logger)
 		close(done)
@@ -141,20 +142,19 @@ func TestStreamWriteYAMLResponse(t *testing.T) {
 func TestParseProtoReader(t *testing.T) {
 	// 47 bytes compressed and 53 uncompressed
 	req := &cortexpb.PreallocWriteRequest{
-		WriteRequest: cortexpb.WriteRequest{
-			Timeseries: []cortexpb.PreallocTimeseries{
-				{
-					TimeSeries: &cortexpb.TimeSeries{
-						Labels: []cortexpb.LabelAdapter{
-							{Name: "foo", Value: "bar"},
-						},
-						Samples: []cortexpb.Sample{
-							{Value: 10, TimestampMs: 1},
-							{Value: 20, TimestampMs: 2},
-							{Value: 30, TimestampMs: 3},
-						},
-						Exemplars: []cortexpb.Exemplar{},
+		Timeseries: []cortexpb.PreallocTimeseries{
+			{
+				TimeSeries: &cortexpb.TimeSeries{
+					Labels: []cortexpb.LabelAdapter{
+						{Name: "foo", Value: "bar"},
 					},
+					Samples: []cortexpb.Sample{
+						{Value: 10, TimestampMs: 1},
+						{Value: 20, TimestampMs: 2},
+						{Value: 30, TimestampMs: 3},
+					},
+					Exemplars:  []cortexpb.Exemplar{},
+					Histograms: []cortexpb.WrappedHistogram{},
 				},
 			},
 		},
@@ -167,14 +167,14 @@ func TestParseProtoReader(t *testing.T) {
 		expectErr      bool
 		useBytesBuffer bool
 	}{
-		{"rawSnappy", util.RawSnappy, 53, false, false},
-		{"noCompression", util.NoCompression, 53, false, false},
+		{"rawSnappy", util.RawSnappy, 57, false, false},
+		{"noCompression", util.NoCompression, 57, false, false},
 		{"too big rawSnappy", util.RawSnappy, 10, true, false},
 		{"too big decoded rawSnappy", util.RawSnappy, 50, true, false},
 		{"too big noCompression", util.NoCompression, 10, true, false},
 
-		{"bytesbuffer rawSnappy", util.RawSnappy, 53, false, true},
-		{"bytesbuffer noCompression", util.NoCompression, 53, false, true},
+		{"bytesbuffer rawSnappy", util.RawSnappy, 57, false, true},
+		{"bytesbuffer noCompression", util.NoCompression, 57, false, true},
 		{"bytesbuffer too big rawSnappy", util.RawSnappy, 10, true, true},
 		{"bytesbuffer too big decoded rawSnappy", util.RawSnappy, 50, true, true},
 		{"bytesbuffer too big noCompression", util.NoCompression, 10, true, true},
@@ -216,6 +216,29 @@ func (b bytesBuffered) BytesBuffer() *bytes.Buffer {
 }
 
 func TestIsRequestBodyTooLargeRegression(t *testing.T) {
-	_, err := ioutil.ReadAll(http.MaxBytesReader(httptest.NewRecorder(), ioutil.NopCloser(bytes.NewReader([]byte{1, 2, 3, 4})), 1))
+	_, err := io.ReadAll(http.MaxBytesReader(httptest.NewRecorder(), io.NopCloser(bytes.NewReader([]byte{1, 2, 3, 4})), 1))
 	assert.True(t, util.IsRequestBodyTooLarge(err))
+}
+
+func TestParseProtoReader_GzipDecompressionBomb(t *testing.T) {
+	// Create a gzip payload where decompressed size far exceeds maxSize.
+	const maxSize = 4096                // 4 KB limit on decompressed output
+	uncompressed := make([]byte, 1<<20) // 1 MB of zeros
+
+	var compressed bytes.Buffer
+	gzw := gzip.NewWriter(&compressed)
+	_, err := gzw.Write(uncompressed)
+	require.NoError(t, err)
+	require.NoError(t, gzw.Close())
+
+	// The compressed payload is small enough to pass the compressed-size limit,
+	// but decompresses to far more than maxSize.
+	require.Less(t, compressed.Len(), maxSize)
+
+	var fromWire cortexpb.PreallocWriteRequest
+	err = util.ParseProtoReader(context.Background(), io.NopCloser(&compressed), 0, maxSize, &fromWire, util.Gzip)
+	// The decompressed output should be limited to maxSize+1 bytes, causing a
+	// proto unmarshal error (not an OOM). The key assertion is that we don't
+	// allocate 1 MB of memory.
+	assert.NotNil(t, err)
 }

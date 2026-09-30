@@ -6,13 +6,13 @@ import (
 	"strings"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/flagext"
-	"github.com/oklog/ulid"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/oklog/ulid/v2"
+	"github.com/thanos-io/objstore"
 
 	"github.com/cortexproject/cortex/integration/e2e"
 	e2edb "github.com/cortexproject/cortex/integration/e2e/db"
 	"github.com/cortexproject/cortex/pkg/storage/bucket/s3"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 type S3Client struct {
@@ -21,7 +21,7 @@ type S3Client struct {
 }
 
 func NewS3Client(cfg s3.Config) (*S3Client, error) {
-	writer, err := s3.NewBucketClient(cfg, "test", log.NewNopLogger())
+	writer, err := s3.NewBucketClient(cfg, nil, "test", log.NewNopLogger())
 	if err != nil {
 		return nil, err
 	}
@@ -39,11 +39,12 @@ func NewS3Client(cfg s3.Config) (*S3Client, error) {
 
 func NewS3ClientForMinio(minio *e2e.HTTPService, bucketName string) (*S3Client, error) {
 	return NewS3Client(s3.Config{
-		Endpoint:        minio.HTTPEndpoint(),
-		BucketName:      bucketName,
-		SecretAccessKey: flagext.Secret{Value: e2edb.MinioSecretKey},
-		AccessKeyID:     e2edb.MinioAccessKey,
-		Insecure:        true,
+		Endpoint:         minio.HTTPEndpoint(),
+		BucketName:       bucketName,
+		SecretAccessKey:  flagext.Secret{Value: e2edb.MinioSecretKey},
+		AccessKeyID:      e2edb.MinioAccessKey,
+		Insecure:         true,
+		BucketLookupType: s3.BucketAutoLookup,
 	})
 }
 
@@ -87,4 +88,8 @@ func (c *S3Client) Delete(prefix string) error {
 
 		return c.writer.Delete(context.Background(), entry)
 	})
+}
+
+func (c *S3Client) GetBucket() objstore.Bucket {
+	return c.writer
 }

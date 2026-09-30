@@ -2,356 +2,25 @@ package ingester
 
 import (
 	"context"
-	"net/http"
 	"sync"
-	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/tsdb/chunks"
-	tsdb_record "github.com/prometheus/prometheus/tsdb/record"
+	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/segmentio/fasthash/fnv1a"
-	"github.com/weaveworks/common/httpgrpc"
 
-	"github.com/cortexproject/cortex/pkg/cortexpb"
-	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/ingester/index"
-	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/extract"
-	util_math "github.com/cortexproject/cortex/pkg/util/math"
-	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
-// userStates holds the userState object for all users (tenants),
-// each one containing all the in-memory series for a given user.
-type userStates struct {
-	states  sync.Map
-	limiter *Limiter
-	cfg     Config
-	metrics *ingesterMetrics
-	logger  log.Logger
-}
-
-type userState struct {
-	limiter             *Limiter
-	userID              string
-	fpLocker            *fingerprintLocker
-	fpToSeries          *seriesMap
-	mapper              *fpMapper
-	index               *index.InvertedIndex
-	ingestedAPISamples  *util_math.EwmaRate
-	ingestedRuleSamples *util_math.EwmaRate
-	activeSeries        *ActiveSeries
-	logger              log.Logger
-
-	seriesInMetric *metricCounter
-
-	// Series metrics.
-	memSeries             prometheus.Gauge
-	memSeriesCreatedTotal prometheus.Counter
-	memSeriesRemovedTotal prometheus.Counter
-	discardedSamples      *prometheus.CounterVec
-	createdChunks         prometheus.Counter
-	activeSeriesGauge     prometheus.Gauge
-}
-
 // DiscardedSamples metric labels
 const (
-	perUserSeriesLimit   = "per_user_series_limit"
-	perMetricSeriesLimit = "per_metric_series_limit"
+	perUserSeriesLimit                = "per_user_series_limit"
+	perUserNativeHistogramSeriesLimit = "per_user_native_histogram_series_limit"
+	perMetricSeriesLimit              = "per_metric_series_limit"
+	perLabelsetSeriesLimit            = "per_labelset_series_limit"
 )
-
-func newUserStates(limiter *Limiter, cfg Config, metrics *ingesterMetrics, logger log.Logger) *userStates {
-	return &userStates{
-		limiter: limiter,
-		cfg:     cfg,
-		metrics: metrics,
-		logger:  logger,
-	}
-}
-
-func (us *userStates) cp() map[string]*userState {
-	states := map[string]*userState{}
-	us.states.Range(func(key, value interface{}) bool {
-		states[key.(string)] = value.(*userState)
-		return true
-	})
-	return states
-}
-
-//nolint:unused
-func (us *userStates) gc() {
-	us.states.Range(func(key, value interface{}) bool {
-		state := value.(*userState)
-		if state.fpToSeries.length() == 0 {
-			us.states.Delete(key)
-			state.activeSeries.clear()
-			state.activeSeriesGauge.Set(0)
-		}
-		return true
-	})
-}
-
-func (us *userStates) updateRates() {
-	us.states.Range(func(key, value interface{}) bool {
-		state := value.(*userState)
-		state.ingestedAPISamples.Tick()
-		state.ingestedRuleSamples.Tick()
-		return true
-	})
-}
-
-// Labels will be copied if they are kept.
-func (us *userStates) updateActiveSeriesForUser(userID string, now time.Time, lbls []labels.Label) {
-	if s, ok := us.get(userID); ok {
-		s.activeSeries.UpdateSeries(lbls, now, func(l labels.Labels) labels.Labels { return cortexpb.CopyLabels(l) })
-	}
-}
-
-func (us *userStates) purgeAndUpdateActiveSeries(purgeTime time.Time) {
-	us.states.Range(func(key, value interface{}) bool {
-		state := value.(*userState)
-		state.activeSeries.Purge(purgeTime)
-		state.activeSeriesGauge.Set(float64(state.activeSeries.Active()))
-		return true
-	})
-}
-
-func (us *userStates) get(userID string) (*userState, bool) {
-	state, ok := us.states.Load(userID)
-	if !ok {
-		return nil, ok
-	}
-	return state.(*userState), ok
-}
-
-func (us *userStates) getOrCreate(userID string) *userState {
-	state, ok := us.get(userID)
-	if !ok {
-
-		logger := log.With(us.logger, "user", userID)
-		// Speculatively create a userState object and try to store it
-		// in the map.  Another goroutine may have got there before
-		// us, in which case this userState will be discarded
-		state = &userState{
-			userID:              userID,
-			limiter:             us.limiter,
-			fpToSeries:          newSeriesMap(),
-			fpLocker:            newFingerprintLocker(16 * 1024),
-			index:               index.New(),
-			ingestedAPISamples:  util_math.NewEWMARate(0.2, us.cfg.RateUpdatePeriod),
-			ingestedRuleSamples: util_math.NewEWMARate(0.2, us.cfg.RateUpdatePeriod),
-			seriesInMetric:      newMetricCounter(us.limiter, us.cfg.getIgnoreSeriesLimitForMetricNamesMap()),
-			logger:              logger,
-
-			memSeries:             us.metrics.memSeries,
-			memSeriesCreatedTotal: us.metrics.memSeriesCreatedTotal.WithLabelValues(userID),
-			memSeriesRemovedTotal: us.metrics.memSeriesRemovedTotal.WithLabelValues(userID),
-			discardedSamples:      validation.DiscardedSamples.MustCurryWith(prometheus.Labels{"user": userID}),
-			createdChunks:         us.metrics.createdChunks,
-
-			activeSeries:      NewActiveSeries(),
-			activeSeriesGauge: us.metrics.activeSeriesPerUser.WithLabelValues(userID),
-		}
-		state.mapper = newFPMapper(state.fpToSeries, logger)
-		stored, ok := us.states.LoadOrStore(userID, state)
-		if !ok {
-			us.metrics.memUsers.Inc()
-		}
-		state = stored.(*userState)
-	}
-
-	return state
-}
-
-// teardown ensures metrics are accurately updated if a userStates struct is discarded
-func (us *userStates) teardown() {
-	for _, u := range us.cp() {
-		u.memSeriesRemovedTotal.Add(float64(u.fpToSeries.length()))
-		u.memSeries.Sub(float64(u.fpToSeries.length()))
-		u.activeSeriesGauge.Set(0)
-		us.metrics.memUsers.Dec()
-	}
-}
-
-func (us *userStates) getViaContext(ctx context.Context) (*userState, bool, error) {
-	userID, err := tenant.TenantID(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	state, ok := us.get(userID)
-	return state, ok, nil
-}
-
-// NOTE: memory for `labels` is unsafe; anything retained beyond the
-// life of this function must be copied
-func (us *userStates) getOrCreateSeries(ctx context.Context, userID string, labels []cortexpb.LabelAdapter, record *WALRecord) (*userState, model.Fingerprint, *memorySeries, error) {
-	state := us.getOrCreate(userID)
-	// WARNING: `err` may have a reference to unsafe memory in `labels`
-	fp, series, err := state.getSeries(labels, record)
-	return state, fp, series, err
-}
-
-// NOTE: memory for `metric` is unsafe; anything retained beyond the
-// life of this function must be copied
-func (u *userState) getSeries(metric labelPairs, record *WALRecord) (model.Fingerprint, *memorySeries, error) {
-	rawFP := client.FastFingerprint(metric)
-	u.fpLocker.Lock(rawFP)
-	fp := u.mapper.mapFP(rawFP, metric)
-	if fp != rawFP {
-		u.fpLocker.Unlock(rawFP)
-		u.fpLocker.Lock(fp)
-	}
-
-	series, ok := u.fpToSeries.get(fp)
-	if ok {
-		return fp, series, nil
-	}
-
-	series, err := u.createSeriesWithFingerprint(fp, metric, record, false)
-	if err != nil {
-		u.fpLocker.Unlock(fp)
-		return 0, nil, err
-	}
-
-	return fp, series, nil
-}
-
-func (u *userState) createSeriesWithFingerprint(fp model.Fingerprint, metric labelPairs, record *WALRecord, recovery bool) (*memorySeries, error) {
-	// There's theoretically a relatively harmless race here if multiple
-	// goroutines get the length of the series map at the same time, then
-	// all proceed to add a new series. This is likely not worth addressing,
-	// as this should happen rarely (all samples from one push are added
-	// serially), and the overshoot in allowed series would be minimal.
-
-	if !recovery {
-		if err := u.limiter.AssertMaxSeriesPerUser(u.userID, u.fpToSeries.length()); err != nil {
-			return nil, makeLimitError(perUserSeriesLimit, u.limiter.FormatError(u.userID, err))
-		}
-	}
-
-	// MetricNameFromLabelAdapters returns a copy of the string in `metric`
-	metricName, err := extract.MetricNameFromLabelAdapters(metric)
-	if err != nil {
-		return nil, err
-	}
-
-	if !recovery {
-		// Check if the per-metric limit has been exceeded
-		if err = u.seriesInMetric.canAddSeriesFor(u.userID, metricName); err != nil {
-			// WARNING: returns a reference to `metric`
-			return nil, makeMetricLimitError(perMetricSeriesLimit, cortexpb.FromLabelAdaptersToLabels(metric), u.limiter.FormatError(u.userID, err))
-		}
-	}
-
-	u.memSeriesCreatedTotal.Inc()
-	u.memSeries.Inc()
-	u.seriesInMetric.increaseSeriesForMetric(metricName)
-
-	if record != nil {
-		lbls := make(labels.Labels, 0, len(metric))
-		for _, m := range metric {
-			lbls = append(lbls, labels.Label(m))
-		}
-		record.Series = append(record.Series, tsdb_record.RefSeries{
-			Ref:    chunks.HeadSeriesRef(fp),
-			Labels: lbls,
-		})
-	}
-
-	labels := u.index.Add(metric, fp) // Add() returns 'interned' values so the original labels are not retained
-	series := newMemorySeries(labels, u.createdChunks)
-	u.fpToSeries.put(fp, series)
-
-	return series, nil
-}
-
-func (u *userState) removeSeries(fp model.Fingerprint, metric labels.Labels) {
-	u.fpToSeries.del(fp)
-	u.index.Delete(metric, fp)
-
-	metricName := metric.Get(model.MetricNameLabel)
-	if metricName == "" {
-		// Series without a metric name should never be able to make it into
-		// the ingester's memory storage.
-		panic("No metric name label")
-	}
-
-	u.seriesInMetric.decreaseSeriesForMetric(metricName)
-
-	u.memSeriesRemovedTotal.Inc()
-	u.memSeries.Dec()
-}
-
-// forSeriesMatching passes all series matching the given matchers to the
-// provided callback. Deals with locking and the quirks of zero-length matcher
-// values. There are 2 callbacks:
-// - The `add` callback is called for each series while the lock is held, and
-//   is intend to be used by the caller to build a batch.
-// - The `send` callback is called at certain intervals specified by batchSize
-//   with no locks held, and is intended to be used by the caller to send the
-//   built batches.
-func (u *userState) forSeriesMatching(ctx context.Context, allMatchers []*labels.Matcher,
-	add func(context.Context, model.Fingerprint, *memorySeries) error,
-	send func(context.Context) error, batchSize int,
-) error {
-	log, ctx := spanlogger.New(ctx, "forSeriesMatching")
-	defer log.Finish()
-
-	filters, matchers := util.SplitFiltersAndMatchers(allMatchers)
-	fps := u.index.Lookup(matchers)
-	if len(fps) > u.limiter.MaxSeriesPerQuery(u.userID) {
-		return httpgrpc.Errorf(http.StatusRequestEntityTooLarge, "exceeded maximum number of series in a query")
-	}
-
-	level.Debug(log).Log("series", len(fps))
-
-	// We only hold one FP lock at once here, so no opportunity to deadlock.
-	sent := 0
-outer:
-	for _, fp := range fps {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		u.fpLocker.Lock(fp)
-		series, ok := u.fpToSeries.get(fp)
-		if !ok {
-			u.fpLocker.Unlock(fp)
-			continue
-		}
-
-		for _, filter := range filters {
-			if !filter.Matches(series.metric.Get(filter.Name)) {
-				u.fpLocker.Unlock(fp)
-				continue outer
-			}
-		}
-
-		err := add(ctx, fp, series)
-		u.fpLocker.Unlock(fp)
-		if err != nil {
-			return err
-		}
-
-		sent++
-		if batchSize > 0 && sent%batchSize == 0 && send != nil {
-			if err = send(ctx); err != nil {
-				return nil
-			}
-		}
-	}
-
-	if batchSize > 0 && sent%batchSize > 0 && send != nil {
-		return send(ctx)
-	}
-	return nil
-}
 
 const numMetricCounterShards = 128
 
@@ -369,7 +38,7 @@ type metricCounter struct {
 
 func newMetricCounter(limiter *Limiter, ignoredMetricsForSeriesCount map[string]struct{}) *metricCounter {
 	shards := make([]metricCounterShard, 0, numMetricCounterShards)
-	for i := 0; i < numMetricCounterShards; i++ {
+	for range numMetricCounterShards {
 		shards = append(shards, metricCounterShard{
 			m: map[string]int{},
 		})
@@ -415,4 +84,240 @@ func (m *metricCounter) increaseSeriesForMetric(metric string) {
 	shard.mtx.Lock()
 	shard.m[metric]++
 	shard.mtx.Unlock()
+}
+
+// ActiveMetricNames returns the total number of unique metric names tracked across all shards.
+func (m *metricCounter) ActiveMetricNames() int {
+	total := 0
+	for i := range m.shards {
+		m.shards[i].mtx.Lock()
+		total += len(m.shards[i].m)
+		m.shards[i].mtx.Unlock()
+	}
+	return total
+}
+
+type labelSetCounterEntry struct {
+	count  int
+	labels labels.Labels
+}
+
+type labelSetCounterShard struct {
+	*sync.RWMutex
+	valuesCounter map[uint64]*labelSetCounterEntry
+}
+
+type labelSetCounter struct {
+	limiter *Limiter
+	shards  []*labelSetCounterShard
+}
+
+func newLabelSetCounter(limiter *Limiter) *labelSetCounter {
+	shards := make([]*labelSetCounterShard, 0, numMetricCounterShards)
+	for range numMetricCounterShards {
+		shards = append(shards, &labelSetCounterShard{
+			RWMutex:       &sync.RWMutex{},
+			valuesCounter: map[uint64]*labelSetCounterEntry{},
+		})
+	}
+	return &labelSetCounter{
+		shards:  shards,
+		limiter: limiter,
+	}
+}
+
+func (m *labelSetCounter) canAddSeriesForLabelSet(ctx context.Context, u *userTSDB, metric labels.Labels) error {
+	return m.limiter.AssertMaxSeriesPerLabelSet(u.userID, metric, func(allLimits []validation.LimitsPerLabelSet, limit validation.LimitsPerLabelSet) (int, error) {
+		s := m.shards[util.HashFP(model.Fingerprint(limit.Hash))%numMetricCounterShards]
+		s.RLock()
+		if r, ok := s.valuesCounter[limit.Hash]; ok {
+			defer s.RUnlock()
+			return r.count, nil
+		}
+		s.RUnlock()
+
+		// We still dont keep track of this label value so we need to backfill
+		return m.backFillLimit(ctx, u, false, allLimits, limit, s)
+	})
+}
+
+func (m *labelSetCounter) backFillLimit(ctx context.Context, u *userTSDB, forceBackfill bool, allLimits []validation.LimitsPerLabelSet, limit validation.LimitsPerLabelSet, s *labelSetCounterShard) (int, error) {
+	s.Lock()
+	defer s.Unlock()
+	// If not force backfill, use existing counter value.
+	if !forceBackfill {
+		if r, ok := s.valuesCounter[limit.Hash]; ok {
+			return r.count, nil
+		}
+	}
+
+	ir, err := u.db.Head().Index()
+	if err != nil {
+		return 0, err
+	}
+
+	defer ir.Close()
+
+	numSeries := u.db.Head().NumSeries()
+	totalCount, err := getCardinalityForLimitsPerLabelSet(ctx, numSeries, ir, allLimits, limit)
+	if err != nil {
+		return 0, err
+	}
+
+	s.valuesCounter[limit.Hash] = &labelSetCounterEntry{
+		count:  totalCount,
+		labels: limit.LabelSet,
+	}
+	return totalCount, nil
+}
+
+func getCardinalityForLimitsPerLabelSet(ctx context.Context, numSeries uint64, ir tsdb.IndexReader, allLimits []validation.LimitsPerLabelSet, limit validation.LimitsPerLabelSet) (int, error) {
+	// Easy path with explicit labels.
+	if limit.LabelSet.Len() > 0 {
+		p, err := getPostingForLabels(ctx, ir, limit.LabelSet)
+		if err != nil {
+			return 0, err
+		}
+		return getPostingCardinality(p)
+	}
+
+	// Default partition needs to get cardinality of all series that doesn't belong to any existing partitions.
+	postings := make([]index.Postings, 0, len(allLimits)-1)
+	for _, l := range allLimits {
+		if l.Hash == limit.Hash {
+			continue
+		}
+		p, err := getPostingForLabels(ctx, ir, l.LabelSet)
+		if err != nil {
+			return 0, err
+		}
+		postings = append(postings, p)
+	}
+	mergedCardinality, err := getPostingCardinality(index.Merge(ctx, postings...))
+	if err != nil {
+		return 0, err
+	}
+
+	return int(numSeries) - mergedCardinality, nil
+}
+
+func getPostingForLabels(ctx context.Context, ir tsdb.IndexReader, lbls labels.Labels) (index.Postings, error) {
+	postings := make([]index.Postings, 0, lbls.Len())
+	for name, value := range lbls.Map() {
+		p, err := ir.Postings(ctx, name, value)
+		if err != nil {
+			return nil, err
+		}
+		postings = append(postings, p)
+	}
+
+	return index.Intersect(postings...), nil
+}
+
+func getPostingCardinality(p index.Postings) (int, error) {
+	totalCount := 0
+	for p.Next() {
+		totalCount++
+	}
+
+	if p.Err() != nil {
+		return 0, p.Err()
+	}
+	return totalCount, nil
+}
+
+func (m *labelSetCounter) increaseSeriesLabelSet(u *userTSDB, metric labels.Labels) {
+	limits := m.limiter.limitsPerLabelSets(u.userID, metric)
+	for _, l := range limits {
+		s := m.shards[util.HashFP(model.Fingerprint(l.Hash))%numMetricCounterShards]
+		s.Lock()
+		if e, ok := s.valuesCounter[l.Hash]; ok {
+			e.count++
+		} else {
+			s.valuesCounter[l.Hash] = &labelSetCounterEntry{
+				count:  1,
+				labels: l.LabelSet,
+			}
+		}
+		s.Unlock()
+	}
+}
+
+func (m *labelSetCounter) decreaseSeriesLabelSet(u *userTSDB, metric labels.Labels) {
+	limits := m.limiter.limitsPerLabelSets(u.userID, metric)
+	for _, l := range limits {
+		s := m.shards[util.HashFP(model.Fingerprint(l.Hash))%numMetricCounterShards]
+		s.Lock()
+		if e, ok := s.valuesCounter[l.Hash]; ok {
+			e.count--
+		}
+		s.Unlock()
+	}
+}
+
+func (m *labelSetCounter) UpdateMetric(ctx context.Context, u *userTSDB, metrics *ingesterMetrics) error {
+	currentLbsLimitHash := map[uint64]validation.LimitsPerLabelSet{}
+	limits := m.limiter.limits.LimitsPerLabelSet(u.userID)
+	for _, l := range limits {
+		currentLbsLimitHash[l.Hash] = l
+	}
+
+	nonDefaultPartitionChanged := false
+	for i := range numMetricCounterShards {
+		s := m.shards[i]
+		s.RLock()
+		for h, entry := range s.valuesCounter {
+			lbls := entry.labels.String()
+			// This limit no longer exists
+			if _, ok := currentLbsLimitHash[h]; !ok {
+				metrics.usagePerLabelSet.DeleteLabelValues(u.userID, "max_series", lbls)
+				metrics.limitsPerLabelSet.DeleteLabelValues(u.userID, "max_series", lbls)
+				if entry.labels.Len() > 0 {
+					nonDefaultPartitionChanged = true
+				}
+				continue
+			}
+			// Delay exposing default partition metrics from current label limits as if
+			// another label set is added or removed then we need to backfill default partition again.
+			if entry.labels.Len() > 0 {
+				metrics.usagePerLabelSet.WithLabelValues(u.userID, "max_series", lbls).Set(float64(entry.count))
+				metrics.limitsPerLabelSet.WithLabelValues(u.userID, "max_series", lbls).Set(float64(currentLbsLimitHash[h].Limits.MaxSeries))
+				delete(currentLbsLimitHash, h)
+			}
+		}
+		s.RUnlock()
+	}
+
+	// Check if we need to backfill default partition. We don't need to backfill when any condition meet:
+	// 1. Default partition doesn't exist.
+	// 2. No new partition added and no old partition removed.
+	if !nonDefaultPartitionChanged {
+		for _, l := range currentLbsLimitHash {
+			if l.LabelSet.Len() > 0 {
+				nonDefaultPartitionChanged = true
+				break
+			}
+		}
+	}
+
+	// Backfill all limits that are not being tracked yet
+	for _, l := range currentLbsLimitHash {
+		s := m.shards[util.HashFP(model.Fingerprint(l.Hash))%numMetricCounterShards]
+		force := false
+		// Force backfill to make sure we update the counter for the default partition
+		// when other limits got added or removed. If no partition is changed then we
+		// can use the value in the counter.
+		if l.LabelSet.Len() == 0 && nonDefaultPartitionChanged {
+			force = true
+		}
+		count, err := m.backFillLimit(ctx, u, force, limits, l, s)
+		if err != nil {
+			return err
+		}
+		lbls := l.LabelSet.String()
+		metrics.usagePerLabelSet.WithLabelValues(u.userID, "max_series", lbls).Set(float64(count))
+		metrics.limitsPerLabelSet.WithLabelValues(u.userID, "max_series", lbls).Set(float64(l.Limits.MaxSeries))
+	}
+
+	return nil
 }

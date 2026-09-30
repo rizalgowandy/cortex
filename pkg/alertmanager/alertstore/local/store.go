@@ -3,7 +3,6 @@ package local
 import (
 	"context"
 	"flag"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,10 +11,12 @@ import (
 	"github.com/prometheus/alertmanager/config"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 const (
-	Name = "local"
+	Name         = "local"
+	templatesDir = "templates"
 )
 
 var (
@@ -41,6 +42,11 @@ type Store struct {
 // NewStore returns a new file alert store.
 func NewStore(cfg StoreConfig) (*Store, error) {
 	return &Store{cfg}, nil
+}
+
+// GetUserIndexUpdater implements alertstore.AlertStore.
+func (f *Store) GetUserIndexUpdater() *users.UserIndexUpdater {
+	return nil
 }
 
 // ListAllUsers implements alertstore.AlertStore.
@@ -141,7 +147,7 @@ func (f *Store) reloadConfigs() (map[string]alertspb.AlertConfigDesc, error) {
 		}
 
 		// Load the file to be returned by the store.
-		content, err := ioutil.ReadFile(path)
+		content, err := os.ReadFile(path)
 		if err != nil {
 			return errors.Wrapf(err, "unable to read alertmanager config %s", path)
 		}
@@ -149,9 +155,42 @@ func (f *Store) reloadConfigs() (map[string]alertspb.AlertConfigDesc, error) {
 		// The file name must correspond to the user tenant ID
 		user := strings.TrimSuffix(info.Name(), ext)
 
+		// Load template files
+		userTemplateDir := filepath.Join(f.cfg.Path, user, templatesDir)
+		var templates []*alertspb.TemplateDesc
+
+		if _, e := os.Stat(userTemplateDir); e == nil {
+			err = filepath.Walk(userTemplateDir, func(templatePath string, info os.FileInfo, err error) error {
+				if err != nil {
+					return errors.Wrapf(err, "unable to walk file path at %s", templatePath)
+				}
+				// Ignore files that are directories
+				if info.IsDir() {
+					return nil
+				}
+				content, err := os.ReadFile(templatePath)
+				if err != nil {
+					return errors.Wrapf(err, "unable to read alertmanager templates %s", templatePath)
+				}
+
+				templates = append(templates, &alertspb.TemplateDesc{
+					Body:     string(content),
+					Filename: info.Name(),
+				})
+				return nil
+			})
+
+			if err != nil {
+				return errors.Wrapf(err, "unable to list alertmanager templates: %s", userTemplateDir)
+			}
+		} else if !os.IsNotExist(e) {
+			return errors.Wrapf(e, "unable to read alertmanager templates %s", path)
+		}
+
 		configs[user] = alertspb.AlertConfigDesc{
 			User:      user,
 			RawConfig: string(content),
+			Templates: templates,
 		}
 		return nil
 	})

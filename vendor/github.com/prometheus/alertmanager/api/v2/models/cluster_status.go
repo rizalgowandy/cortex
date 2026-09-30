@@ -20,7 +20,9 @@ package models
 // Editing this file might prove futile when you re-run the swagger generate command
 
 import (
+	"context"
 	"encoding/json"
+	stderrors "errors"
 	"strconv"
 
 	"github.com/go-openapi/errors"
@@ -42,7 +44,7 @@ type ClusterStatus struct {
 
 	// status
 	// Required: true
-	// Enum: [ready settling disabled]
+	// Enum: ["ready","settling","disabled"]
 	Status *string `json:"status"`
 }
 
@@ -65,7 +67,6 @@ func (m *ClusterStatus) Validate(formats strfmt.Registry) error {
 }
 
 func (m *ClusterStatus) validatePeers(formats strfmt.Registry) error {
-
 	if swag.IsZero(m.Peers) { // not required
 		return nil
 	}
@@ -77,9 +78,15 @@ func (m *ClusterStatus) validatePeers(formats strfmt.Registry) error {
 
 		if m.Peers[i] != nil {
 			if err := m.Peers[i].Validate(formats); err != nil {
-				if ve, ok := err.(*errors.Validation); ok {
+				ve := new(errors.Validation)
+				if stderrors.As(err, &ve) {
 					return ve.ValidateName("peers" + "." + strconv.Itoa(i))
 				}
+				ce := new(errors.CompositeError)
+				if stderrors.As(err, &ce) {
+					return ce.ValidateName("peers" + "." + strconv.Itoa(i))
+				}
+
 				return err
 			}
 		}
@@ -89,7 +96,7 @@ func (m *ClusterStatus) validatePeers(formats strfmt.Registry) error {
 	return nil
 }
 
-var clusterStatusTypeStatusPropEnum []interface{}
+var clusterStatusTypeStatusPropEnum []any
 
 func init() {
 	var res []string
@@ -130,6 +137,49 @@ func (m *ClusterStatus) validateStatus(formats strfmt.Registry) error {
 	// value enum
 	if err := m.validateStatusEnum("status", "body", *m.Status); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// ContextValidate validate this cluster status based on the context it is used
+func (m *ClusterStatus) ContextValidate(ctx context.Context, formats strfmt.Registry) error {
+	var res []error
+
+	if err := m.contextValidatePeers(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
+	if len(res) > 0 {
+		return errors.CompositeValidationError(res...)
+	}
+	return nil
+}
+
+func (m *ClusterStatus) contextValidatePeers(ctx context.Context, formats strfmt.Registry) error {
+
+	for i := 0; i < len(m.Peers); i++ {
+
+		if m.Peers[i] != nil {
+
+			if swag.IsZero(m.Peers[i]) { // not required
+				return nil
+			}
+
+			if err := m.Peers[i].ContextValidate(ctx, formats); err != nil {
+				ve := new(errors.Validation)
+				if stderrors.As(err, &ve) {
+					return ve.ValidateName("peers" + "." + strconv.Itoa(i))
+				}
+				ce := new(errors.CompositeError)
+				if stderrors.As(err, &ce) {
+					return ce.ValidateName("peers" + "." + strconv.Itoa(i))
+				}
+
+				return err
+			}
+		}
+
 	}
 
 	return nil

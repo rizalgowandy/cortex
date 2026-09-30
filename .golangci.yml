@@ -1,32 +1,69 @@
-output:
-  format: line-number
-
-linters:
-  enable:
-    - goimports
-    - golint
-    - gofmt
-    - misspell
-    - depguard
-
-linters-settings:
-  errcheck:
-    # path to a file containing a list of functions to exclude from checking
-    # see https://github.com/kisielk/errcheck#excluding-functions for details
-    exclude: ./.errcheck-exclude
-  goimports:
-    local-prefixes: "github.com/cortexproject/cortex"
-
-  depguard:
-    list-type: blacklist
-    include-go-root: true
-    packages-with-error-message:
-      - github.com/go-kit/kit/log: "Use github.com/go-kit/log instead of github.com/go-kit/kit/log"
-
+version: "2"
 run:
-  timeout: 5m
-
+  timeout: 10m
   # List of build tags, all linters use it.
   build-tags:
     - netgo
     - requires_docker
+    - integration
+    - integration_alertmanager
+    - integration_backward_compatibility
+    - integration_memberlist
+    - integration_querier
+    - integration_ruler
+    - integration_query_fuzz
+    - integration_remote_write_v2
+    - slicelabels
+output:
+  formats:
+    text:
+      path: stdout
+      colors: false
+linters:
+  enable:
+    - depguard
+    - misspell
+    - modernize
+    - revive
+    - sloglint
+  settings:
+    depguard:
+      rules:
+        main:
+          list-mode: lax
+          files:
+            - $all
+          deny:
+            - pkg: github.com/go-kit/kit/log
+              desc: Use github.com/go-kit/log instead of github.com/go-kit/kit/log"
+    errcheck:
+      exclude-functions:
+        - io/ioutil.WriteFile
+        - io/ioutil.ReadFile
+        - io.Copy
+        - (github.com/go-kit/log.Logger).Log
+        - (*github.com/cortexproject/cortex/pkg/util/spanlogger.SpanLogger).Error
+        - (github.com/opentracing/opentracing-go.Tracer).Inject
+    govet:
+      disable:
+        - printf
+    revive:
+      severity: error
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - staticcheck
+        text: 'labels.MetricName is deprecated: .*'    
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/cortexproject/cortex

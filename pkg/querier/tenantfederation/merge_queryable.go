@@ -5,23 +5,26 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
-	"github.com/grafana/dskit/concurrency"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/weaveworks/common/user"
 
-	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 const (
-	defaultTenantLabel   = "__tenant_id__"
-	retainExistingPrefix = "original_"
-	maxConcurrency       = 16
+	defaultTenantLabel    = "__tenant_id__"
+	retainExistingPrefix  = "original_"
+	defaultMaxConcurrency = 16
 )
 
 // NewQueryable returns a queryable that iterates through all the tenant IDs
@@ -36,21 +39,27 @@ const (
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
-func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+func NewQueryable(upstream storage.Queryable, cfg Config, byPassWithSingleQuerier bool, reg prometheus.Registerer) storage.Queryable {
+	return NewMergeQueryable(
+		defaultTenantLabel,
+		cfg.MaxConcurrent,
+		tenantQuerierCallback(upstream),
+		byPassWithSingleQuerier,
+		cfg.AllowPartialData,
+		reg,
+	)
 }
 
 func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
-		tenantIDs, err := tenant.TenantIDs(ctx)
+		tenantIDs, err := users.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
-		for pos, tenantID := range tenantIDs {
+		for pos := range tenantIDs {
 			q, err := queryable.Querier(
-				user.InjectOrgID(ctx, tenantID),
 				mint,
 				maxt,
 			)
@@ -80,41 +89,47 @@ type MergeQuerierCallback func(ctx context.Context, mint int64, maxt int64) (ids
 // If the label `idLabelName` is already existing, its value is overwritten and
 // the previous value is exposed through a new label prefixed with "original_".
 // This behaviour is not implemented recursively.
-func NewMergeQueryable(idLabelName string, callback MergeQuerierCallback, byPassWithSingleQuerier bool) storage.Queryable {
+func NewMergeQueryable(idLabelName string, maxConcurrent int, callback MergeQuerierCallback, byPassWithSingleQuerier, allowPartialData bool, reg prometheus.Registerer) storage.Queryable {
 	return &mergeQueryable{
 		idLabelName:             idLabelName,
+		maxConcurrent:           maxConcurrent,
 		callback:                callback,
 		byPassWithSingleQuerier: byPassWithSingleQuerier,
+		allowPartialData:        allowPartialData,
+
+		tenantsPerQuery: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+			Namespace:                       "cortex",
+			Name:                            "querier_federated_tenants_per_query",
+			Help:                            "Number of tenants per query.",
+			Buckets:                         []float64{1, 2, 4, 8, 16, 32, 64},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
+		}),
 	}
 }
 
 type mergeQueryable struct {
 	idLabelName             string
+	maxConcurrent           int
 	byPassWithSingleQuerier bool
+	allowPartialData        bool
 	callback                MergeQuerierCallback
+	tenantsPerQuery         prometheus.Histogram
 }
 
 // Querier returns a new mergeQuerier, which aggregates results from multiple
 // underlying queriers into a single result.
-func (m *mergeQueryable) Querier(ctx context.Context, mint int64, maxt int64) (storage.Querier, error) {
-	// TODO: it's necessary to think how to override context inside querier
-	//  to mark spans created inside querier as child of a span created inside
-	//  methods of merged querier.
-	ids, queriers, err := m.callback(ctx, mint, maxt)
-	if err != nil {
-		return nil, err
-	}
-
-	// by pass when only single querier is returned
-	if m.byPassWithSingleQuerier && len(queriers) == 1 {
-		return queriers[0], nil
-	}
-
+func (m *mergeQueryable) Querier(mint int64, maxt int64) (storage.Querier, error) {
 	return &mergeQuerier{
-		ctx:         ctx,
-		idLabelName: m.idLabelName,
-		queriers:    queriers,
-		ids:         ids,
+		idLabelName:             m.idLabelName,
+		maxConcurrent:           m.maxConcurrent,
+		mint:                    mint,
+		maxt:                    maxt,
+		byPassWithSingleQuerier: m.byPassWithSingleQuerier,
+		allowPartialData:        m.allowPartialData,
+		callback:                m.callback,
+		tenantsPerQuery:         m.tenantsPerQuery,
 	}, nil
 }
 
@@ -123,12 +138,16 @@ func (m *mergeQueryable) Querier(ctx context.Context, mint int64, maxt int64) (s
 // from.
 // If the label `idLabelName` is already existing, its value is overwritten and
 // the previous value is exposed through a new label prefixed with "original_".
-// This behaviour is not implemented recursively
+// This behavior is not implemented recursively
 type mergeQuerier struct {
-	ctx         context.Context
-	queriers    []storage.Querier
-	idLabelName string
-	ids         []string
+	idLabelName   string
+	mint, maxt    int64
+	callback      MergeQuerierCallback
+	maxConcurrent int
+
+	byPassWithSingleQuerier bool
+	allowPartialData        bool
+	tenantsPerQuery         prometheus.Histogram
 }
 
 // LabelValues returns all potential values for a label name.  It is not safe
@@ -136,15 +155,26 @@ type mergeQuerier struct {
 // For the label `idLabelName` it will return all the underlying ids available.
 // For the label "original_" + `idLabelName it will return all the values
 // of the underlying queriers for `idLabelName`.
-func (m *mergeQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
-	log, _ := spanlogger.New(m.ctx, "mergeQuerier.LabelValues")
-	defer log.Span.Finish()
+func (m *mergeQuerier) LabelValues(ctx context.Context, name string, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	ids, queriers, err := m.callback(ctx, m.mint, m.maxt)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	matchedTenants, filteredMatchers := filterValuesByMatchers(m.idLabelName, m.ids, matchers...)
+	m.tenantsPerQuery.Observe(float64(len(ids)))
+
+	// by pass when only single querier is returned
+	if m.byPassWithSingleQuerier && len(queriers) == 1 {
+		return queriers[0].LabelValues(user.InjectOrgID(ctx, ids[0]), name, hints, matchers...)
+	}
+	log, _ := spanlogger.New(ctx, "mergeQuerier.LabelValues")
+	defer log.Finish()
+
+	matchedTenants, filteredMatchers := filterValuesByMatchers(m.idLabelName, ids, matchers...)
 
 	if name == m.idLabelName {
 		var labelValues = make([]string, 0, len(matchedTenants))
-		for _, id := range m.ids {
+		for _, id := range ids {
 			if _, matched := matchedTenants[id]; matched {
 				labelValues = append(labelValues, id)
 			}
@@ -158,23 +188,34 @@ func (m *mergeQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]
 		name = m.idLabelName
 	}
 
-	return m.mergeDistinctStringSliceWithTenants(func(ctx context.Context, q storage.Querier) ([]string, storage.Warnings, error) {
-		return q.LabelValues(name, filteredMatchers...)
-	}, matchedTenants)
+	return m.mergeDistinctStringSliceWithTenants(ctx, func(ctx context.Context, q storage.Querier) ([]string, annotations.Annotations, error) {
+		return q.LabelValues(ctx, name, hints, filteredMatchers...)
+	}, matchedTenants, ids, queriers)
 }
 
 // LabelNames returns all the unique label names present in the underlying
 // queriers. It also adds the `idLabelName` and if present in the original
 // results the original `idLabelName`.
-func (m *mergeQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
-	log, _ := spanlogger.New(m.ctx, "mergeQuerier.LabelNames")
-	defer log.Span.Finish()
+func (m *mergeQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	ids, queriers, err := m.callback(ctx, m.mint, m.maxt)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	matchedTenants, filteredMatchers := filterValuesByMatchers(m.idLabelName, m.ids, matchers...)
+	m.tenantsPerQuery.Observe(float64(len(ids)))
 
-	labelNames, warnings, err := m.mergeDistinctStringSliceWithTenants(func(ctx context.Context, q storage.Querier) ([]string, storage.Warnings, error) {
-		return q.LabelNames(filteredMatchers...)
-	}, matchedTenants)
+	// by pass when only single querier is returned
+	if m.byPassWithSingleQuerier && len(queriers) == 1 {
+		return queriers[0].LabelNames(user.InjectOrgID(ctx, ids[0]), hints, matchers...)
+	}
+	log, _ := spanlogger.New(ctx, "mergeQuerier.LabelNames")
+	defer log.Finish()
+
+	matchedTenants, filteredMatchers := filterValuesByMatchers(m.idLabelName, ids, matchers...)
+
+	labelNames, warnings, err := m.mergeDistinctStringSliceWithTenants(ctx, func(ctx context.Context, q storage.Querier) ([]string, annotations.Annotations, error) {
+		return q.LabelNames(ctx, hints, filteredMatchers...)
+	}, matchedTenants, ids, queriers)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -203,13 +244,13 @@ func (m *mergeQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, storag
 	return labelNames, warnings, nil
 }
 
-type stringSliceFunc func(context.Context, storage.Querier) ([]string, storage.Warnings, error)
+type stringSliceFunc func(context.Context, storage.Querier) ([]string, annotations.Annotations, error)
 
 type stringSliceFuncJob struct {
 	querier  storage.Querier
 	id       string
 	result   []string
-	warnings storage.Warnings
+	warnings annotations.Annotations
 }
 
 // mergeDistinctStringSliceWithTenants aggregates stringSliceFunc call
@@ -217,10 +258,10 @@ type stringSliceFuncJob struct {
 // provided, all queriers are used. It removes duplicates and sorts the result.
 // It doesn't require the output of the stringSliceFunc to be sorted, as results
 // of LabelValues are not sorted.
-func (m *mergeQuerier) mergeDistinctStringSliceWithTenants(f stringSliceFunc, tenants map[string]struct{}) ([]string, storage.Warnings, error) {
-	var jobs []interface{}
+func (m *mergeQuerier) mergeDistinctStringSliceWithTenants(ctx context.Context, f stringSliceFunc, tenants map[string]struct{}, ids []string, queriers []storage.Querier) ([]string, annotations.Annotations, error) {
+	var jobs []any
 
-	for pos, id := range m.ids {
+	for pos, id := range ids {
 		if tenants != nil {
 			if _, matched := tenants[id]; !matched {
 				continue
@@ -228,33 +269,41 @@ func (m *mergeQuerier) mergeDistinctStringSliceWithTenants(f stringSliceFunc, te
 		}
 
 		jobs = append(jobs, &stringSliceFuncJob{
-			querier: m.queriers[pos],
-			id:      m.ids[pos],
+			querier: queriers[pos],
+			id:      ids[pos],
 		})
 	}
 
-	run := func(ctx context.Context, jobIntf interface{}) error {
+	parentCtx := ctx
+	run := func(ctx context.Context, jobIntf any) error {
 		job, ok := jobIntf.(*stringSliceFuncJob)
 		if !ok {
 			return fmt.Errorf("unexpected type %T", jobIntf)
 		}
 
 		var err error
-		job.result, job.warnings, err = f(ctx, job.querier)
+		// Based on parent ctx here as we are using lazy querier.
+		newCtx := user.InjectOrgID(parentCtx, job.id)
+		job.result, job.warnings, err = f(newCtx, job.querier)
 		if err != nil {
+			if m.allowPartialData {
+				job.warnings.Add(fmt.Errorf("%w (partial data returned)", err))
+				return nil
+			}
+
 			return errors.Wrapf(err, "error querying %s %s", rewriteLabelName(m.idLabelName), job.id)
 		}
 
 		return nil
 	}
 
-	err := concurrency.ForEach(m.ctx, jobs, maxConcurrency, run)
+	err := concurrency.ForEach(ctx, jobs, m.maxConcurrent, run)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// aggregate warnings and deduplicate string results
-	var warnings storage.Warnings
+	var warnings annotations.Annotations
 	resultMap := make(map[string]struct{})
 	for _, jobIntf := range jobs {
 		job, ok := jobIntf.(*stringSliceFuncJob)
@@ -267,7 +316,7 @@ func (m *mergeQuerier) mergeDistinctStringSliceWithTenants(f stringSliceFunc, te
 		}
 
 		for _, w := range job.warnings {
-			warnings = append(warnings, errors.Wrapf(w, "warning querying %s %s", rewriteLabelName(m.idLabelName), job.id))
+			warnings.Add(errors.Wrapf(w, "warning querying %s %s", rewriteLabelName(m.idLabelName), job.id))
 		}
 	}
 
@@ -281,11 +330,7 @@ func (m *mergeQuerier) mergeDistinctStringSliceWithTenants(f stringSliceFunc, te
 
 // Close releases the resources of the Querier.
 func (m *mergeQuerier) Close() error {
-	errs := tsdb_errors.NewMulti()
-	for pos, id := range m.ids {
-		errs.Add(errors.Wrapf(m.queriers[pos].Close(), "failed to close querier for %s %s", rewriteLabelName(m.idLabelName), id))
-	}
-	return errs.Err()
+	return nil
 }
 
 type selectJob struct {
@@ -298,48 +343,58 @@ type selectJob struct {
 // `idLabelName` is matched on, it only considers those queriers
 // matching. The forwarded labelSelector is not containing those that operate
 // on `idLabelName`.
-func (m *mergeQuerier) Select(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
-	log, ctx := spanlogger.New(m.ctx, "mergeQuerier.Select")
-	defer log.Span.Finish()
-	matchedValues, filteredMatchers := filterValuesByMatchers(m.idLabelName, m.ids, matchers...)
-	var jobs = make([]interface{}, len(matchedValues))
-	var seriesSets = make([]storage.SeriesSet, len(matchedValues))
-	var jobPos int
-	for labelPos := range m.ids {
-		if _, matched := matchedValues[m.ids[labelPos]]; !matched {
-			continue
-		}
-		jobs[jobPos] = &selectJob{
-			pos:     jobPos,
-			querier: m.queriers[labelPos],
-			id:      m.ids[labelPos],
-		}
-		jobPos++
-	}
-
-	run := func(ctx context.Context, jobIntf interface{}) error {
-		job, ok := jobIntf.(*selectJob)
-		if !ok {
-			return fmt.Errorf("unexpected type %T", jobIntf)
-		}
-		seriesSets[job.pos] = &addLabelsSeriesSet{
-			upstream: job.querier.Select(sortSeries, hints, filteredMatchers...),
-			labels: labels.Labels{
-				{
-					Name:  m.idLabelName,
-					Value: job.id,
-				},
-			},
-		}
-		return nil
-	}
-
-	err := concurrency.ForEach(ctx, jobs, maxConcurrency, run)
+func (m *mergeQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	ids, queriers, err := m.callback(ctx, m.mint, m.maxt)
 	if err != nil {
 		return storage.ErrSeriesSet(err)
 	}
 
-	return storage.NewMergeSeriesSet(seriesSets, storage.ChainedSeriesMerge)
+	m.tenantsPerQuery.Observe(float64(len(ids)))
+
+	// by pass when only single querier is returned
+	if m.byPassWithSingleQuerier && len(queriers) == 1 {
+		return queriers[0].Select(user.InjectOrgID(ctx, ids[0]), sortSeries, hints, matchers...)
+	}
+
+	log, ctx := spanlogger.New(ctx, "mergeQuerier.Select")
+	defer log.Finish()
+	matchedValues, filteredMatchers := filterValuesByMatchers(m.idLabelName, ids, matchers...)
+	var jobs = make([]any, len(matchedValues))
+	var seriesSets = make([]storage.SeriesSet, len(matchedValues))
+	var jobPos int
+	for labelPos := range ids {
+		if _, matched := matchedValues[ids[labelPos]]; !matched {
+			continue
+		}
+		jobs[jobPos] = &selectJob{
+			pos:     jobPos,
+			querier: queriers[labelPos],
+			id:      ids[labelPos],
+		}
+		jobPos++
+	}
+
+	parentCtx := ctx
+	run := func(ctx context.Context, jobIntf any) error {
+		job, ok := jobIntf.(*selectJob)
+		if !ok {
+			return fmt.Errorf("unexpected type %T", jobIntf)
+		}
+		// Based on parent ctx here as we are using lazy querier.
+		newCtx := user.InjectOrgID(parentCtx, job.id)
+		seriesSets[job.pos] = &addLabelsSeriesSet{
+			upstream:         job.querier.Select(newCtx, sortSeries, hints, filteredMatchers...),
+			labels:           labels.FromStrings(m.idLabelName, job.id),
+			allowPartialData: m.allowPartialData,
+		}
+		return nil
+	}
+
+	if err := concurrency.ForEach(ctx, jobs, m.maxConcurrent, run); err != nil {
+		return storage.ErrSeriesSet(err)
+	}
+
+	return storage.NewMergeSeriesSet(seriesSets, 0, storage.ChainedSeriesMerge)
 }
 
 // filterValuesByMatchers applies matchers to inputed `idLabelName` and
@@ -387,9 +442,10 @@ func filterValuesByMatchers(idLabelName string, ids []string, matchers ...*label
 }
 
 type addLabelsSeriesSet struct {
-	upstream   storage.SeriesSet
-	labels     labels.Labels
-	currSeries storage.Series
+	upstream         storage.SeriesSet
+	labels           labels.Labels
+	currSeries       storage.Series
+	allowPartialData bool
 }
 
 func (m *addLabelsSeriesSet) Next() bool {
@@ -403,7 +459,7 @@ func (m *addLabelsSeriesSet) At() storage.Series {
 		upstream := m.upstream.At()
 		m.currSeries = &addLabelsSeries{
 			upstream: upstream,
-			labels:   setLabelsRetainExisting(upstream.Labels(), m.labels...),
+			labels:   setLabelsRetainExisting(upstream.Labels(), m.labels),
 		}
 	}
 	return m.currSeries
@@ -412,16 +468,25 @@ func (m *addLabelsSeriesSet) At() storage.Series {
 // The error that iteration as failed with.
 // When an error occurs, set cannot continue to iterate.
 func (m *addLabelsSeriesSet) Err() error {
+	if m.allowPartialData {
+		return nil
+	}
 	return errors.Wrapf(m.upstream.Err(), "error querying %s", labelsToString(m.labels))
 }
 
 // A collection of warnings for the whole set.
 // Warnings could be return even iteration has not failed with error.
-func (m *addLabelsSeriesSet) Warnings() storage.Warnings {
+func (m *addLabelsSeriesSet) Warnings() annotations.Annotations {
 	upstream := m.upstream.Warnings()
-	warnings := make(storage.Warnings, len(upstream))
+	warnings := make(annotations.Annotations, len(upstream))
 	for pos := range upstream {
 		warnings[pos] = errors.Wrapf(upstream[pos], "warning querying %s", labelsToString(m.labels))
+	}
+
+	if m.allowPartialData {
+		if err := m.upstream.Err(); err != nil {
+			warnings.Add(errors.Wrapf(err, "failed to query tenant %s (partial data returned)", labelsToString(m.labels)))
+		}
 	}
 	return warnings
 }
@@ -432,11 +497,11 @@ func rewriteLabelName(s string) string {
 }
 
 // this outputs a more readable error format
-func labelsToString(labels labels.Labels) string {
-	parts := make([]string, len(labels))
-	for pos, l := range labels {
-		parts[pos] = rewriteLabelName(l.Name) + " " + l.Value
-	}
+func labelsToString(lbls labels.Labels) string {
+	parts := make([]string, 0, lbls.Len())
+	lbls.Range(func(l labels.Label) {
+		parts = append(parts, rewriteLabelName(l.Name)+" "+l.Value)
+	})
 	return strings.Join(parts, ", ")
 }
 
@@ -451,23 +516,23 @@ func (a *addLabelsSeries) Labels() labels.Labels {
 }
 
 // Iterator returns a new, independent iterator of the data of the series.
-func (a *addLabelsSeries) Iterator() chunkenc.Iterator {
-	return a.upstream.Iterator()
+func (a *addLabelsSeries) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
+	return a.upstream.Iterator(it)
 }
 
 // this sets a label and preserves an existing value a new label prefixed with
 // original_. It doesn't do this recursively.
-func setLabelsRetainExisting(src labels.Labels, additionalLabels ...labels.Label) labels.Labels {
+func setLabelsRetainExisting(src labels.Labels, additionalLabels labels.Labels) labels.Labels {
 	lb := labels.NewBuilder(src)
 
-	for _, additionalL := range additionalLabels {
-		if oldValue := src.Get(additionalL.Name); oldValue != "" {
+	for name, value := range additionalLabels.Map() {
+		if oldValue := src.Get(name); oldValue != "" {
 			lb.Set(
-				retainExistingPrefix+additionalL.Name,
+				retainExistingPrefix+name,
 				oldValue,
 			)
 		}
-		lb.Set(additionalL.Name, additionalL.Value)
+		lb.Set(name, value)
 	}
 
 	return lb.Labels()

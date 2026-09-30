@@ -5,9 +5,6 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/crypto/tls"
-	"github.com/grafana/dskit/grpcclient"
-	"github.com/grafana/dskit/ring/client"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -15,6 +12,9 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
+	"github.com/cortexproject/cortex/pkg/ring/client"
+	"github.com/cortexproject/cortex/pkg/util/grpcclient"
+	"github.com/cortexproject/cortex/pkg/util/tls"
 )
 
 // ClientsPool is the interface used to get the client from the pool for a specified address.
@@ -34,16 +34,24 @@ type Client interface {
 
 // ClientConfig is the configuration struct for the alertmanager client.
 type ClientConfig struct {
-	RemoteTimeout time.Duration    `yaml:"remote_timeout"`
-	TLSEnabled    bool             `yaml:"tls_enabled"`
-	TLS           tls.ClientConfig `yaml:",inline"`
+	RemoteTimeout   time.Duration    `yaml:"remote_timeout"`
+	TLSEnabled      bool             `yaml:"tls_enabled"`
+	TLS             tls.ClientConfig `yaml:",inline"`
+	GRPCCompression string           `yaml:"grpc_compression"`
+	MaxRecvMsgSize  int              `yaml:"max_recv_msg_size"`
+	MaxSendMsgSize  int              `yaml:"max_send_msg_size"`
+	ConnectTimeout  time.Duration    `yaml:"connect_timeout"`
 }
 
 // RegisterFlagsWithPrefix registers flags with prefix.
 func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.BoolVar(&cfg.TLSEnabled, prefix+".tls-enabled", cfg.TLSEnabled, "Enable TLS in the GRPC client. This flag needs to be enabled when any other TLS flag is set. If set to false, insecure connection to gRPC server will be used.")
 	f.DurationVar(&cfg.RemoteTimeout, prefix+".remote-timeout", 2*time.Second, "Timeout for downstream alertmanagers.")
+	f.StringVar(&cfg.GRPCCompression, prefix+".grpc-compression", "", "Use compression when sending messages. Supported values are: 'gzip', 'snappy' and '' (disable compression)")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix, f)
+	f.IntVar(&cfg.MaxRecvMsgSize, prefix+".grpc-max-recv-msg-size", 16*1024*1024, "gRPC client max receive message size (bytes).")
+	f.IntVar(&cfg.MaxSendMsgSize, prefix+".grpc-max-send-msg-size", 4*1024*1024, "gRPC client max send message size (bytes).")
+	f.DurationVar(&cfg.ConnectTimeout, prefix+".connect-timeout", 5*time.Second, "The maximum amount of time to establish a connection. A value of 0 means using default gRPC client connect timeout 5s.")
 }
 
 type alertmanagerClientsPool struct {
@@ -53,20 +61,24 @@ type alertmanagerClientsPool struct {
 func newAlertmanagerClientsPool(discovery client.PoolServiceDiscovery, amClientCfg ClientConfig, logger log.Logger, reg prometheus.Registerer) ClientsPool {
 	// We prefer sane defaults instead of exposing further config options.
 	grpcCfg := grpcclient.Config{
-		MaxRecvMsgSize:      16 * 1024 * 1024,
-		MaxSendMsgSize:      4 * 1024 * 1024,
-		GRPCCompression:     "",
+		MaxRecvMsgSize:      amClientCfg.MaxRecvMsgSize,
+		MaxSendMsgSize:      amClientCfg.MaxSendMsgSize,
+		GRPCCompression:     amClientCfg.GRPCCompression,
 		RateLimit:           0,
 		RateLimitBurst:      0,
 		BackoffOnRatelimits: false,
 		TLSEnabled:          amClientCfg.TLSEnabled,
 		TLS:                 amClientCfg.TLS,
+		ConnectTimeout:      amClientCfg.ConnectTimeout,
 	}
 
 	requestDuration := promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "cortex_alertmanager_distributor_client_request_duration_seconds",
-		Help:    "Time spent executing requests from an alertmanager to another alertmanager.",
-		Buckets: prometheus.ExponentialBuckets(0.008, 4, 7),
+		Name:                            "cortex_alertmanager_distributor_client_request_duration_seconds",
+		Help:                            "Time spent executing requests from an alertmanager to another alertmanager.",
+		Buckets:                         prometheus.ExponentialBuckets(0.008, 4, 7),
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"operation", "status_code"})
 
 	factory := func(addr string) (client.PoolClient, error) {
@@ -101,7 +113,7 @@ func dialAlertmanagerClient(cfg grpcclient.Config, addr string, requestDuration 
 	if err != nil {
 		return nil, err
 	}
-	conn, err := grpc.Dial(addr, opts...)
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to dial alertmanager %s", addr)
 	}

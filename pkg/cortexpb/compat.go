@@ -14,28 +14,43 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/model/textparse"
 
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
-// ToWriteRequest converts matched slices of Labels, Samples and Metadata into a WriteRequest proto.
+// ToWriteRequest converts matched slices of Labels, Samples, Metadata and Histograms into a WriteRequest proto.
 // It gets timeseries from the pool, so ReuseSlice() should be called when done.
-func ToWriteRequest(lbls []labels.Labels, samples []Sample, metadata []*MetricMetadata, source WriteRequest_SourceEnum) *WriteRequest {
+func ToWriteRequest(lbls []labels.Labels, samples []Sample, metadata []*MetricMetadata, histograms []WrappedHistogram, source SourceEnum) *WriteRequest {
 	req := &WriteRequest{
 		Timeseries: PreallocTimeseriesSliceFromPool(),
 		Metadata:   metadata,
 		Source:     source,
 	}
 
-	for i, s := range samples {
+	i := 0
+	for i < len(samples) || i < len(histograms) {
 		ts := TimeseriesFromPool()
 		ts.Labels = append(ts.Labels, FromLabelsToLabelAdapters(lbls[i])...)
-		ts.Samples = append(ts.Samples, s)
+		if i < len(samples) {
+			ts.Samples = append(ts.Samples, samples[i])
+		}
+		if i < len(histograms) {
+			ts.Histograms = append(ts.Histograms, histograms[i])
+		}
+		i++
 		req.Timeseries = append(req.Timeseries, PreallocTimeseries{TimeSeries: ts})
 	}
 
 	return req
+}
+
+func (w *WriteRequest) AddHistogramTimeSeries(lbls []labels.Labels, histograms []WrappedHistogram) {
+	for i := range lbls {
+		ts := TimeseriesFromPool()
+		ts.Labels = append(ts.Labels, FromLabelsToLabelAdapters(lbls[i])...)
+		ts.Histograms = append(ts.Histograms, histograms[i])
+		w.Timeseries = append(w.Timeseries, PreallocTimeseries{TimeSeries: ts})
+	}
 }
 
 // FromLabelAdaptersToLabels casts []LabelAdapter to labels.Labels.
@@ -52,13 +67,13 @@ func FromLabelAdaptersToLabels(ls []LabelAdapter) labels.Labels {
 // Do NOT use unsafe to convert between data types because this function may
 // get in input labels whose data structure is reused.
 func FromLabelAdaptersToLabelsWithCopy(input []LabelAdapter) labels.Labels {
-	return CopyLabels(FromLabelAdaptersToLabels(input))
+	return CopyLabels(input)
 }
 
 // Efficiently copies labels input slice. To be used in cases where input slice
 // can be reused, but long-term copy is needed.
-func CopyLabels(input []labels.Label) labels.Labels {
-	result := make(labels.Labels, len(input))
+func CopyLabels(input []LabelAdapter) labels.Labels {
+	builder := labels.NewBuilder(labels.EmptyLabels())
 
 	size := 0
 	for _, l := range input {
@@ -69,12 +84,14 @@ func CopyLabels(input []labels.Label) labels.Labels {
 	// Copy all strings into the buffer, and use 'yoloString' to convert buffer
 	// slices to strings.
 	buf := make([]byte, size)
+	var name, value string
 
-	for i, l := range input {
-		result[i].Name, buf = copyStringToBuffer(l.Name, buf)
-		result[i].Value, buf = copyStringToBuffer(l.Value, buf)
+	for _, l := range input {
+		name, buf = copyStringToBuffer(l.Name, buf)
+		value, buf = copyStringToBuffer(l.Value, buf)
+		builder.Set(name, value)
 	}
-	return result
+	return builder.Labels()
 }
 
 // Copies string to buffer (which must be big enough), and converts buffer slice containing
@@ -100,6 +117,12 @@ func FromLabelsToLabelAdapters(ls labels.Labels) []LabelAdapter {
 // Don't do this on any performance sensitive paths.
 func FromLabelAdaptersToMetric(ls []LabelAdapter) model.Metric {
 	return util.LabelsToMetric(FromLabelAdaptersToLabels(ls))
+}
+
+// FromLabelAdaptersToMetric converts []LabelAdapter to a model.Metric with copy.
+// Don't do this on any performance sensitive paths.
+func FromLabelAdaptersToMetricWithCopy(ls []LabelAdapter) model.Metric {
+	return util.LabelsToMetric(FromLabelAdaptersToLabelsWithCopy(ls))
 }
 
 // FromMetricsToLabelAdapters converts model.Metric to []LabelAdapter.
@@ -149,26 +172,26 @@ func (s byLabel) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // MetricMetadataMetricTypeToMetricType converts a metric type from our internal client
 // to a Prometheus one.
-func MetricMetadataMetricTypeToMetricType(mt MetricMetadata_MetricType) textparse.MetricType {
+func MetricMetadataMetricTypeToMetricType(mt MetricMetadata_MetricType) model.MetricType {
 	switch mt {
 	case UNKNOWN:
-		return textparse.MetricTypeUnknown
+		return model.MetricTypeUnknown
 	case COUNTER:
-		return textparse.MetricTypeCounter
+		return model.MetricTypeCounter
 	case GAUGE:
-		return textparse.MetricTypeGauge
+		return model.MetricTypeGauge
 	case HISTOGRAM:
-		return textparse.MetricTypeHistogram
+		return model.MetricTypeHistogram
 	case GAUGEHISTOGRAM:
-		return textparse.MetricTypeGaugeHistogram
+		return model.MetricTypeGaugeHistogram
 	case SUMMARY:
-		return textparse.MetricTypeSummary
+		return model.MetricTypeSummary
 	case INFO:
-		return textparse.MetricTypeInfo
+		return model.MetricTypeInfo
 	case STATESET:
-		return textparse.MetricTypeStateset
+		return model.MetricTypeStateset
 	default:
-		return textparse.MetricTypeUnknown
+		return model.MetricTypeUnknown
 	}
 }
 
@@ -190,7 +213,7 @@ func (s Sample) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []byte(fmt.Sprintf("[%s,%s]", t, v)), nil
+	return fmt.Appendf(nil, "[%s,%s]", t, v), nil
 }
 
 // UnmarshalJSON implements json.Unmarshaler.

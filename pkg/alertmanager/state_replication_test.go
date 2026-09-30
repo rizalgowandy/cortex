@@ -10,15 +10,16 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/services"
 	"github.com/prometheus/alertmanager/cluster/clusterpb"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 type fakeState struct {
@@ -143,10 +144,10 @@ func TestStateReplication(t *testing.T) {
 				require.NoError(t, s.WaitReady(ctx))
 			}
 
-			ch := s.AddState("nflog", &fakeState{}, reg)
+			ch := s.AddState("nflog:user-1", &fakeState{}, reg)
 
 			part := tt.message
-			d, err := part.Marshal()
+			d, err := proto.Marshal(part)
 			require.NoError(t, err)
 			ch.Broadcast(d)
 
@@ -166,10 +167,10 @@ alertmanager_state_fetch_replica_state_failed_total 0
 alertmanager_state_fetch_replica_state_total 1
 # HELP alertmanager_partial_state_merges_failed_total Number of times we have failed to merge a partial state received for a key.
 # TYPE alertmanager_partial_state_merges_failed_total counter
-alertmanager_partial_state_merges_failed_total{key="nflog"} 0
+alertmanager_partial_state_merges_failed_total{type="nflog"} 0
 # HELP alertmanager_partial_state_merges_total Number of times we have received a partial state to merge for a key.
 # TYPE alertmanager_partial_state_merges_total counter
-alertmanager_partial_state_merges_total{key="nflog"} 0
+alertmanager_partial_state_merges_total{type="nflog"} 0
 # HELP alertmanager_state_initial_sync_completed_total Number of times we have completed syncing initial state for each possible outcome.
 # TYPE alertmanager_state_initial_sync_completed_total counter
 alertmanager_state_initial_sync_completed_total{outcome="failed"} 0
@@ -181,10 +182,10 @@ alertmanager_state_initial_sync_completed_total{outcome="user-not-found"} 0
 alertmanager_state_initial_sync_total 1
 # HELP alertmanager_state_replication_failed_total Number of times we have failed to replicate a state to other alertmanagers.
 # TYPE alertmanager_state_replication_failed_total counter
-alertmanager_state_replication_failed_total{key="nflog"} 0
+alertmanager_state_replication_failed_total{type="nflog"} 0
 # HELP alertmanager_state_replication_total Number of times we have tried to replicate a state to other alertmanagers.
 # TYPE alertmanager_state_replication_total counter
-alertmanager_state_replication_total{key="nflog"} 1
+alertmanager_state_replication_total{type="nflog"} 1
 	`),
 					"alertmanager_state_fetch_replica_state_failed_total",
 					"alertmanager_state_fetch_replica_state_total",
@@ -224,8 +225,8 @@ func TestStateReplication_Settle(t *testing.T) {
 			replicationFactor: 3,
 			read: readStateResult{
 				res: []*clusterpb.FullState{
-					{Parts: []clusterpb.Part{{Key: "key1", Data: []byte("Datum1")}, {Key: "key2", Data: []byte("Datum2")}}},
-					{Parts: []clusterpb.Part{{Key: "key1", Data: []byte("Datum3")}, {Key: "key2", Data: []byte("Datum4")}}},
+					{Parts: []*clusterpb.Part{{Key: "key1", Data: []byte("Datum1")}, {Key: "key2", Data: []byte("Datum2")}}},
+					{Parts: []*clusterpb.Part{{Key: "key1", Data: []byte("Datum3")}, {Key: "key2", Data: []byte("Datum4")}}},
 				},
 			},
 			results: map[string][][]byte{
@@ -237,7 +238,7 @@ func TestStateReplication_Settle(t *testing.T) {
 			name:              "with full state having no parts, nothing is merged.",
 			replicationFactor: 3,
 			read: readStateResult{
-				res: []*clusterpb.FullState{{Parts: []clusterpb.Part{}}},
+				res: []*clusterpb.FullState{{Parts: []*clusterpb.Part{}}},
 			},
 			results: map[string][][]byte{
 				"key1": nil,
@@ -248,7 +249,7 @@ func TestStateReplication_Settle(t *testing.T) {
 			name:              "with an unknown key, parts in the same state are merged.",
 			replicationFactor: 3,
 			read: readStateResult{
-				res: []*clusterpb.FullState{{Parts: []clusterpb.Part{
+				res: []*clusterpb.FullState{{Parts: []*clusterpb.Part{
 					{Key: "unknown", Data: []byte("Wow")},
 					{Key: "key1", Data: []byte("Datum1")},
 				}}},
@@ -263,8 +264,8 @@ func TestStateReplication_Settle(t *testing.T) {
 			replicationFactor: 3,
 			read: readStateResult{
 				res: []*clusterpb.FullState{
-					{Parts: []clusterpb.Part{{Key: "unknown", Data: []byte("Wow")}}},
-					{Parts: []clusterpb.Part{{Key: "key1", Data: []byte("Datum1")}}},
+					{Parts: []*clusterpb.Part{{Key: "unknown", Data: []byte("Wow")}}},
+					{Parts: []*clusterpb.Part{{Key: "key1", Data: []byte("Datum1")}}},
 				},
 			},
 			results: map[string][][]byte{
@@ -279,7 +280,7 @@ func TestStateReplication_Settle(t *testing.T) {
 			storeStates: map[string]alertspb.FullStateDesc{
 				"user-1": {
 					State: &clusterpb.FullState{
-						Parts: []clusterpb.Part{{Key: "key1", Data: []byte("Datum1")}},
+						Parts: []*clusterpb.Part{{Key: "key1", Data: []byte("Datum1")}},
 					},
 				},
 			},
@@ -354,7 +355,7 @@ func TestStateReplication_GetFullState(t *testing.T) {
 			name: "no keys",
 			data: map[string][]byte{},
 			result: &clusterpb.FullState{
-				Parts: []clusterpb.Part{},
+				Parts: []*clusterpb.Part{},
 			},
 		},
 		{
@@ -363,7 +364,7 @@ func TestStateReplication_GetFullState(t *testing.T) {
 				"key1": {},
 			},
 			result: &clusterpb.FullState{
-				Parts: []clusterpb.Part{
+				Parts: []*clusterpb.Part{
 					{Key: "key1", Data: []byte{}},
 				},
 			},
@@ -375,7 +376,7 @@ func TestStateReplication_GetFullState(t *testing.T) {
 				"key2": []byte("Datum2"),
 			},
 			result: &clusterpb.FullState{
-				Parts: []clusterpb.Part{
+				Parts: []*clusterpb.Part{
 					{Key: "key1", Data: []byte("Datum1")},
 					{Key: "key2", Data: []byte("Datum2")},
 				},

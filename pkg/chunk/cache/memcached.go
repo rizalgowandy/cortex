@@ -16,7 +16,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	instr "github.com/weaveworks/common/instrument"
 
-	"github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 )
 
@@ -63,8 +62,11 @@ func NewMemcached(cfg MemcachedConfig, client MemcachedClient, name string, reg 
 				Name:      "memcache_request_duration_seconds",
 				Help:      "Total time spent in seconds doing memcache requests.",
 				// Memcached requests are very quick: smallest bucket is 16us, biggest is 1s
-				Buckets:     prometheus.ExponentialBuckets(0.000016, 4, 8),
-				ConstLabels: prometheus.Labels{"name": name},
+				Buckets:                         prometheus.ExponentialBuckets(0.000016, 4, 8),
+				ConstLabels:                     prometheus.Labels{"name": name},
+				NativeHistogramBucketFactor:     1.1,
+				NativeHistogramMaxBucketNumber:  100,
+				NativeHistogramMinResetDuration: time.Hour,
 			}, []string{"method", "status_code"}),
 		),
 	}
@@ -133,7 +135,7 @@ func memcacheStatusCode(err error) string {
 }
 
 // Fetch gets keys from the cache. The keys that are found must be in the order of the keys requested.
-func (c *Memcached) Fetch(ctx context.Context, keys []string) (found []string, bufs [][]byte, missed []string) {
+func (c *Memcached) Fetch(ctx context.Context, keys []string, ttl time.Duration) (found []string, bufs [][]byte, missed []string) {
 	if c.cfg.BatchSize == 0 {
 		found, bufs, missed = c.fetch(ctx, keys)
 		return
@@ -188,7 +190,7 @@ func (c *Memcached) fetchKeysBatched(ctx context.Context, keys []string) (found 
 
 	go func() {
 		for i, j := 0, 0; i < len(keys); i += batchSize {
-			batchKeys := keys[i:math.Min(i+batchSize, len(keys))]
+			batchKeys := keys[i:min(i+batchSize, len(keys))]
 			select {
 			case <-c.quit:
 				return
@@ -234,13 +236,19 @@ loopResults:
 }
 
 // Store stores the key in the cache.
-func (c *Memcached) Store(ctx context.Context, keys []string, bufs [][]byte) {
+func (c *Memcached) Store(ctx context.Context, keys []string, bufs [][]byte, ttl time.Duration) {
+	// If TTL is 0, fall back to configured expiration
+	if ttl == 0 {
+		ttl = c.cfg.Expiration
+	}
+	expiration := int32(ttl.Seconds())
+
 	for i := range keys {
 		err := instr.CollectedRequest(ctx, "Memcache.Put", c.requestDuration, memcacheStatusCode, func(_ context.Context) error {
 			item := memcache.Item{
 				Key:        keys[i],
 				Value:      bufs[i],
-				Expiration: int32(c.cfg.Expiration.Seconds()),
+				Expiration: expiration,
 			}
 			return c.memcache.Set(&item)
 		})

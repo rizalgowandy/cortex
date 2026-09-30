@@ -7,22 +7,30 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 
-	luajson "github.com/alicebob/gopher-json"
 	lua "github.com/yuin/gopher-lua"
 	"github.com/yuin/gopher-lua/parse"
 
+	luajson "github.com/alicebob/miniredis/v2/gopher-json"
 	"github.com/alicebob/miniredis/v2/server"
 )
 
 func commandsScripting(m *Miniredis) {
 	m.srv.Register("EVAL", m.cmdEval)
+	m.srv.Register("EVAL_RO", m.cmdEvalro, server.ReadOnlyOption())
 	m.srv.Register("EVALSHA", m.cmdEvalsha)
+	m.srv.Register("EVALSHA_RO", m.cmdEvalshaRo, server.ReadOnlyOption())
 	m.srv.Register("SCRIPT", m.cmdScript)
 }
 
+var (
+	parsedScripts = sync.Map{}
+)
+
 // Execute lua. Needs to run m.Lock()ed, from within withTx().
-func (m *Miniredis) runLuaScript(c *server.Peer, script string, args []string) {
+// Returns true if the lua was OK (and hence should be cached).
+func (m *Miniredis) runLuaScript(c *server.Peer, sha, script string, readOnly bool, args []string) bool {
 	l := lua.NewState(lua.Options{SkipOpenLibs: true})
 	defer l.Close()
 
@@ -57,15 +65,15 @@ func (m *Miniredis) runLuaScript(c *server.Peer, script string, args []string) {
 	keysLen, err := strconv.Atoi(keysS)
 	if err != nil {
 		c.WriteError(msgInvalidInt)
-		return
+		return false
 	}
 	if keysLen < 0 {
 		c.WriteError(msgNegativeKeysNumber)
-		return
+		return false
 	}
 	if keysLen > len(args) {
 		c.WriteError(msgInvalidKeysNumber)
-		return
+		return false
 	}
 	keys, args := args[:keysLen], args[keysLen:]
 	for i, k := range keys {
@@ -79,66 +87,108 @@ func (m *Miniredis) runLuaScript(c *server.Peer, script string, args []string) {
 	}
 	l.SetGlobal("ARGV", argvTable)
 
-	redisFuncs := mkLuaFuncs(m.srv, c)
-	// Register command handlers
-	l.Push(l.NewFunction(func(l *lua.LState) int {
-		mod := l.RegisterModule("redis", redisFuncs).(*lua.LTable)
-		l.Push(mod)
-		return 1
-	}))
+	redisFuncs, redisConstants := mkLua(m.srv, c, sha, readOnly)
+	redisMod := l.CreateTable(0, len(redisFuncs)+len(redisConstants))
+	for fname, fn := range redisFuncs {
+		redisMod.RawSetString(fname, l.NewFunction(fn))
+	}
+	for k, v := range redisConstants {
+		redisMod.RawSetString(k, v)
+	}
+	for _, name := range []string{"redis", "server"} {
+		l.SetGlobal(name, redisMod)
+	}
 
-	l.DoString(protectGlobals)
+	l.RegisterModule("os", mkLuaOS())
 
-	l.Push(lua.LString("redis"))
-	l.Call(1, 0)
+	_ = doScript(l, protectGlobals)
 
-	if err := l.DoString(script); err != nil {
-		c.WriteError(errLuaParseError(err))
-		return
+	// lua can call redis.setresp(...), but it's tmp state.
+	oldresp := c.Resp3
+	if err := doScript(l, script); err != nil {
+		c.WriteError(err.Error())
+		return false
 	}
 
 	luaToRedis(l, c, l.Get(1))
+	c.Resp3 = oldresp
+	c.SwitchResp3 = nil
+	return true
 }
 
-func (m *Miniredis) cmdEval(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
-		return
+// doScript pre-compiles the given script into a Lua prototype,
+// then executes the pre-compiled function against the given lua state.
+//
+// This is thread-safe.
+func doScript(l *lua.LState, script string) error {
+	proto, err := compile(script)
+	if err != nil {
+		return fmt.Errorf(errLuaParseError(err))
 	}
-	if !m.handleAuth(c) {
-		return
+
+	lfunc := l.NewFunctionFromProto(proto)
+	l.Push(lfunc)
+	if err := l.PCall(0, lua.MultRet, nil); err != nil {
+		// ensure we wrap with the correct format.
+		return fmt.Errorf(errLuaParseError(err))
 	}
-	if m.checkPubsub(c, cmd) {
+
+	return nil
+}
+
+func compile(script string) (*lua.FunctionProto, error) {
+	if val, ok := parsedScripts.Load(script); ok {
+		return val.(*lua.FunctionProto), nil
+	}
+	chunk, err := parse.Parse(strings.NewReader(script), "<string>")
+	if err != nil {
+		return nil, err
+	}
+	proto, err := lua.Compile(chunk, "")
+	if err != nil {
+		return nil, err
+	}
+	parsedScripts.Store(script, proto)
+	return proto, nil
+}
+
+// Shared implementation for EVAL and EVALRO
+func (m *Miniredis) cmdEvalShared(c *server.Peer, cmd string, readOnly bool, args []string) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
 
-	if getCtx(c).nested {
-		c.WriteError(msgNotFromScripts)
+	ctx := getCtx(c)
+	if ctx.nested {
+		c.WriteError(msgNotFromScripts(ctx.nestedSHA))
 		return
 	}
 
 	script, args := args[0], args[1:]
 
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
-		m.runLuaScript(c, script, args)
+		sha := sha1Hex(script)
+		ok := m.runLuaScript(c, sha, script, readOnly, args)
+		if ok {
+			m.scripts[sha] = script
+		}
 	})
 }
 
-func (m *Miniredis) cmdEvalsha(c *server.Peer, cmd string, args []string) {
-	if len(args) < 2 {
-		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
+// Wrapper function for EVAL command
+func (m *Miniredis) cmdEval(c *server.Peer, cmd string, args []string) {
+	m.cmdEvalShared(c, cmd, false, args)
+}
+
+// Shared implementation for EVALSHA and EVALSHA_RO
+func (m *Miniredis) cmdEvalshaShared(c *server.Peer, cmd string, readOnly bool, args []string) {
+	if !m.isValidCMD(c, cmd, args, atLeast(2)) {
 		return
 	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
-		return
-	}
-	if getCtx(c).nested {
-		c.WriteError(msgNotFromScripts)
+
+	ctx := getCtx(c)
+	if ctx.nested {
+		c.WriteError(msgNotFromScripts(ctx.nestedSHA))
 		return
 	}
 
@@ -151,47 +201,86 @@ func (m *Miniredis) cmdEvalsha(c *server.Peer, cmd string, args []string) {
 			return
 		}
 
-		m.runLuaScript(c, script, args)
+		m.runLuaScript(c, sha, script, readOnly, args)
 	})
 }
 
+// Wrapper function for EVALSHA command
+func (m *Miniredis) cmdEvalsha(c *server.Peer, cmd string, args []string) {
+	m.cmdEvalshaShared(c, cmd, false, args)
+}
+
+// Wrapper function for EVALRO command
+func (m *Miniredis) cmdEvalro(c *server.Peer, cmd string, args []string) {
+	m.cmdEvalShared(c, cmd, true, args)
+}
+
+// Wrapper function for EVALSHA_RO command
+func (m *Miniredis) cmdEvalshaRo(c *server.Peer, cmd string, args []string) {
+	m.cmdEvalshaShared(c, cmd, true, args)
+}
+
 func (m *Miniredis) cmdScript(c *server.Peer, cmd string, args []string) {
-	if len(args) < 1 {
+	if !m.isValidCMD(c, cmd, args, atLeast(1)) {
+		return
+	}
+
+	ctx := getCtx(c)
+	if ctx.nested {
+		c.WriteError(msgNotFromScripts(ctx.nestedSHA))
+		return
+	}
+
+	var opts struct {
+		subcmd string
+		script string
+	}
+
+	opts.subcmd, args = args[0], args[1:]
+
+	switch strings.ToLower(opts.subcmd) {
+	case "load":
+		if len(args) != 1 {
+			setDirty(c)
+			c.WriteError(fmt.Sprintf(msgFScriptUsage, "LOAD"))
+			return
+		}
+		opts.script = args[0]
+	case "exists":
+		if len(args) == 0 {
+			setDirty(c)
+			c.WriteError(errWrongNumber("script|exists"))
+			return
+		}
+	case "flush":
+		if len(args) == 1 {
+			switch strings.ToUpper(args[0]) {
+			case "SYNC", "ASYNC":
+				args = args[1:]
+			default:
+			}
+		}
+		if len(args) != 0 {
+			setDirty(c)
+			c.WriteError(msgScriptFlush)
+			return
+		}
+	default:
 		setDirty(c)
-		c.WriteError(errWrongNumber(cmd))
+		c.WriteError(fmt.Sprintf(msgFScriptUsageSimple, strings.ToUpper(opts.subcmd)))
 		return
 	}
-	if !m.handleAuth(c) {
-		return
-	}
-	if m.checkPubsub(c, cmd) {
-		return
-	}
-
-	if getCtx(c).nested {
-		c.WriteError(msgNotFromScripts)
-		return
-	}
-
-	subcmd, args := args[0], args[1:]
 
 	withTx(m, c, func(c *server.Peer, ctx *connCtx) {
-		switch strings.ToLower(subcmd) {
+		switch strings.ToLower(opts.subcmd) {
 		case "load":
-			if len(args) != 1 {
-				c.WriteError(fmt.Sprintf(msgFScriptUsage, "LOAD"))
-				return
-			}
-			script := args[0]
-
-			if _, err := parse.Parse(strings.NewReader(script), "user_script"); err != nil {
+			if _, err := parse.Parse(strings.NewReader(opts.script), "user_script"); err != nil {
 				c.WriteError(errLuaParseError(err))
 				return
 			}
-			sha := sha1Hex(script)
-			m.scripts[sha] = script
+			sha := sha1Hex(opts.script)
+			m.scripts[sha] = opts.script
 			c.WriteBulk(sha)
-
 		case "exists":
 			c.WriteLen(len(args))
 			for _, arg := range args {
@@ -201,18 +290,9 @@ func (m *Miniredis) cmdScript(c *server.Peer, cmd string, args []string) {
 					c.WriteInt(0)
 				}
 			}
-
 		case "flush":
-			if len(args) != 0 {
-				c.WriteError(fmt.Sprintf(msgFScriptUsage, "FLUSH"))
-				return
-			}
-
 			m.scripts = map[string]string{}
 			c.WriteOK()
-
-		default:
-			c.WriteError(fmt.Sprintf(msgFScriptUsage, strings.ToUpper(subcmd)))
 		}
 	})
 }

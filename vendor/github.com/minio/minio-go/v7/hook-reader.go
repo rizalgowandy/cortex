@@ -43,18 +43,21 @@ func (hr *hookReader) Seek(offset int64, whence int) (n int64, err error) {
 		}
 	}
 
-	// Verify if hook has embedded Seeker, use it.
-	hookSeeker, ok := hr.hook.(io.Seeker)
-	if ok {
-		var m int64
-		m, err = hookSeeker.Seek(offset, whence)
-		if err != nil {
-			return 0, err
-		}
-		if n != m {
-			return 0, fmt.Errorf("hook seeker seeked %d bytes, expected source %d bytes", m, n)
+	if hr.hook != nil {
+		// Verify if hook has embedded Seeker, use it.
+		hookSeeker, ok := hr.hook.(io.Seeker)
+		if ok {
+			var m int64
+			m, err = hookSeeker.Seek(offset, whence)
+			if err != nil {
+				return 0, err
+			}
+			if n != m {
+				return 0, fmt.Errorf("hook seeker seeked %d bytes, expected source %d bytes", m, n)
+			}
 		}
 	}
+
 	return n, nil
 }
 
@@ -66,10 +69,12 @@ func (hr *hookReader) Read(b []byte) (n int, err error) {
 	if err != nil && err != io.EOF {
 		return n, err
 	}
-	// Progress the hook with the total read bytes from the source.
-	if _, herr := hr.hook.Read(b[:n]); herr != nil {
-		if herr != io.EOF {
-			return n, herr
+	if hr.hook != nil {
+		// Progress the hook with the total read bytes from the source.
+		if _, herr := hr.hook.Read(b[:n]); herr != nil {
+			if herr != io.EOF {
+				return n, herr
+			}
 		}
 	}
 	return n, err
@@ -79,7 +84,10 @@ func (hr *hookReader) Read(b []byte) (n int, err error) {
 // reports the data read from the source to the hook.
 func newHook(source, hook io.Reader) io.Reader {
 	if hook == nil {
-		return source
+		return &hookReader{source: source}
 	}
-	return &hookReader{source, hook}
+	return &hookReader{
+		source: source,
+		hook:   hook,
+	}
 }

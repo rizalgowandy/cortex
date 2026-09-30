@@ -7,13 +7,13 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/services"
 	"github.com/prometheus/alertmanager/cluster/clusterpb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 type fakePersistableState struct {
@@ -72,7 +72,7 @@ func (f *fakeStore) getWrites() []fakeStoreWrite {
 
 func makeTestFullState() *clusterpb.FullState {
 	return &clusterpb.FullState{
-		Parts: []clusterpb.Part{
+		Parts: []*clusterpb.Part{
 			{
 				Key:  "key",
 				Data: []byte("data"),
@@ -105,7 +105,7 @@ func TestStatePersister_Position0ShouldWrite(t *testing.T) {
 	{
 		time.Sleep(5 * time.Second)
 
-		assert.Equal(t, services.Starting, s.Service.State())
+		assert.Equal(t, services.Starting, s.State())
 		assert.Equal(t, 0, len(store.getWrites()))
 	}
 
@@ -139,13 +139,13 @@ func TestStatePersister_Position1ShouldNotWrite(t *testing.T) {
 
 	// Start the persister.
 	{
-		require.Equal(t, services.Starting, s.Service.State())
+		require.Equal(t, services.Starting, s.State())
 
 		state.getResult = makeTestFullState()
 		close(state.readyc)
 
 		require.NoError(t, s.AwaitRunning(context.Background()))
-		require.Equal(t, services.Running, s.Service.State())
+		require.Equal(t, services.Running, s.State())
 	}
 
 	// Should not have stored anything, having passed the interval multiple times.

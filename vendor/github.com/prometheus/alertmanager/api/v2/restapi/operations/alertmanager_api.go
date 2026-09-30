@@ -52,6 +52,7 @@ func NewAlertmanagerAPI(spec *loads.Document) *AlertmanagerAPI {
 		PreServerShutdown:   func() {},
 		ServerShutdown:      func() {},
 		spec:                spec,
+		useSwaggerUI:        false,
 		ServeError:          errors.ServeError,
 		BasicAuthenticator:  security.BasicAuth,
 		APIKeyAuthenticator: security.APIKeyAuth,
@@ -62,30 +63,56 @@ func NewAlertmanagerAPI(spec *loads.Document) *AlertmanagerAPI {
 		JSONProducer: runtime.JSONProducer(),
 
 		SilenceDeleteSilenceHandler: silence.DeleteSilenceHandlerFunc(func(params silence.DeleteSilenceParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation silence.DeleteSilence has not yet been implemented")
 		}),
+
 		AlertgroupGetAlertGroupsHandler: alertgroup.GetAlertGroupsHandlerFunc(func(params alertgroup.GetAlertGroupsParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation alertgroup.GetAlertGroups has not yet been implemented")
 		}),
+
 		AlertGetAlertsHandler: alert.GetAlertsHandlerFunc(func(params alert.GetAlertsParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation alert.GetAlerts has not yet been implemented")
 		}),
+
 		ReceiverGetReceiversHandler: receiver.GetReceiversHandlerFunc(func(params receiver.GetReceiversParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation receiver.GetReceivers has not yet been implemented")
 		}),
+
 		SilenceGetSilenceHandler: silence.GetSilenceHandlerFunc(func(params silence.GetSilenceParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation silence.GetSilence has not yet been implemented")
 		}),
+
 		SilenceGetSilencesHandler: silence.GetSilencesHandlerFunc(func(params silence.GetSilencesParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation silence.GetSilences has not yet been implemented")
 		}),
+
 		GeneralGetStatusHandler: general.GetStatusHandlerFunc(func(params general.GetStatusParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation general.GetStatus has not yet been implemented")
 		}),
+
 		AlertPostAlertsHandler: alert.PostAlertsHandlerFunc(func(params alert.PostAlertsParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation alert.PostAlerts has not yet been implemented")
 		}),
+
 		SilencePostSilencesHandler: silence.PostSilencesHandlerFunc(func(params silence.PostSilencesParams) middleware.Responder {
+			_ = params
+
 			return middleware.NotImplemented("operation silence.PostSilences has not yet been implemented")
 		}),
 	}
@@ -102,13 +129,16 @@ type AlertmanagerAPI struct {
 	defaultConsumes string
 	defaultProduces string
 	Middleware      func(middleware.Builder) http.Handler
+	useSwaggerUI    bool
 
 	// BasicAuthenticator generates a runtime.Authenticator from the supplied basic auth function.
 	// It has a default implementation in the security package, however you can replace it for your particular usage.
 	BasicAuthenticator func(security.UserPassAuthentication) runtime.Authenticator
+
 	// APIKeyAuthenticator generates a runtime.Authenticator from the supplied token auth function.
 	// It has a default implementation in the security package, however you can replace it for your particular usage.
 	APIKeyAuthenticator func(string, string, security.TokenAuthentication) runtime.Authenticator
+
 	// BearerAuthenticator generates a runtime.Authenticator from the supplied bearer token auth function.
 	// It has a default implementation in the security package, however you can replace it for your particular usage.
 	BearerAuthenticator func(string, security.ScopedTokenAuthentication) runtime.Authenticator
@@ -139,6 +169,7 @@ type AlertmanagerAPI struct {
 	AlertPostAlertsHandler alert.PostAlertsHandler
 	// SilencePostSilencesHandler sets the operation handler for the post silences operation
 	SilencePostSilencesHandler silence.PostSilencesHandler
+
 	// ServeError is called when an error is received, there is a default handler
 	// but you can set your own with this
 	ServeError func(http.ResponseWriter, *http.Request, error)
@@ -155,7 +186,17 @@ type AlertmanagerAPI struct {
 	CommandLineOptionsGroups []swag.CommandLineOptionsGroup
 
 	// User defined logger function.
-	Logger func(string, ...interface{})
+	Logger func(string, ...any)
+}
+
+// UseRedoc for documentation at /docs
+func (o *AlertmanagerAPI) UseRedoc() {
+	o.useSwaggerUI = false
+}
+
+// UseSwaggerUI for documentation at /docs
+func (o *AlertmanagerAPI) UseSwaggerUI() {
+	o.useSwaggerUI = true
 }
 
 // SetDefaultProduces sets the default produces media type
@@ -256,12 +297,12 @@ func (o *AlertmanagerAPI) Authorizer() runtime.Authorizer {
 }
 
 // ConsumersFor gets the consumers for the specified media types.
+//
 // MIME type parameters are ignored here.
 func (o *AlertmanagerAPI) ConsumersFor(mediaTypes []string) map[string]runtime.Consumer {
 	result := make(map[string]runtime.Consumer, len(mediaTypes))
 	for _, mt := range mediaTypes {
-		switch mt {
-		case "application/json":
+		if mt == "application/json" {
 			result["application/json"] = o.JSONConsumer
 		}
 
@@ -269,16 +310,17 @@ func (o *AlertmanagerAPI) ConsumersFor(mediaTypes []string) map[string]runtime.C
 			result[mt] = c
 		}
 	}
+
 	return result
 }
 
 // ProducersFor gets the producers for the specified media types.
+//
 // MIME type parameters are ignored here.
 func (o *AlertmanagerAPI) ProducersFor(mediaTypes []string) map[string]runtime.Producer {
 	result := make(map[string]runtime.Producer, len(mediaTypes))
 	for _, mt := range mediaTypes {
-		switch mt {
-		case "application/json":
+		if mt == "application/json" {
 			result["application/json"] = o.JSONProducer
 		}
 
@@ -286,6 +328,7 @@ func (o *AlertmanagerAPI) ProducersFor(mediaTypes []string) map[string]runtime.P
 			result[mt] = p
 		}
 	}
+
 	return result
 }
 
@@ -366,6 +409,9 @@ func (o *AlertmanagerAPI) Serve(builder middleware.Builder) http.Handler {
 	if o.Middleware != nil {
 		return o.Middleware(builder)
 	}
+	if o.useSwaggerUI {
+		return o.context.APIHandlerSwaggerUI(builder)
+	}
 	return o.context.APIHandler(builder)
 }
 
@@ -394,6 +440,6 @@ func (o *AlertmanagerAPI) AddMiddlewareFor(method, path string, builder middlewa
 	}
 	o.Init()
 	if h, ok := o.handlers[um][path]; ok {
-		o.handlers[method][path] = builder(h)
+		o.handlers[um][path] = builder(h)
 	}
 }

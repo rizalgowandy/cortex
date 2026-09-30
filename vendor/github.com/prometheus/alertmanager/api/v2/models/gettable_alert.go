@@ -20,6 +20,8 @@ package models
 // Editing this file might prove futile when you re-run the swagger generate command
 
 import (
+	"context"
+	stderrors "errors"
 	"strconv"
 
 	"github.com/go-openapi/errors"
@@ -48,7 +50,7 @@ type GettableAlert struct {
 
 	// receivers
 	// Required: true
-	Receivers []*Receiver `json:"receivers"`
+	Receivers []*ReceiverReference `json:"receivers"`
 
 	// starts at
 	// Required: true
@@ -77,7 +79,7 @@ func (m *GettableAlert) UnmarshalJSON(raw []byte) error {
 
 		Fingerprint *string `json:"fingerprint"`
 
-		Receivers []*Receiver `json:"receivers"`
+		Receivers []*ReceiverReference `json:"receivers"`
 
 		StartsAt *strfmt.DateTime `json:"startsAt"`
 
@@ -124,7 +126,7 @@ func (m GettableAlert) MarshalJSON() ([]byte, error) {
 
 		Fingerprint *string `json:"fingerprint"`
 
-		Receivers []*Receiver `json:"receivers"`
+		Receivers []*ReceiverReference `json:"receivers"`
 
 		StartsAt *strfmt.DateTime `json:"startsAt"`
 
@@ -206,11 +208,23 @@ func (m *GettableAlert) Validate(formats strfmt.Registry) error {
 
 func (m *GettableAlert) validateAnnotations(formats strfmt.Registry) error {
 
-	if err := m.Annotations.Validate(formats); err != nil {
-		if ve, ok := err.(*errors.Validation); ok {
-			return ve.ValidateName("annotations")
-		}
+	if err := validate.Required("annotations", "body", m.Annotations); err != nil {
 		return err
+	}
+
+	if m.Annotations != nil {
+		if err := m.Annotations.Validate(formats); err != nil {
+			ve := new(errors.Validation)
+			if stderrors.As(err, &ve) {
+				return ve.ValidateName("annotations")
+			}
+			ce := new(errors.CompositeError)
+			if stderrors.As(err, &ce) {
+				return ce.ValidateName("annotations")
+			}
+
+			return err
+		}
 	}
 
 	return nil
@@ -251,9 +265,15 @@ func (m *GettableAlert) validateReceivers(formats strfmt.Registry) error {
 
 		if m.Receivers[i] != nil {
 			if err := m.Receivers[i].Validate(formats); err != nil {
-				if ve, ok := err.(*errors.Validation); ok {
+				ve := new(errors.Validation)
+				if stderrors.As(err, &ve) {
 					return ve.ValidateName("receivers" + "." + strconv.Itoa(i))
 				}
+				ce := new(errors.CompositeError)
+				if stderrors.As(err, &ce) {
+					return ce.ValidateName("receivers" + "." + strconv.Itoa(i))
+				}
+
 				return err
 			}
 		}
@@ -284,9 +304,15 @@ func (m *GettableAlert) validateStatus(formats strfmt.Registry) error {
 
 	if m.Status != nil {
 		if err := m.Status.Validate(formats); err != nil {
-			if ve, ok := err.(*errors.Validation); ok {
+			ve := new(errors.Validation)
+			if stderrors.As(err, &ve) {
 				return ve.ValidateName("status")
 			}
+			ce := new(errors.CompositeError)
+			if stderrors.As(err, &ce) {
+				return ce.ValidateName("status")
+			}
+
 			return err
 		}
 	}
@@ -302,6 +328,101 @@ func (m *GettableAlert) validateUpdatedAt(formats strfmt.Registry) error {
 
 	if err := validate.FormatOf("updatedAt", "body", "date-time", m.UpdatedAt.String(), formats); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// ContextValidate validate this gettable alert based on the context it is used
+func (m *GettableAlert) ContextValidate(ctx context.Context, formats strfmt.Registry) error {
+	var res []error
+
+	if err := m.contextValidateAnnotations(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
+	if err := m.contextValidateReceivers(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
+	if err := m.contextValidateStatus(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
+	// validation for a type composition with Alert
+	if err := m.Alert.ContextValidate(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
+	if len(res) > 0 {
+		return errors.CompositeValidationError(res...)
+	}
+	return nil
+}
+
+func (m *GettableAlert) contextValidateAnnotations(ctx context.Context, formats strfmt.Registry) error {
+
+	if err := m.Annotations.ContextValidate(ctx, formats); err != nil {
+		ve := new(errors.Validation)
+		if stderrors.As(err, &ve) {
+			return ve.ValidateName("annotations")
+		}
+		ce := new(errors.CompositeError)
+		if stderrors.As(err, &ce) {
+			return ce.ValidateName("annotations")
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func (m *GettableAlert) contextValidateReceivers(ctx context.Context, formats strfmt.Registry) error {
+
+	for i := 0; i < len(m.Receivers); i++ {
+
+		if m.Receivers[i] != nil {
+
+			if swag.IsZero(m.Receivers[i]) { // not required
+				return nil
+			}
+
+			if err := m.Receivers[i].ContextValidate(ctx, formats); err != nil {
+				ve := new(errors.Validation)
+				if stderrors.As(err, &ve) {
+					return ve.ValidateName("receivers" + "." + strconv.Itoa(i))
+				}
+				ce := new(errors.CompositeError)
+				if stderrors.As(err, &ce) {
+					return ce.ValidateName("receivers" + "." + strconv.Itoa(i))
+				}
+
+				return err
+			}
+		}
+
+	}
+
+	return nil
+}
+
+func (m *GettableAlert) contextValidateStatus(ctx context.Context, formats strfmt.Registry) error {
+
+	if m.Status != nil {
+
+		if err := m.Status.ContextValidate(ctx, formats); err != nil {
+			ve := new(errors.Validation)
+			if stderrors.As(err, &ve) {
+				return ve.ValidateName("status")
+			}
+			ce := new(errors.CompositeError)
+			if stderrors.As(err, &ce) {
+				return ce.ValidateName("status")
+			}
+
+			return err
+		}
 	}
 
 	return nil

@@ -8,7 +8,315 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 )
+
+func TestRegexMatcherLimitsMetricsFeatureFlag(t *testing.T) {
+	ingestionRate := util_math.NewEWMARate(0.2, instanceIngestionRateTickInterval)
+	inflightPushRequests := util_math.MaxTracker{}
+	maxInflightQueryRequests := util_math.MaxTracker{}
+
+	// Test with feature flag disabled - metrics should be nil
+	t.Run("metrics are nil when feature flag is disabled", func(t *testing.T) {
+		reg := prometheus.NewRegistry()
+		m := newIngesterMetrics(reg, false, false, false, false,
+			func() *InstanceLimits { return &InstanceLimits{} },
+			ingestionRate, &inflightPushRequests, &maxInflightQueryRequests, false, false)
+
+		require.Nil(t, m.unoptimizedRegexPatternLength)
+		require.Nil(t, m.unoptimizedRegexLabelCardinality)
+		require.Nil(t, m.unoptimizedRegexTotalValueLength)
+		require.Nil(t, m.unoptimizedRegexRejectedTotal)
+	})
+
+	// Test with feature flag enabled - metrics should be initialized
+	t.Run("metrics are initialized when feature flag is enabled", func(t *testing.T) {
+		reg := prometheus.NewRegistry()
+		m := newIngesterMetrics(reg, false, false, false, false,
+			func() *InstanceLimits { return &InstanceLimits{} },
+			ingestionRate, &inflightPushRequests, &maxInflightQueryRequests, false, true)
+
+		require.NotNil(t, m.unoptimizedRegexPatternLength)
+		require.NotNil(t, m.unoptimizedRegexLabelCardinality)
+		require.NotNil(t, m.unoptimizedRegexTotalValueLength)
+		require.NotNil(t, m.unoptimizedRegexRejectedTotal)
+	})
+}
+
+func TestUnoptimizedRegexRejectedMetric(t *testing.T) {
+	ingestionRate := util_math.NewEWMARate(0.2, instanceIngestionRateTickInterval)
+	inflightPushRequests := util_math.MaxTracker{}
+	maxInflightQueryRequests := util_math.MaxTracker{}
+
+	t.Run("rejected metric increments correctly", func(t *testing.T) {
+		reg := prometheus.NewRegistry()
+		m := newIngesterMetrics(reg, false, false, false, false,
+			func() *InstanceLimits { return &InstanceLimits{} },
+			ingestionRate, &inflightPushRequests, &maxInflightQueryRequests, false, true)
+
+		require.NotNil(t, m.unoptimizedRegexRejectedTotal)
+
+		// Test incrementing different rejection reasons
+		m.unoptimizedRegexRejectedTotal.WithLabelValues("user1", "pattern_length").Inc()
+		m.unoptimizedRegexRejectedTotal.WithLabelValues("user1", "cardinality").Inc()
+		m.unoptimizedRegexRejectedTotal.WithLabelValues("user1", "cardinality").Inc()
+		m.unoptimizedRegexRejectedTotal.WithLabelValues("user2", "total_value_length").Inc()
+
+		err := testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+			# HELP cortex_ingester_unoptimized_regex_rejected_requests_total Total number of requests rejected due to unoptimized regex matcher limits per user and reason.
+			# TYPE cortex_ingester_unoptimized_regex_rejected_requests_total counter
+			cortex_ingester_unoptimized_regex_rejected_requests_total{reason="cardinality",user="user1"} 2
+			cortex_ingester_unoptimized_regex_rejected_requests_total{reason="pattern_length",user="user1"} 1
+			cortex_ingester_unoptimized_regex_rejected_requests_total{reason="total_value_length",user="user2"} 1
+		`), "cortex_ingester_unoptimized_regex_rejected_requests_total")
+		require.NoError(t, err)
+	})
+
+	t.Run("metric cleanup works correctly", func(t *testing.T) {
+		reg := prometheus.NewRegistry()
+		m := newIngesterMetrics(reg, false, false, false, false,
+			func() *InstanceLimits { return &InstanceLimits{} },
+			ingestionRate, &inflightPushRequests, &maxInflightQueryRequests, false, true)
+
+		require.NotNil(t, m.unoptimizedRegexRejectedTotal)
+
+		// Add metrics for multiple users
+		m.unoptimizedRegexRejectedTotal.WithLabelValues("user1", "pattern_length").Inc()
+		m.unoptimizedRegexRejectedTotal.WithLabelValues("user2", "cardinality").Inc()
+		m.ingestionDelaySeconds.WithLabelValues("user1").Observe(10.0)
+		m.ingestionDelaySeconds.WithLabelValues("user2").Observe(5.0)
+
+		// Delete user1 metrics
+		m.deletePerUserMetrics("user1")
+
+		// Only user2 metrics should remain
+		err := testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+			# HELP cortex_ingester_ingestion_delay_seconds Delay in seconds between sample ingestion time and sample timestamp.
+			# TYPE cortex_ingester_ingestion_delay_seconds histogram
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="1"} 0
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="5"} 1
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="10"} 1
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="30"} 1
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="60"} 1
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="120"} 1
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="300"} 1
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="600"} 1
+			cortex_ingester_ingestion_delay_seconds_bucket{user="user2",le="+Inf"} 1
+			cortex_ingester_ingestion_delay_seconds_sum{user="user2"} 5
+			cortex_ingester_ingestion_delay_seconds_count{user="user2"} 1
+			# HELP cortex_ingester_unoptimized_regex_rejected_requests_total Total number of requests rejected due to unoptimized regex matcher limits per user and reason.
+			# TYPE cortex_ingester_unoptimized_regex_rejected_requests_total counter
+			cortex_ingester_unoptimized_regex_rejected_requests_total{reason="cardinality",user="user2"} 1
+		`), "cortex_ingester_unoptimized_regex_rejected_requests_total", "cortex_ingester_ingestion_delay_seconds")
+		require.NoError(t, err)
+	})
+}
+
+func TestIngesterMetrics(t *testing.T) {
+	mainReg := prometheus.NewPedanticRegistry()
+	ingestionRate := util_math.NewEWMARate(0.2, instanceIngestionRateTickInterval)
+	inflightPushRequests := util_math.MaxTracker{}
+	maxInflightQueryRequests := util_math.MaxTracker{}
+	maxInflightQueryRequests.Track(98)
+	inflightPushRequests.Track(14)
+
+	m := newIngesterMetrics(mainReg,
+		false,
+		true,
+		false,
+		false,
+		func() *InstanceLimits {
+			return &InstanceLimits{
+				MaxIngestionRate:        12,
+				MaxInMemoryTenants:      1,
+				MaxInMemorySeries:       11,
+				MaxInflightPushRequests: 6,
+			}
+		},
+		ingestionRate,
+		&inflightPushRequests,
+		&maxInflightQueryRequests,
+		false,
+		true)
+
+	require.NotNil(t, m)
+
+	err := testutil.GatherAndCompare(mainReg, bytes.NewBufferString(`
+			# HELP cortex_ingester_inflight_push_requests Max number of inflight push requests in ingester in the last minute.
+			# TYPE cortex_ingester_inflight_push_requests gauge
+			cortex_ingester_inflight_push_requests 14
+			# HELP cortex_ingester_max_inflight_query_requests Max number of inflight query requests in ingester.
+			# TYPE cortex_ingester_max_inflight_query_requests gauge
+			cortex_ingester_max_inflight_query_requests 98
+			# HELP cortex_ingester_ingested_exemplars_failures_total The total number of exemplars that errored on ingestion.
+			# TYPE cortex_ingester_ingested_exemplars_failures_total counter
+			cortex_ingester_ingested_exemplars_failures_total 0
+			# HELP cortex_ingester_ingested_exemplars_total The total number of exemplars ingested.
+			# TYPE cortex_ingester_ingested_exemplars_total counter
+			cortex_ingester_ingested_exemplars_total 0
+			# HELP cortex_ingester_ingested_metadata_failures_total The total number of metadata that errored on ingestion.
+			# TYPE cortex_ingester_ingested_metadata_failures_total counter
+			cortex_ingester_ingested_metadata_failures_total 0
+			# HELP cortex_ingester_ingested_metadata_total The total number of metadata ingested.
+			# TYPE cortex_ingester_ingested_metadata_total counter
+			cortex_ingester_ingested_metadata_total 0
+			# HELP cortex_ingester_ingested_samples_failures_total The total number of samples that errored on ingestion.
+			# TYPE cortex_ingester_ingested_samples_failures_total counter
+			cortex_ingester_ingested_samples_failures_total 0
+			# HELP cortex_ingester_ingested_samples_total The total number of samples ingested.
+			# TYPE cortex_ingester_ingested_samples_total counter
+			cortex_ingester_ingested_samples_total 0
+			# HELP cortex_ingester_start_timestamp_append_failures_total Total number of failed appends for samples and histograms with a start timestamp.
+			# TYPE cortex_ingester_start_timestamp_append_failures_total counter
+			cortex_ingester_start_timestamp_append_failures_total{type="float"} 0
+			cortex_ingester_start_timestamp_append_failures_total{type="histogram"} 0
+			# HELP cortex_ingester_ingested_native_histograms_total The total number of native histograms ingested.
+			# TYPE cortex_ingester_ingested_native_histograms_total counter
+			cortex_ingester_ingested_native_histograms_total 0
+			# HELP cortex_ingester_ingested_native_histograms_failures_total The total number of native histograms that errored on ingestion.
+			# TYPE cortex_ingester_ingested_native_histograms_failures_total counter
+			cortex_ingester_ingested_native_histograms_failures_total 0
+			# HELP cortex_ingester_ingested_histogram_buckets The number of ingested native histogram buckets per user.
+			# TYPE cortex_ingester_ingested_histogram_buckets histogram
+			# HELP cortex_ingester_ingestion_rate_samples_per_second Current ingestion rate in samples/sec that ingester is using to limit access.
+			# TYPE cortex_ingester_ingestion_rate_samples_per_second gauge
+			cortex_ingester_ingestion_rate_samples_per_second 0
+			# HELP cortex_ingester_instance_limits Instance limits used by this ingester.
+			# TYPE cortex_ingester_instance_limits gauge
+			cortex_ingester_instance_limits{limit="max_inflight_push_requests"} 6
+			cortex_ingester_instance_limits{limit="max_ingestion_rate"} 12
+			cortex_ingester_instance_limits{limit="max_series"} 11
+			cortex_ingester_instance_limits{limit="max_tenants"} 1
+			# HELP cortex_ingester_memory_metadata The current number of metadata in memory.
+			# TYPE cortex_ingester_memory_metadata gauge
+			cortex_ingester_memory_metadata 0
+			# HELP cortex_ingester_memory_series The current number of series in memory.
+			# TYPE cortex_ingester_memory_series gauge
+			cortex_ingester_memory_series 0
+			# HELP cortex_ingester_memory_users The current number of users in memory.
+			# TYPE cortex_ingester_memory_users gauge
+			cortex_ingester_memory_users 0
+			# HELP cortex_ingester_queried_chunks The total number of chunks returned from queries.
+			# TYPE cortex_ingester_queried_chunks histogram
+			cortex_ingester_queried_chunks_bucket{le="10"} 0
+			cortex_ingester_queried_chunks_bucket{le="80"} 0
+			cortex_ingester_queried_chunks_bucket{le="640"} 0
+			cortex_ingester_queried_chunks_bucket{le="5120"} 0
+			cortex_ingester_queried_chunks_bucket{le="40960"} 0
+			cortex_ingester_queried_chunks_bucket{le="327680"} 0
+			cortex_ingester_queried_chunks_bucket{le="2.62144e+06"} 0
+			cortex_ingester_queried_chunks_bucket{le="+Inf"} 0
+			cortex_ingester_queried_chunks_sum 0
+			cortex_ingester_queried_chunks_count 0
+			# HELP cortex_ingester_queried_exemplars The total number of exemplars returned from queries.
+			# TYPE cortex_ingester_queried_exemplars histogram
+			cortex_ingester_queried_exemplars_bucket{le="10"} 0
+			cortex_ingester_queried_exemplars_bucket{le="50"} 0
+			cortex_ingester_queried_exemplars_bucket{le="250"} 0
+			cortex_ingester_queried_exemplars_bucket{le="1250"} 0
+			cortex_ingester_queried_exemplars_bucket{le="6250"} 0
+			cortex_ingester_queried_exemplars_bucket{le="+Inf"} 0
+			cortex_ingester_queried_exemplars_sum 0
+			cortex_ingester_queried_exemplars_count 0
+			# HELP cortex_ingester_queried_samples The total number of samples returned from queries.
+			# TYPE cortex_ingester_queried_samples histogram
+			cortex_ingester_queried_samples_bucket{le="10"} 0
+			cortex_ingester_queried_samples_bucket{le="80"} 0
+			cortex_ingester_queried_samples_bucket{le="640"} 0
+			cortex_ingester_queried_samples_bucket{le="5120"} 0
+			cortex_ingester_queried_samples_bucket{le="40960"} 0
+			cortex_ingester_queried_samples_bucket{le="327680"} 0
+			cortex_ingester_queried_samples_bucket{le="2.62144e+06"} 0
+			cortex_ingester_queried_samples_bucket{le="2.097152e+07"} 0
+			cortex_ingester_queried_samples_bucket{le="+Inf"} 0
+			cortex_ingester_queried_samples_sum 0
+			cortex_ingester_queried_samples_count 0
+			# HELP cortex_ingester_queried_series The total number of series returned from queries.
+			# TYPE cortex_ingester_queried_series histogram
+			cortex_ingester_queried_series_bucket{le="10"} 0
+			cortex_ingester_queried_series_bucket{le="80"} 0
+			cortex_ingester_queried_series_bucket{le="640"} 0
+			cortex_ingester_queried_series_bucket{le="5120"} 0
+			cortex_ingester_queried_series_bucket{le="40960"} 0
+			cortex_ingester_queried_series_bucket{le="327680"} 0
+			cortex_ingester_queried_series_bucket{le="+Inf"} 0
+			cortex_ingester_queried_series_sum 0
+			cortex_ingester_queried_series_count 0
+			# HELP cortex_ingester_queries_total The total number of queries the ingester has handled.
+			# TYPE cortex_ingester_queries_total counter
+			cortex_ingester_queries_total 0
+			# HELP cortex_ingester_unoptimized_regex_pattern_length_bytes Length (in bytes) of unoptimized regex patterns in queries.
+			# TYPE cortex_ingester_unoptimized_regex_pattern_length_bytes histogram
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="1"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="2"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="4"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="8"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="16"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="32"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="64"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="128"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="256"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="512"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="1024"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="2048"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_bucket{le="+Inf"} 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_sum 0
+			cortex_ingester_unoptimized_regex_pattern_length_bytes_count 0
+			# HELP cortex_ingester_unoptimized_regex_label_cardinality Cardinality of labels queried with unoptimized regex matchers.
+			# TYPE cortex_ingester_unoptimized_regex_label_cardinality histogram
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="1"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="4"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="16"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="64"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="256"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="1024"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="4096"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="16384"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="65536"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="262144"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_bucket{le="+Inf"} 0
+			cortex_ingester_unoptimized_regex_label_cardinality_sum 0
+			cortex_ingester_unoptimized_regex_label_cardinality_count 0
+			# HELP cortex_ingester_unoptimized_regex_total_value_length_bytes Total length (in bytes) of all label values for labels queried with unoptimized regex matchers.
+			# TYPE cortex_ingester_unoptimized_regex_total_value_length_bytes histogram
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="1"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="4"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="16"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="64"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="256"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="1024"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="4096"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="16384"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="65536"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="262144"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="1.048576e+06"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="4.194304e+06"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_bucket{le="+Inf"} 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_sum 0
+			cortex_ingester_unoptimized_regex_total_value_length_bytes_count 0
+			# HELP cortex_ingester_unoptimized_regex_rejected_requests_total Total number of requests rejected due to unoptimized regex matcher limits per user and reason.
+			# TYPE cortex_ingester_unoptimized_regex_rejected_requests_total counter
+	`))
+	require.NoError(t, err)
+
+	require.Equal(t, int64(98), maxInflightQueryRequests.Load())
+	maxInflightQueryRequests.Tick()
+
+	err = testutil.GatherAndCompare(mainReg, bytes.NewBufferString(`
+			# HELP cortex_ingester_max_inflight_query_requests Max number of inflight query requests in ingester.
+			# TYPE cortex_ingester_max_inflight_query_requests gauge
+			cortex_ingester_max_inflight_query_requests 98
+	`), "cortex_ingester_max_inflight_query_requests")
+	require.NoError(t, err)
+	maxInflightQueryRequests.Tick()
+	err = testutil.GatherAndCompare(mainReg, bytes.NewBufferString(`
+			# HELP cortex_ingester_max_inflight_query_requests Max number of inflight query requests in ingester.
+			# TYPE cortex_ingester_max_inflight_query_requests gauge
+			cortex_ingester_max_inflight_query_requests 0
+	`), "cortex_ingester_max_inflight_query_requests")
+	require.NoError(t, err)
+}
 
 func TestTSDBMetrics(t *testing.T) {
 	mainReg := prometheus.NewPedanticRegistry()
@@ -39,6 +347,11 @@ func TestTSDBMetrics(t *testing.T) {
 			# TYPE cortex_ingester_shipper_upload_failures_total counter
 			# 4*(12345 + 85787 + 999)
 			cortex_ingester_shipper_upload_failures_total 396524
+
+            # HELP cortex_ingester_shipper_corrupted_blocks_total Total number of TSDB blocks corrupted
+			# TYPE cortex_ingester_shipper_corrupted_blocks_total counter
+			# 30*(12345 + 85787 + 999)
+			cortex_ingester_shipper_corrupted_blocks_total 2973930
 
 			# HELP cortex_ingester_tsdb_compactions_total Total number of TSDB compactions that were executed.
 			# TYPE cortex_ingester_tsdb_compactions_total counter
@@ -88,6 +401,18 @@ func TestTSDBMetrics(t *testing.T) {
 			# TYPE cortex_ingester_tsdb_wal_corruptions_total counter
 			cortex_ingester_tsdb_wal_corruptions_total 2.676537e+06
 
+			# HELP cortex_ingester_tsdb_wal_replay_unknown_refs_total Total number of unknown series references encountered during TSDB WAL replay.
+			# TYPE cortex_ingester_tsdb_wal_replay_unknown_refs_total counter
+			cortex_ingester_tsdb_wal_replay_unknown_refs_total{type="series"} 300
+			cortex_ingester_tsdb_wal_replay_unknown_refs_total{type="samples"} 303
+			cortex_ingester_tsdb_wal_replay_unknown_refs_total{type="metadata"} 306
+
+			# HELP cortex_ingester_tsdb_wbl_replay_unknown_refs_total Total number of unknown series references encountered during TSDB WBL replay.
+			# TYPE cortex_ingester_tsdb_wbl_replay_unknown_refs_total counter
+			cortex_ingester_tsdb_wbl_replay_unknown_refs_total{type="exemplars"} 300
+			cortex_ingester_tsdb_wbl_replay_unknown_refs_total{type="histograms"} 303
+			cortex_ingester_tsdb_wbl_replay_unknown_refs_total{type="tombstones"} 306
+
 			# HELP cortex_ingester_tsdb_wal_writes_failed_total Total number of TSDB WAL writes that failed.
 			# TYPE cortex_ingester_tsdb_wal_writes_failed_total counter
 			cortex_ingester_tsdb_wal_writes_failed_total 1486965
@@ -104,7 +429,22 @@ func TestTSDBMetrics(t *testing.T) {
 			# TYPE cortex_ingester_tsdb_head_gc_duration_seconds summary
 			cortex_ingester_tsdb_head_gc_duration_seconds_sum 9
 			cortex_ingester_tsdb_head_gc_duration_seconds_count 3
-
+        	# HELP cortex_ingester_tsdb_head_out_of_order_samples_appended_total Total number of appended out of order samples.
+        	# TYPE cortex_ingester_tsdb_head_out_of_order_samples_appended_total counter
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="float",user="user1"} 102
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="float",user="user2"} 102
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="float",user="user3"} 102
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="histogram",user="user1"} 103
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="histogram",user="user2"} 103
+            cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="histogram",user="user3"} 103
+        	# HELP cortex_ingester_tsdb_head_samples_appended_total Total number of appended samples.
+        	# TYPE cortex_ingester_tsdb_head_samples_appended_total counter
+			cortex_ingester_tsdb_head_samples_appended_total{type="float",user="user1"} 101
+			cortex_ingester_tsdb_head_samples_appended_total{type="float",user="user2"} 101
+			cortex_ingester_tsdb_head_samples_appended_total{type="float",user="user3"} 101
+        	cortex_ingester_tsdb_head_samples_appended_total{type="histogram",user="user1"} 102
+        	cortex_ingester_tsdb_head_samples_appended_total{type="histogram",user="user2"} 102
+        	cortex_ingester_tsdb_head_samples_appended_total{type="histogram",user="user3"} 102
 			# HELP cortex_ingester_tsdb_checkpoint_deletions_failed_total Total number of TSDB checkpoint deletions that failed.
 			# TYPE cortex_ingester_tsdb_checkpoint_deletions_failed_total counter
 			cortex_ingester_tsdb_checkpoint_deletions_failed_total 1586096
@@ -120,6 +460,23 @@ func TestTSDBMetrics(t *testing.T) {
 			# HELP cortex_ingester_tsdb_checkpoint_creations_total Total number of TSDB checkpoint creations attempted.
 			# TYPE cortex_ingester_tsdb_checkpoint_creations_total counter
 			cortex_ingester_tsdb_checkpoint_creations_total 1883489
+
+			# HELP cortex_ingester_tsdb_wal_record_part_writes_total Total number of WAL record parts written before flushing.
+			# TYPE cortex_ingester_tsdb_wal_record_part_writes_total counter
+			# 32*(12345 + 85787 + 999)
+			cortex_ingester_tsdb_wal_record_part_writes_total 3172192
+
+			# HELP cortex_ingester_tsdb_wal_record_parts_bytes_written_total Total number of WAL record part bytes written before flushing, including CRC and compression headers.
+			# TYPE cortex_ingester_tsdb_wal_record_parts_bytes_written_total counter
+			# 33*(12345 + 85787 + 999)
+			cortex_ingester_tsdb_wal_record_parts_bytes_written_total 3271323
+
+			# HELP cortex_ingester_tsdb_wal_record_bytes_saved_total Total number of bytes saved by the optional WAL record compression.
+			# TYPE cortex_ingester_tsdb_wal_record_bytes_saved_total counter
+			# 34*(12345 + 85787 + 999)
+			cortex_ingester_tsdb_wal_record_bytes_saved_total{compression="snappy"} 3370454
+			# 35*(12345 + 85787 + 999)
+			cortex_ingester_tsdb_wal_record_bytes_saved_total{compression="zstd"} 3469585
 
 			# HELP cortex_ingester_memory_series_created_total The total number of series that were created per user.
 			# TYPE cortex_ingester_memory_series_created_total counter
@@ -167,7 +524,17 @@ func TestTSDBMetrics(t *testing.T) {
 			# HELP cortex_ingester_tsdb_mmap_chunk_corruptions_total Total number of memory-mapped TSDB chunk corruptions.
 			# TYPE cortex_ingester_tsdb_mmap_chunk_corruptions_total counter
 			cortex_ingester_tsdb_mmap_chunk_corruptions_total 2577406
-
+        	# HELP cortex_ingester_tsdb_mmap_chunks_total Total number of chunks that were memory-mapped.
+        	# TYPE cortex_ingester_tsdb_mmap_chunks_total counter
+        	cortex_ingester_tsdb_mmap_chunks_total 312
+        	# HELP cortex_ingester_tsdb_out_of_order_samples_total Total number of out of order samples ingestion failed attempts due to out of order being disabled.
+			# TYPE cortex_ingester_tsdb_out_of_order_samples_total counter
+        	cortex_ingester_tsdb_out_of_order_samples_total{type="float",user="user1"} 102
+        	cortex_ingester_tsdb_out_of_order_samples_total{type="float",user="user2"} 102
+			cortex_ingester_tsdb_out_of_order_samples_total{type="float",user="user3"} 102
+        	cortex_ingester_tsdb_out_of_order_samples_total{type="histogram",user="user1"} 103
+			cortex_ingester_tsdb_out_of_order_samples_total{type="histogram",user="user2"} 103
+        	cortex_ingester_tsdb_out_of_order_samples_total{type="histogram",user="user3"} 103
 			# HELP cortex_ingester_tsdb_blocks_loaded Number of currently loaded data blocks
 			# TYPE cortex_ingester_tsdb_blocks_loaded gauge
 			cortex_ingester_tsdb_blocks_loaded 15
@@ -175,7 +542,41 @@ func TestTSDBMetrics(t *testing.T) {
 			# HELP cortex_ingester_tsdb_reloads_total Number of times the database reloaded block data from disk.
 			# TYPE cortex_ingester_tsdb_reloads_total counter
 			cortex_ingester_tsdb_reloads_total 30
-
+        	# HELP cortex_ingester_tsdb_sample_ooo_delta Delta in seconds by which a sample is considered out of order (reported regardless of OOO time window and whether sample is accepted or not).
+        	# TYPE cortex_ingester_tsdb_sample_ooo_delta histogram
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="600"} 0
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="1800"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="3600"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="7200"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="10800"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="21600"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="43200"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="+Inf"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_sum{user="user1"} 900
+            cortex_ingester_tsdb_sample_ooo_delta_count{user="user1"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="600"} 0
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="1800"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="3600"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="7200"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="10800"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="21600"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="43200"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="+Inf"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_sum{user="user2"} 900
+            cortex_ingester_tsdb_sample_ooo_delta_count{user="user2"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user3",le="600"} 0
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user3",le="1800"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user3",le="3600"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user3",le="7200"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user3",le="10800"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user3",le="21600"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user3",le="43200"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user3",le="+Inf"} 1
+            cortex_ingester_tsdb_sample_ooo_delta_sum{user="user3"} 900
+            cortex_ingester_tsdb_sample_ooo_delta_count{user="user3"} 1
+        	# HELP cortex_ingester_tsdb_snapshot_replay_error_total Total number snapshot replays that failed.
+        	# TYPE cortex_ingester_tsdb_snapshot_replay_error_total counter
+        	cortex_ingester_tsdb_snapshot_replay_error_total 309
 			# HELP cortex_ingester_tsdb_reloads_failures_total Number of times the database failed to reloadBlocks block data from disk.
 			# TYPE cortex_ingester_tsdb_reloads_failures_total counter
 			cortex_ingester_tsdb_reloads_failures_total 21
@@ -202,10 +603,16 @@ func TestTSDBMetrics(t *testing.T) {
 			cortex_ingester_tsdb_exemplar_last_exemplars_timestamp_seconds{user="user2"} 1234
 			cortex_ingester_tsdb_exemplar_last_exemplars_timestamp_seconds{user="user3"} 1234
 
+            # HELP cortex_ingester_tsdb_data_replay_duration_seconds Time taken to replay the tsdb data on disk.
+			# TYPE cortex_ingester_tsdb_data_replay_duration_seconds gauge
+			cortex_ingester_tsdb_data_replay_duration_seconds{user="user1"} 12345
+			cortex_ingester_tsdb_data_replay_duration_seconds{user="user2"} 12345
+			cortex_ingester_tsdb_data_replay_duration_seconds{user="user3"} 12345
+
 			# HELP cortex_ingester_tsdb_exemplar_out_of_order_exemplars_total Total number of out of order exemplar ingestion failed attempts.
 			# TYPE cortex_ingester_tsdb_exemplar_out_of_order_exemplars_total counter
 			cortex_ingester_tsdb_exemplar_out_of_order_exemplars_total 9
-			
+
 			# HELP cortex_ingester_tsdb_exemplar_series_with_exemplars_in_storage Number of TSDB series with exemplars currently in storage.
 			# TYPE cortex_ingester_tsdb_exemplar_series_with_exemplars_in_storage gauge
 			cortex_ingester_tsdb_exemplar_series_with_exemplars_in_storage{user="user1"} 1
@@ -219,6 +626,17 @@ func TestTSDBMetrics(t *testing.T) {
 			# HELP cortex_ingester_tsdb_exemplar_exemplars_in_storage Number of TSDB exemplars currently in storage.
 			# TYPE cortex_ingester_tsdb_exemplar_exemplars_in_storage gauge
 			cortex_ingester_tsdb_exemplar_exemplars_in_storage 30
+			# HELP cortex_ingester_tsdb_head_stale_series Total number of stale series in the head block.
+			# TYPE cortex_ingester_tsdb_head_stale_series gauge
+			cortex_ingester_tsdb_head_stale_series{user="user1"} 382695
+			cortex_ingester_tsdb_head_stale_series{user="user2"} 2659397
+			cortex_ingester_tsdb_head_stale_series{user="user3"} 30969
+			# HELP cortex_ingester_tsdb_head_max_timestamp Maximum timestamp of the head block, in milliseconds since epoch.
+			# TYPE cortex_ingester_tsdb_head_max_timestamp gauge
+			# 36 * base
+			cortex_ingester_tsdb_head_max_timestamp{user="user1"} 444420
+			cortex_ingester_tsdb_head_max_timestamp{user="user2"} 3088332
+			cortex_ingester_tsdb_head_max_timestamp{user="user3"} 35964
 	`))
 	require.NoError(t, err)
 }
@@ -253,6 +671,12 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# TYPE cortex_ingester_shipper_upload_failures_total counter
 			# 4*(12345 + 85787 + 999)
 			cortex_ingester_shipper_upload_failures_total 396524
+
+            # HELP cortex_ingester_shipper_corrupted_blocks_total Total number of TSDB blocks corrupted
+			# TYPE cortex_ingester_shipper_corrupted_blocks_total counter
+			# 30*(12345 + 85787 + 999)
+			cortex_ingester_shipper_corrupted_blocks_total 2973930
+
 
 			# HELP cortex_ingester_tsdb_compactions_total Total number of TSDB compactions that were executed.
 			# TYPE cortex_ingester_tsdb_compactions_total counter
@@ -302,6 +726,18 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# TYPE cortex_ingester_tsdb_wal_corruptions_total counter
 			cortex_ingester_tsdb_wal_corruptions_total 2.676537e+06
 
+			# HELP cortex_ingester_tsdb_wal_replay_unknown_refs_total Total number of unknown series references encountered during TSDB WAL replay.
+			# TYPE cortex_ingester_tsdb_wal_replay_unknown_refs_total counter
+			cortex_ingester_tsdb_wal_replay_unknown_refs_total{type="series"} 300
+			cortex_ingester_tsdb_wal_replay_unknown_refs_total{type="samples"} 303
+			cortex_ingester_tsdb_wal_replay_unknown_refs_total{type="metadata"} 306
+
+			# HELP cortex_ingester_tsdb_wbl_replay_unknown_refs_total Total number of unknown series references encountered during TSDB WBL replay.
+			# TYPE cortex_ingester_tsdb_wbl_replay_unknown_refs_total counter
+			cortex_ingester_tsdb_wbl_replay_unknown_refs_total{type="exemplars"} 300
+			cortex_ingester_tsdb_wbl_replay_unknown_refs_total{type="histograms"} 303
+			cortex_ingester_tsdb_wbl_replay_unknown_refs_total{type="tombstones"} 306
+
 			# HELP cortex_ingester_tsdb_wal_writes_failed_total Total number of TSDB WAL writes that failed.
 			# TYPE cortex_ingester_tsdb_wal_writes_failed_total counter
 			cortex_ingester_tsdb_wal_writes_failed_total 1486965
@@ -318,6 +754,18 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# TYPE cortex_ingester_tsdb_head_gc_duration_seconds summary
 			cortex_ingester_tsdb_head_gc_duration_seconds_sum 9
 			cortex_ingester_tsdb_head_gc_duration_seconds_count 3
+        	# HELP cortex_ingester_tsdb_head_out_of_order_samples_appended_total Total number of appended out of order samples.
+        	# TYPE cortex_ingester_tsdb_head_out_of_order_samples_appended_total counter
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="float",user="user1"} 102
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="float",user="user2"} 102
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="histogram",user="user1"} 103
+        	cortex_ingester_tsdb_head_out_of_order_samples_appended_total{type="histogram",user="user2"} 103
+        	# HELP cortex_ingester_tsdb_head_samples_appended_total Total number of appended samples.
+        	# TYPE cortex_ingester_tsdb_head_samples_appended_total counter
+			cortex_ingester_tsdb_head_samples_appended_total{type="float",user="user1"} 101
+			cortex_ingester_tsdb_head_samples_appended_total{type="float",user="user2"} 101
+        	cortex_ingester_tsdb_head_samples_appended_total{type="histogram",user="user1"} 102
+        	cortex_ingester_tsdb_head_samples_appended_total{type="histogram",user="user2"} 102
 
 			# HELP cortex_ingester_tsdb_checkpoint_deletions_failed_total Total number of TSDB checkpoint deletions that failed.
 			# TYPE cortex_ingester_tsdb_checkpoint_deletions_failed_total counter
@@ -334,6 +782,23 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# HELP cortex_ingester_tsdb_checkpoint_creations_total Total number of TSDB checkpoint creations attempted.
 			# TYPE cortex_ingester_tsdb_checkpoint_creations_total counter
 			cortex_ingester_tsdb_checkpoint_creations_total 1883489
+
+			# HELP cortex_ingester_tsdb_wal_record_part_writes_total Total number of WAL record parts written before flushing.
+			# TYPE cortex_ingester_tsdb_wal_record_part_writes_total counter
+			# 32*(12345 + 85787 + 999) - counter retained after user3 removal
+			cortex_ingester_tsdb_wal_record_part_writes_total 3172192
+
+			# HELP cortex_ingester_tsdb_wal_record_parts_bytes_written_total Total number of WAL record part bytes written before flushing, including CRC and compression headers.
+			# TYPE cortex_ingester_tsdb_wal_record_parts_bytes_written_total counter
+			# 33*(12345 + 85787 + 999) - counter retained after user3 removal
+			cortex_ingester_tsdb_wal_record_parts_bytes_written_total 3271323
+
+			# HELP cortex_ingester_tsdb_wal_record_bytes_saved_total Total number of bytes saved by the optional WAL record compression.
+			# TYPE cortex_ingester_tsdb_wal_record_bytes_saved_total counter
+			# 34*(12345 + 85787 + 999) - counter retained after user3 removal
+			cortex_ingester_tsdb_wal_record_bytes_saved_total{compression="snappy"} 3370454
+			# 35*(12345 + 85787 + 999) - counter retained after user3 removal
+			cortex_ingester_tsdb_wal_record_bytes_saved_total{compression="zstd"} 3469585
 
 			# HELP cortex_ingester_memory_series_created_total The total number of series that were created per user.
 			# TYPE cortex_ingester_memory_series_created_total counter
@@ -377,7 +842,15 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# HELP cortex_ingester_tsdb_mmap_chunk_corruptions_total Total number of memory-mapped TSDB chunk corruptions.
 			# TYPE cortex_ingester_tsdb_mmap_chunk_corruptions_total counter
 			cortex_ingester_tsdb_mmap_chunk_corruptions_total 2577406
-
+        	# HELP cortex_ingester_tsdb_mmap_chunks_total Total number of chunks that were memory-mapped.
+        	# TYPE cortex_ingester_tsdb_mmap_chunks_total counter
+        	cortex_ingester_tsdb_mmap_chunks_total 312
+        	# HELP cortex_ingester_tsdb_out_of_order_samples_total Total number of out of order samples ingestion failed attempts due to out of order being disabled.
+			# TYPE cortex_ingester_tsdb_out_of_order_samples_total counter
+        	cortex_ingester_tsdb_out_of_order_samples_total{type="float",user="user1"} 102
+			cortex_ingester_tsdb_out_of_order_samples_total{type="float",user="user2"} 102
+        	cortex_ingester_tsdb_out_of_order_samples_total{type="histogram",user="user1"} 103
+			cortex_ingester_tsdb_out_of_order_samples_total{type="histogram",user="user2"} 103
 			# HELP cortex_ingester_tsdb_blocks_loaded Number of currently loaded data blocks
 			# TYPE cortex_ingester_tsdb_blocks_loaded gauge
 			cortex_ingester_tsdb_blocks_loaded 10
@@ -385,7 +858,31 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# HELP cortex_ingester_tsdb_reloads_total Number of times the database reloaded block data from disk.
 			# TYPE cortex_ingester_tsdb_reloads_total counter
 			cortex_ingester_tsdb_reloads_total 30
-
+        	# HELP cortex_ingester_tsdb_sample_ooo_delta Delta in seconds by which a sample is considered out of order (reported regardless of OOO time window and whether sample is accepted or not).
+        	# TYPE cortex_ingester_tsdb_sample_ooo_delta histogram
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="600"} 0
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="1800"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="3600"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="7200"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="10800"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="21600"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="43200"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user1",le="+Inf"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_sum{user="user1"} 900
+        	cortex_ingester_tsdb_sample_ooo_delta_count{user="user1"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="600"} 0
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="1800"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="3600"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="7200"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="10800"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="21600"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="43200"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_bucket{user="user2",le="+Inf"} 1
+        	cortex_ingester_tsdb_sample_ooo_delta_sum{user="user2"} 900
+        	cortex_ingester_tsdb_sample_ooo_delta_count{user="user2"} 1
+        	# HELP cortex_ingester_tsdb_snapshot_replay_error_total Total number snapshot replays that failed.
+        	# TYPE cortex_ingester_tsdb_snapshot_replay_error_total counter
+        	cortex_ingester_tsdb_snapshot_replay_error_total 309
 			# HELP cortex_ingester_tsdb_reloads_failures_total Number of times the database failed to reloadBlocks block data from disk.
 			# TYPE cortex_ingester_tsdb_reloads_failures_total counter
 			cortex_ingester_tsdb_reloads_failures_total 21
@@ -409,10 +906,15 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			cortex_ingester_tsdb_exemplar_last_exemplars_timestamp_seconds{user="user1"} 1234
 			cortex_ingester_tsdb_exemplar_last_exemplars_timestamp_seconds{user="user2"} 1234
 
+            # HELP cortex_ingester_tsdb_data_replay_duration_seconds Time taken to replay the tsdb data on disk.
+			# TYPE cortex_ingester_tsdb_data_replay_duration_seconds gauge
+			cortex_ingester_tsdb_data_replay_duration_seconds{user="user1"} 12345
+			cortex_ingester_tsdb_data_replay_duration_seconds{user="user2"} 12345
+
 			# HELP cortex_ingester_tsdb_exemplar_out_of_order_exemplars_total Total number of out of order exemplar ingestion failed attempts.
 			# TYPE cortex_ingester_tsdb_exemplar_out_of_order_exemplars_total counter
 			cortex_ingester_tsdb_exemplar_out_of_order_exemplars_total 9
-			
+
 			# HELP cortex_ingester_tsdb_exemplar_series_with_exemplars_in_storage Number of TSDB series with exemplars currently in storage.
 			# TYPE cortex_ingester_tsdb_exemplar_series_with_exemplars_in_storage gauge
 			cortex_ingester_tsdb_exemplar_series_with_exemplars_in_storage{user="user1"} 1
@@ -425,6 +927,15 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# HELP cortex_ingester_tsdb_exemplar_exemplars_in_storage Number of TSDB exemplars currently in storage.
 			# TYPE cortex_ingester_tsdb_exemplar_exemplars_in_storage gauge
 			cortex_ingester_tsdb_exemplar_exemplars_in_storage 20
+			# HELP cortex_ingester_tsdb_head_stale_series Total number of stale series in the head block.
+			# TYPE cortex_ingester_tsdb_head_stale_series gauge
+			cortex_ingester_tsdb_head_stale_series{user="user1"} 382695
+			cortex_ingester_tsdb_head_stale_series{user="user2"} 2659397
+			# HELP cortex_ingester_tsdb_head_max_timestamp Maximum timestamp of the head block, in milliseconds since epoch.
+			# TYPE cortex_ingester_tsdb_head_max_timestamp gauge
+			# 36 * base
+			cortex_ingester_tsdb_head_max_timestamp{user="user1"} 444420
+			cortex_ingester_tsdb_head_max_timestamp{user="user2"} 3088332
 	`))
 	require.NoError(t, err)
 }
@@ -456,6 +967,12 @@ func populateTSDBMetrics(base float64) *prometheus.Registry {
 		Help: "Total number of block upload failures",
 	})
 	uploadFailures.Add(4 * base)
+
+	corruptedBlocks := promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "thanos_shipper_corrupted_blocks_total",
+		Help: "Total number of corrupted blocks",
+	})
+	corruptedBlocks.Add(30 * base)
 
 	// TSDB Head
 	seriesCreated := promauto.With(r).NewCounter(prometheus.CounterOpts{
@@ -608,6 +1125,76 @@ func populateTSDBMetrics(base float64) *prometheus.Registry {
 	})
 	gcDuration.Observe(3)
 
+	samplesAppended := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_head_samples_appended_total",
+		Help: "Total number of appended samples.",
+	}, []string{"type"})
+	samplesAppended.WithLabelValues(sampleMetricTypeFloat).Add(101)
+	samplesAppended.WithLabelValues(sampleMetricTypeHistogram).Add(102)
+
+	outOfOrderSamplesAppended := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_head_out_of_order_samples_appended_total",
+		Help: "Total number of appended out of order samples.",
+	}, []string{"type"})
+	outOfOrderSamplesAppended.WithLabelValues(sampleMetricTypeFloat).Add(102)
+	outOfOrderSamplesAppended.WithLabelValues(sampleMetricTypeHistogram).Add(103)
+
+	oooSamples := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_out_of_order_samples_total",
+		Help: "Total number of out of order samples ingestion failed attempts due to out of order being disabled.",
+	}, []string{"type"})
+	oooSamples.WithLabelValues(sampleMetricTypeFloat).Add(102)
+	oooSamples.WithLabelValues(sampleMetricTypeHistogram).Add(103)
+
+	snapshotReplayErrorTotal := promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_snapshot_replay_error_total",
+		Help: "Total number snapshot replays that failed.",
+	})
+	snapshotReplayErrorTotal.Add(103)
+
+	walReplayUnknownRefsTotal := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_wal_replay_unknown_refs_total",
+		Help: "Total number of unknown series references encountered during WAL replay.",
+	}, []string{"type"})
+	walReplayUnknownRefsTotal.WithLabelValues(typeSeries).Add(100)
+	walReplayUnknownRefsTotal.WithLabelValues(typeSamples).Add(101)
+	walReplayUnknownRefsTotal.WithLabelValues(typeMetadata).Add(102)
+
+	wblReplayUnknownRefsTotal := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_wbl_replay_unknown_refs_total",
+		Help: "Total number of unknown series references encountered during WBL replay.",
+	}, []string{"type"})
+	wblReplayUnknownRefsTotal.WithLabelValues(typeExemplars).Add(100)
+	wblReplayUnknownRefsTotal.WithLabelValues(typeHistograms).Add(101)
+	wblReplayUnknownRefsTotal.WithLabelValues(typeTombstones).Add(102)
+
+	oooHistogram := promauto.With(r).NewHistogram(prometheus.HistogramOpts{
+		Name: "prometheus_tsdb_sample_ooo_delta",
+		Help: "Delta in seconds by which a sample is considered out of order (reported regardless of OOO time window and whether sample is accepted or not).",
+		Buckets: []float64{
+			60 * 10,      // 10 min
+			60 * 30,      // 30 min
+			60 * 60,      // 60 min
+			60 * 60 * 2,  // 2h
+			60 * 60 * 3,  // 3h
+			60 * 60 * 6,  // 6h
+			60 * 60 * 12, // 12h
+		},
+	})
+	oooHistogram.Observe(60 * 15)
+
+	mmapChunksTotal := promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_mmap_chunks_total",
+		Help: "Total number of chunks that were memory-mapped.",
+	})
+	mmapChunksTotal.Add(104)
+
+	dataTotalReplayDuration := promauto.With(r).NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_data_replay_duration_seconds",
+		Help: "Time taken to replay the data on disk.",
+	})
+	dataTotalReplayDuration.Set(12345)
+
 	loadedBlocks := promauto.With(r).NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_blocks_loaded",
 		Help: "Number of currently loaded data blocks",
@@ -675,6 +1262,39 @@ func populateTSDBMetrics(base float64) *prometheus.Registry {
 		Help: "Total number of out of order exemplar ingestion failed attempts.",
 	})
 	exemplarsOutOfOrderTotal.Add(3)
+
+	headStaleSeries := promauto.With(r).NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_head_stale_series",
+		Help: "Total number of stale series in the head block.",
+	})
+	headStaleSeries.Set(31 * base)
+
+	headMaxTime := promauto.With(r).NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_head_max_time",
+		Help: "Maximum timestamp of the head block. The unit is decided by the library consumer.",
+	})
+	headMaxTime.Set(36 * base)
+
+	recordPartWrites := promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_wal_record_part_writes_total",
+		Help: "Total number of record parts written before flushing.",
+	})
+	recordPartWrites.Add(32 * base)
+
+	recordPartBytes := promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_wal_record_parts_bytes_written_total",
+		Help: "Total number of record part bytes written before flushing, including" +
+			" CRC and compression headers.",
+	})
+	recordPartBytes.Add(33 * base)
+
+	recordBytesSaved := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_wal_record_bytes_saved_total",
+		Help: "Total number of bytes saved by the optional record compression." +
+			" Use this metric to learn about the effectiveness compression.",
+	}, []string{"compression"})
+	recordBytesSaved.WithLabelValues("snappy").Add(34 * base)
+	recordBytesSaved.WithLabelValues("zstd").Add(35 * base)
 
 	return r
 }

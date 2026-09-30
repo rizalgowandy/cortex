@@ -4,14 +4,15 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/grpcclient"
-	"github.com/grafana/dskit/ring/client"
-	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
+
+	"github.com/cortexproject/cortex/pkg/ring/client"
+	"github.com/cortexproject/cortex/pkg/util/grpcclient"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 // ClientsPool is the interface used to get the client from the pool for a specified address.
@@ -53,9 +54,12 @@ func newRulerClientPool(clientCfg grpcclient.Config, logger log.Logger, reg prom
 
 func newRulerClientFactory(clientCfg grpcclient.Config, reg prometheus.Registerer) client.PoolFactory {
 	requestDuration := promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "cortex_ruler_client_request_duration_seconds",
-		Help:    "Time spent executing requests to the ruler.",
-		Buckets: prometheus.ExponentialBuckets(0.008, 4, 7),
+		Name:                            "cortex_ruler_client_request_duration_seconds",
+		Help:                            "Time spent executing requests to the ruler.",
+		Buckets:                         prometheus.ExponentialBuckets(0.008, 4, 7),
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"operation", "status_code"})
 
 	return func(addr string) (client.PoolClient, error) {
@@ -69,7 +73,7 @@ func dialRulerClient(clientCfg grpcclient.Config, addr string, requestDuration *
 		return nil, err
 	}
 
-	conn, err := grpc.Dial(addr, opts...)
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to dial ruler %s", addr)
 	}

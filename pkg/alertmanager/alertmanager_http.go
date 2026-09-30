@@ -1,13 +1,13 @@
 package alertmanager
 
 import (
+	"html/template"
 	"net/http"
-	"text/template"
 
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/services"
 
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 var (
@@ -96,12 +96,12 @@ type StatusHandler struct {
 
 // ServeHTTP serves the status of the alertmanager.
 func (s StatusHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	var clusterInfo map[string]interface{}
+	var clusterInfo map[string]any
 	if s.am.peer != nil {
 		clusterInfo = s.am.peer.Info()
 	}
 	err := statusTemplate.Execute(w, struct {
-		ClusterInfo map[string]interface{}
+		ClusterInfo map[string]any
 	}{
 		ClusterInfo: clusterInfo,
 	})

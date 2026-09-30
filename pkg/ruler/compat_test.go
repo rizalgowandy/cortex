@@ -3,6 +3,7 @@ package ruler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"testing"
@@ -12,13 +13,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
+	"github.com/cortexproject/cortex/pkg/querier/stats"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 type fakePusher struct {
@@ -36,83 +43,210 @@ func TestPusherAppendable(t *testing.T) {
 	pusher := &fakePusher{}
 	pa := NewPusherAppendable(pusher, "user-1", nil, prometheus.NewCounter(prometheus.CounterOpts{}), prometheus.NewCounter(prometheus.CounterOpts{}))
 
+	lbls1 := cortexpb.FromLabelsToLabelAdapters(labels.FromMap(map[string]string{labels.MetricName: "foo_bar"}))
+	lbls2 := cortexpb.FromLabelsToLabelAdapters(labels.FromMap(map[string]string{labels.MetricName: "ALERTS", labels.AlertName: "boop"}))
+
+	testHistogram := tsdbutil.GenerateTestHistogram(1)
+	testFloatHistogram := tsdbutil.GenerateTestFloatHistogram(2)
+	testHistogramWithNaN := tsdbutil.GenerateTestHistogram(1)
+	testFloatHistogramWithNaN := tsdbutil.GenerateTestFloatHistogram(1)
+	testHistogramWithNaN.Sum = math.Float64frombits(value.StaleNaN)
+	testFloatHistogramWithNaN.Sum = math.Float64frombits(value.StaleNaN)
+
 	for _, tc := range []struct {
-		name       string
-		series     string
-		evalDelay  time.Duration
-		value      float64
-		expectedTS int64
+		name           string
+		series         string
+		value          float64
+		histogram      *histogram.Histogram
+		floatHistogram *histogram.FloatHistogram
+		expectedReq    *cortexpb.WriteRequest
 	}{
 		{
-			name:       "tenant without delay, normal value",
-			series:     "foo_bar",
-			value:      1.234,
-			expectedTS: 120_000,
+			name:   "tenant, normal value",
+			series: "foo_bar",
+			value:  1.234,
+			expectedReq: &cortexpb.WriteRequest{
+				Timeseries: []cortexpb.PreallocTimeseries{
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls1,
+							Samples: []cortexpb.Sample{
+								{Value: 1.234, TimestampMs: 120_000},
+							},
+						},
+					},
+				},
+				Source: cortexpb.RULE,
+			},
 		},
 		{
-			name:       "tenant without delay, stale nan value",
-			series:     "foo_bar",
-			value:      math.Float64frombits(value.StaleNaN),
-			expectedTS: 120_000,
+			name:   "tenant, stale nan value",
+			series: "foo_bar",
+			value:  math.Float64frombits(value.StaleNaN),
+			expectedReq: &cortexpb.WriteRequest{
+				Timeseries: []cortexpb.PreallocTimeseries{
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls1,
+							Samples: []cortexpb.Sample{
+								{Value: math.Float64frombits(value.StaleNaN), TimestampMs: 120_000},
+							},
+						},
+					},
+				},
+				Source: cortexpb.RULE,
+			},
 		},
 		{
-			name:       "tenant with delay, normal value",
-			series:     "foo_bar",
-			value:      1.234,
-			expectedTS: 120_000,
-			evalDelay:  time.Minute,
+			name:   "ALERTS, normal value",
+			series: `ALERTS{alertname="boop"}`,
+			value:  1.234,
+			expectedReq: &cortexpb.WriteRequest{
+				Timeseries: []cortexpb.PreallocTimeseries{
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls2,
+							Samples: []cortexpb.Sample{
+								{Value: 1.234, TimestampMs: 120_000},
+							},
+						},
+					},
+				},
+				Source: cortexpb.RULE,
+			},
 		},
 		{
-			name:       "tenant with delay, stale nan value",
-			value:      math.Float64frombits(value.StaleNaN),
-			expectedTS: 60_000,
-			evalDelay:  time.Minute,
+			name:   "ALERTS, stale nan value",
+			series: `ALERTS{alertname="boop"}`,
+			value:  math.Float64frombits(value.StaleNaN),
+			expectedReq: &cortexpb.WriteRequest{
+				Timeseries: []cortexpb.PreallocTimeseries{
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls2,
+							Samples: []cortexpb.Sample{
+								{Value: math.Float64frombits(value.StaleNaN), TimestampMs: 120_000},
+							},
+						},
+					},
+				},
+				Source: cortexpb.RULE,
+			},
 		},
 		{
-			name:       "ALERTS without delay, normal value",
-			series:     `ALERTS{alertname="boop"}`,
-			value:      1.234,
-			expectedTS: 120_000,
+			name:      "tenant, normal histogram",
+			series:    "foo_bar",
+			histogram: testHistogram,
+			expectedReq: &cortexpb.WriteRequest{
+				Timeseries: []cortexpb.PreallocTimeseries{
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls1,
+							Histograms: []cortexpb.WrappedHistogram{
+								cortexpb.WrapHistogram(cortexpb.HistogramToHistogramProto(120_000, testHistogram)),
+							},
+						},
+					},
+				},
+				Source: cortexpb.RULE,
+			},
 		},
 		{
-			name:       "ALERTS without delay, stale nan value",
-			series:     `ALERTS{alertname="boop"}`,
-			value:      math.Float64frombits(value.StaleNaN),
-			expectedTS: 120_000,
+			name:           "tenant, float histogram",
+			series:         "foo_bar",
+			floatHistogram: testFloatHistogram,
+			expectedReq: &cortexpb.WriteRequest{
+				Timeseries: []cortexpb.PreallocTimeseries{
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls1,
+							Histograms: []cortexpb.WrappedHistogram{
+								cortexpb.WrapHistogram(cortexpb.FloatHistogramToHistogramProto(120_000, testFloatHistogram)),
+							},
+						},
+					},
+				},
+				Source: cortexpb.RULE,
+			},
 		},
 		{
-			name:       "ALERTS with delay, normal value",
-			series:     `ALERTS{alertname="boop"}`,
-			value:      1.234,
-			expectedTS: 60_000,
-			evalDelay:  time.Minute,
+			name:      "tenant, both sample and histogram",
+			series:    "foo_bar",
+			value:     1.234,
+			histogram: testHistogram,
+			expectedReq: &cortexpb.WriteRequest{
+				Timeseries: []cortexpb.PreallocTimeseries{
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls1,
+							Samples: []cortexpb.Sample{
+								{Value: 1.234, TimestampMs: 120_000},
+							},
+						},
+					},
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls1,
+							Histograms: []cortexpb.WrappedHistogram{
+								cortexpb.WrapHistogram(cortexpb.HistogramToHistogramProto(120_000, testHistogram)),
+							},
+						},
+					},
+				},
+				Source: cortexpb.RULE,
+			},
 		},
 		{
-			name:       "ALERTS with delay, stale nan value",
-			series:     `ALERTS_FOR_STATE{alertname="boop"}`,
-			value:      math.Float64frombits(value.StaleNaN),
-			expectedTS: 60_000,
-			evalDelay:  time.Minute,
+			name:           "tenant, both sample and float histogram",
+			series:         "foo_bar",
+			value:          1.234,
+			floatHistogram: testFloatHistogram,
+			expectedReq: &cortexpb.WriteRequest{
+				Timeseries: []cortexpb.PreallocTimeseries{
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls1,
+							Samples: []cortexpb.Sample{
+								{Value: 1.234, TimestampMs: 120_000},
+							},
+						},
+					},
+					{
+						TimeSeries: &cortexpb.TimeSeries{
+							Labels: lbls1,
+							Histograms: []cortexpb.WrappedHistogram{
+								cortexpb.WrapHistogram(cortexpb.FloatHistogramToHistogramProto(120_000, testFloatHistogram)),
+							},
+						},
+					},
+				},
+				Source: cortexpb.RULE,
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			pa.rulesLimits = &ruleLimits{
-				evalDelay: tc.evalDelay,
-			}
 
 			lbls, err := parser.ParseMetric(tc.series)
 			require.NoError(t, err)
 
 			pusher.response = &cortexpb.WriteResponse{}
 			a := pa.Appender(ctx)
-			_, err = a.Append(0, lbls, 120_000, tc.value)
+			// We don't ingest sample if value is set to 0 for testing purpose.
+			if tc.value != 0 {
+				_, err = a.Append(0, lbls, 120_000, tc.value)
+				require.NoError(t, err)
+			}
+
+			if tc.histogram != nil {
+				_, err = a.AppendHistogram(0, lbls, 120_000, tc.histogram, nil)
+			} else if tc.floatHistogram != nil {
+				_, err = a.AppendHistogram(0, lbls, 120_000, nil, tc.floatHistogram)
+			}
 			require.NoError(t, err)
 
 			require.NoError(t, a.Commit())
-
-			require.Equal(t, tc.expectedTS, pusher.request.Timeseries[0].Samples[0].TimestampMs)
-
+			require.Equal(t, tc.expectedReq.String(), pusher.request.String())
 		})
 	}
 }
@@ -154,13 +288,18 @@ func TestPusherErrors(t *testing.T) {
 			writes := prometheus.NewCounter(prometheus.CounterOpts{})
 			failures := prometheus.NewCounter(prometheus.CounterOpts{})
 
-			pa := NewPusherAppendable(pusher, "user-1", ruleLimits{evalDelay: 10 * time.Second}, writes, failures)
+			pa := NewPusherAppendable(pusher, "user-1", &ruleLimits{}, writes, failures)
 
 			lbls, err := parser.ParseMetric("foo_bar")
 			require.NoError(t, err)
 
 			a := pa.Appender(ctx)
 			_, err = a.Append(0, lbls, int64(model.Now()), 123456)
+			require.NoError(t, err)
+
+			_, err = a.AppendHistogram(0, lbls, int64(model.Now()), tsdbutil.GenerateTestHistogram(1), nil)
+			require.NoError(t, err)
+			_, err = a.AppendHistogram(0, lbls, int64(model.Now()), nil, tsdbutil.GenerateTestFloatHistogram(2))
 			require.NoError(t, err)
 
 			require.Equal(t, tc.returnedError, a.Commit())
@@ -173,9 +312,10 @@ func TestPusherErrors(t *testing.T) {
 
 func TestMetricsQueryFuncErrors(t *testing.T) {
 	for name, tc := range map[string]struct {
-		returnedError         error
-		expectedQueries       int
-		expectedFailedQueries int
+		returnedError          error
+		expectedQueries        int
+		expectedFailedQueries  int
+		notWrapQueryableErrors bool
 	}{
 		"no error": {
 			expectedQueries:       1,
@@ -223,15 +363,26 @@ func TestMetricsQueryFuncErrors(t *testing.T) {
 			expectedQueries:       1,
 			expectedFailedQueries: 1, // unknown errors are not 400, so they are reported.
 		},
+
+		"max query length validation error": {
+			returnedError:          validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, "10000", "1000")),
+			expectedQueries:        1,
+			expectedFailedQueries:  0,
+			notWrapQueryableErrors: true,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			queries := prometheus.NewCounter(prometheus.CounterOpts{})
 			failures := prometheus.NewCounter(prometheus.CounterOpts{})
 
 			mockFunc := func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
-				return promql.Vector{}, WrapQueryableErrors(tc.returnedError)
+				err := tc.returnedError
+				if !tc.notWrapQueryableErrors {
+					err = WrapQueryableErrors(err)
+				}
+				return promql.Vector{}, err
 			}
-			qf := MetricsQueryFunc(mockFunc, queries, failures)
+			qf := metricsQueryFunc(mockFunc, queries, failures)
 
 			_, err := qf(context.Background(), "test", time.Now())
 			require.Equal(t, tc.returnedError, err)
@@ -243,14 +394,46 @@ func TestMetricsQueryFuncErrors(t *testing.T) {
 }
 
 func TestRecordAndReportRuleQueryMetrics(t *testing.T) {
-	queryTime := prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user"})
+	metrics := NewRuleEvalMetrics(Config{EnableQueryStats: true}, prometheus.DefaultRegisterer)
 
 	mockFunc := func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
+		queryStats := stats.FromContext(ctx)
+		queryStats.AddFetchedSeries(2)
+		queryStats.AddFetchedSamples(2)
+		queryStats.AddFetchedChunkBytes(10)
+		queryStats.AddFetchedDataBytes(14)
 		time.Sleep(1 * time.Second)
 		return promql.Vector{}, nil
 	}
-	qf := RecordAndReportRuleQueryMetrics(mockFunc, queryTime.WithLabelValues("userID"), log.NewNopLogger())
+	qf := recordAndReportRuleQueryMetrics(mockFunc, "userID", metrics, log.NewNopLogger())
 	_, _ = qf(context.Background(), "test", time.Now())
 
-	require.GreaterOrEqual(t, testutil.ToFloat64(queryTime.WithLabelValues("userID")), float64(1))
+	require.GreaterOrEqual(t, testutil.ToFloat64(metrics.RulerQuerySeconds.WithLabelValues("userID")), float64(1))
+	require.Equal(t, testutil.ToFloat64(metrics.RulerQuerySeries.WithLabelValues("userID")), float64(2))
+	require.Equal(t, testutil.ToFloat64(metrics.RulerQuerySamples.WithLabelValues("userID")), float64(2))
+	require.Equal(t, testutil.ToFloat64(metrics.RulerQueryChunkBytes.WithLabelValues("userID")), float64(10))
+	require.Equal(t, testutil.ToFloat64(metrics.RulerQueryDataBytes.WithLabelValues("userID")), float64(14))
+}
+func TestPusherAppender_Commit_WithDiscardOutOfOrder(t *testing.T) {
+	pusher := &fakePusher{response: &cortexpb.WriteResponse{}}
+	counter := prometheus.NewCounter(prometheus.CounterOpts{Name: "test"})
+
+	appender := &PusherAppender{
+		ctx:          context.Background(),
+		pusher:       pusher,
+		userID:       "test-user",
+		totalWrites:  counter,
+		failedWrites: counter,
+		labels:       []labels.Labels{labels.FromStrings(labels.MetricName, "test_metric")},
+		samples:      []cortexpb.Sample{{TimestampMs: 1000, Value: 1.0}},
+	}
+
+	appender.SetOptions(&storage.AppendOptions{DiscardOutOfOrder: true})
+
+	err := appender.Commit()
+	require.NoError(t, err)
+
+	// Verify that DiscardOutOfOrder was set in the WriteRequest
+	require.NotNil(t, pusher.request, "WriteRequest should have been sent")
+	require.True(t, pusher.request.DiscardOutOfOrder, "DiscardOutOfOrder should be true in WriteRequest")
 }

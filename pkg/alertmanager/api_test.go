@@ -4,28 +4,31 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
 	"github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/notify/webhook"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
 	"github.com/weaveworks/common/user"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
+	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 func TestAMConfigValidationAPI(t *testing.T) {
@@ -238,6 +241,22 @@ alertmanager_config: |
 `,
 		},
 		{
+			name: "Should return error if global HTTP username_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    http_config:
+      basic_auth:
+        username_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+  receivers:
+    - name: default-receiver
+`,
+			err: errors.Wrap(errUsernameFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "Should return error if global HTTP password_file is set",
 			cfg: `
 alertmanager_config: |
@@ -266,7 +285,7 @@ alertmanager_config: |
   receivers:
     - name: default-receiver
 `,
-			err: errors.Wrap(errPasswordFileNotAllowed, "error validating Alertmanager config"),
+			err: errors.Wrap(errBearerTokenAndCredentialsFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
 			name: "Should return error if global HTTP credentials_file is set",
@@ -282,7 +301,25 @@ alertmanager_config: |
   receivers:
     - name: default-receiver
 `,
-			err: errors.Wrap(errPasswordFileNotAllowed, "error validating Alertmanager config"),
+			err: errors.Wrap(errBearerTokenAndCredentialsFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global OAuth2 client_certificate_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    http_config:
+      oauth2:
+        client_id: test
+        token_url: http://example.com
+        client_certificate_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+  receivers:
+    - name: default-receiver
+`,
+			err: errors.Wrap(errOAuth2CertificateKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
 			name: "Should return error if global OAuth2 client_secret_file is set",
@@ -333,7 +370,7 @@ alertmanager_config: |
   route:
     receiver: 'default-receiver'
 `,
-			err: errors.Wrap(errPasswordFileNotAllowed, "error validating Alertmanager config"),
+			err: errors.Wrap(errBearerTokenAndCredentialsFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
 			name: "Should return error if receiver's HTTP credentials_file is set",
@@ -350,7 +387,26 @@ alertmanager_config: |
   route:
     receiver: 'default-receiver'
 `,
-			err: errors.Wrap(errPasswordFileNotAllowed, "error validating Alertmanager config"),
+			err: errors.Wrap(errBearerTokenAndCredentialsFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if receiver's OAuth2 client_certificate_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            oauth2:
+              client_id: test
+              token_url: http://example.com
+              client_certificate_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOAuth2CertificateKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
 			name: "Should return error if receiver's OAuth2 client_secret_file is set",
@@ -372,7 +428,7 @@ alertmanager_config: |
 			err: errors.Wrap(errOAuth2SecretFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
-			name: "Should return error if receiver's HTTP proxy_url is set",
+			name: "Should return error if receiver's TLS ca_file is set",
 			cfg: `
 alertmanager_config: |
   receivers:
@@ -380,12 +436,110 @@ alertmanager_config: |
       webhook_configs:
         - url: http://localhost
           http_config:
-            proxy_url: http://localhost
+            tls_config:
+              ca_file: /ca.crt
 
   route:
     receiver: 'default-receiver'
 `,
-			err: errors.Wrap(errProxyURLNotAllowed, "error validating Alertmanager config"),
+			err: errors.Wrap(errTLSFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if receiver's TLS cert_file and key_file are set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            tls_config:
+              cert_file: /cert.crt
+              key_file: /key.key
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errTLSFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if receiver's http_headers files is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            http_headers:
+              X-Canary:
+                files:
+                  - /var/run/secrets/kubernetes.io/serviceaccount/token
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errHTTPHeadersFilesNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global http_headers files is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    http_config:
+      http_headers:
+        X-Canary:
+          files:
+            - /secrets
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errHTTPHeadersFilesNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should pass if receiver's http_headers only uses values and secrets",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            http_headers:
+              X-Canary:
+                values:
+                  - canary
+              X-Token:
+                secrets:
+                  - sekret
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: nil,
+		},
+		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
 			name: "Should return error if global slack_api_url_file is set",
@@ -405,6 +559,57 @@ alertmanager_config: |
 			err: errors.Wrap(errSlackAPIURLFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if global slack_app_token_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    slack_app_token_file: /secrets
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSlackAppTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global smtp_auth_password_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    smtp_auth_password_file: /secrets
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errEmailAuthPasswordFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global smtp_auth_secret_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    smtp_auth_secret_file: /secrets
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errEmailAuthSecretFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "Should return error if Slack api_url_file is set",
 			cfg: `
 alertmanager_config: |
@@ -419,6 +624,50 @@ alertmanager_config: |
 			err: errors.Wrap(errSlackAPIURLFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if Slack app_token_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      slack_configs:
+        - app_token_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSlackAppTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if OpsGenie api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global victorops_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    victorops_api_key_file: /secret
+  receivers:
+    - name: default-receiver
+      victorops_configs:
+        - routing_key: test
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "Should return error if VictorOps api_key_file is set",
 			cfg: `
 alertmanager_config: |
@@ -426,7 +675,6 @@ alertmanager_config: |
     - name: default-receiver
       victorops_configs:
         - api_key_file: /secrets
-          api_key: my-key
           routing_key: test
 
   route:
@@ -549,11 +797,391 @@ template_files:
 			maxTemplateSize: 20,
 			err:             nil,
 		},
+		{
+			name: "Should return error if PagerDuty routing_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      pagerduty_configs:
+        - routing_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errPagerDutyRoutingKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if PagerDuty service_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      pagerduty_configs:
+        - service_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errPagerDutyServiceKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if Webhook url_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url_file: /urlFile
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errWebhookURLFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if PushOver user_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      pushover_configs:
+        - user_key_file: /secrets
+          token: 'token'
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errPushOverUserKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if PushOver token_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      pushover_configs:
+        - token_file: /secrets
+          user_key: 'pushover user'
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errPushOverTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global telegram_bot_token_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    telegram_bot_token_file: /secret
+  receivers:
+    - name: default-receiver
+      telegram_configs:
+        - chat_id: 5
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errTelegramBotTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if Telegram bot_token_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      telegram_configs:
+        - chat_id: 5
+          bot_token_file: /secrets
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errTelegramBotTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if Telegram chat_id_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      telegram_configs:
+        - bot_token: token
+          chat_id_file: /secrets
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errTelegramChatIdFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if MSTeams webhook_url_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      msteams_configs:
+        - webhook_url_file: /urlFile
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errMSTeamsWebhookUrlFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if MSTeamsV2 webhook_url_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      msteamsv2_configs:
+        - webhook_url_file: /urlFile
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errMSTeamsV2WebhookUrlFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if RocketChat rocketchat_token_id_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    rocketchat_token_id_file: /secret
+  receivers:
+    - name: default-receiver
+      rocketchat_configs:
+        - token: 'token'
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errRocketChatTokenIdFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if RocketChat token_id_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      rocketchat_configs:
+        - token_id_file: /tokenIdFile
+          token: 'token'
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errRocketChatTokenIdFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global rocketchat_token_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    rocketchat_token_file: /secret
+  receivers:
+    - name: default-receiver
+      rocketchat_configs:
+        - token_id: 'tokenId'
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errRocketChatTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if RocketChat token_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      rocketchat_configs:
+        - token_file: /tokenFile
+          token_id: 'tokenId'
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errRocketChatTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if Discord webhook_url_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      discord_configs:
+        - webhook_url_file: /urlFile
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errDiscordWebhookUrlFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if Email auth_password_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      email_configs:
+        - to: user@example.com
+          from: admin@example.com
+          smarthost: example.com:25
+          auth_password_file: /passwordFile
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errEmailAuthPasswordFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if Email auth_secret_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      email_configs:
+        - to: user@example.com
+          from: admin@example.com
+          smarthost: example.com:25
+          auth_secret_file: /secretFile
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errEmailAuthSecretFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if IncidentIO url_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      incidentio_configs:
+        - send_resolved: true
+          url_file: /urlFile
+          alert_source_token: 'alertSourceToken'
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errIncidentIOURLFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if IncidentIO alert_source_token_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      incidentio_configs:
+        - send_resolved: true
+          url: https://example.com
+          alert_source_token_file: /alertSourceTokenFile
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errIncidentIOAlertSourceTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if Mattermost webhook_url_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      mattermost_configs:
+        - webhook_url_file: /secret
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errMatterMostWebhookUrlFileNotAllowed, "error validating Alertmanager config"),
+		}, {
+			// No mattermost receiver here on purpose. When one is present, upstream copies
+			// the global value into the receiver's webhook_url_file during unmarshal and the
+			// per-receiver check already catches it. Without one, nothing propagated and the
+			// global field went unvalidated.
+			name: "Should return error if global mattermost_webhook_url_file is set without a Mattermost receiver",
+			cfg: `
+alertmanager_config: |
+  global:
+    mattermost_webhook_url_file: /secret
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errMatterMostWebhookUrlFileNotAllowed, "error validating Alertmanager config"),
+		}, {
+			name: "Should return error if global wechat_api_secret_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    wechat_api_secret_file: /secret
+  receivers:
+    - name: default-receiver
+      wechat_configs:
+        - corp_id: id
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errWeChatAPISecretFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if WeChat api_secret_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      wechat_configs:
+        - corp_id: id
+          api_secret_file: /secret
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errWeChatAPISecretFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should pass with valid Jira config",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      jira_configs:
+        - api_url: http://jira.example.com
+          project: TEST
+          issue_type: Bug
+  route:
+    receiver: 'default-receiver'
+`,
+		},
+		{
+			name: "Should pass with valid SNS config",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - api_url: http://sns.example.com
+          topic_arn: arn:aws:sns:us-east-1:123456789012:test
+          sigv4:
+            region: us-east-1
+  route:
+    receiver: 'default-receiver'
+`,
+		},
+		{
+			name: "Should pass with valid Webex config",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webex_configs:
+        - api_url: http://webex.example.com
+          room_id: test-room
+          http_config:
+            authorization:
+              credentials: secret
+  route:
+    receiver: 'default-receiver'
+`,
+		},
 	}
 
 	limits := &mockAlertManagerLimits{}
+	store, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 	am := &MultitenantAlertmanager{
-		store:  prepareInMemoryAlertStore(),
+		store:  store,
 		logger: util_log.Logger,
 		limits: limits,
 	}
@@ -569,7 +1197,7 @@ template_files:
 			am.SetUserConfig(w, req.WithContext(ctx))
 			resp := w.Result()
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
 			if tc.err == nil {
@@ -585,7 +1213,12 @@ template_files:
 
 func TestMultitenantAlertmanager_DeleteUserConfig(t *testing.T) {
 	storage := objstore.NewInMemBucket()
-	alertStore := bucketclient.NewBucketAlertStore(storage, nil, log.NewNopLogger())
+	bkt := &alertstore.MockBucket{Bucket: storage}
+
+	usersScannerConfig := users.UsersScannerConfig{Strategy: users.UserScanStrategyList}
+	reg := prometheus.NewPedanticRegistry()
+	alertStore, err := bucketclient.NewBucketAlertStore(bkt, usersScannerConfig, nil, log.NewNopLogger(), reg)
+	require.NoError(t, err)
 
 	am := &MultitenantAlertmanager{
 		store:  alertStore,
@@ -669,7 +1302,12 @@ receivers:
 	}
 
 	storage := objstore.NewInMemBucket()
-	alertStore := bucketclient.NewBucketAlertStore(storage, nil, log.NewNopLogger())
+	bkt := &alertstore.MockBucket{Bucket: storage}
+
+	usersScannerConfig := users.UsersScannerConfig{Strategy: users.UserScanStrategyList}
+	reg := prometheus.NewPedanticRegistry()
+	alertStore, err := bucketclient.NewBucketAlertStore(bkt, usersScannerConfig, nil, log.NewNopLogger(), reg)
+	require.NoError(t, err)
 
 	for u, cfg := range testCases {
 		err := alertStore.SetAlertConfig(context.Background(), alertspb.AlertConfigDesc{
@@ -680,11 +1318,10 @@ receivers:
 	}
 
 	externalURL := flagext.URLValue{}
-	err := externalURL.Set("http://localhost:8080/alertmanager")
+	err = externalURL.Set("http://localhost:8080/alertmanager")
 	require.NoError(t, err)
 
 	// Create the Multitenant Alertmanager.
-	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
 	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
 	require.NoError(t, err)
@@ -704,7 +1341,7 @@ receivers:
 	resp := w.Result()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	old, err := yaml.Marshal(testCases)
 	require.NoError(t, err)
@@ -713,16 +1350,16 @@ receivers:
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
 	tests := map[string]struct {
-		input    interface{}
+		input    any
 		expected error
 	}{
 		"*HTTPClientConfig": {
 			input: &commoncfg.HTTPClientConfig{
 				BasicAuth: &commoncfg.BasicAuth{
-					PasswordFile: "/secrets",
+					UsernameFile: "/secrets",
 				},
 			},
-			expected: errPasswordFileNotAllowed,
+			expected: errUsernameFileNotAllowed,
 		},
 		"HTTPClientConfig": {
 			input: commoncfg.HTTPClientConfig{
@@ -768,9 +1405,9 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 		},
 		"struct containing *HTTPClientConfig as nested child within a slice": {
 			input: config.Config{
-				Receivers: []*config.Receiver{{
+				Receivers: []config.Receiver{{
 					Name: "test",
-					WebhookConfigs: []*config.WebhookConfig{{
+					WebhookConfigs: []*webhook.WebhookConfig{{
 						HTTPConfig: &commoncfg.HTTPClientConfig{
 							BasicAuth: &commoncfg.BasicAuth{
 								PasswordFile: "/secrets",
@@ -794,12 +1431,87 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 		"map containing TLSConfig as nested child": {
 			input: map[string][]config.EmailConfig{
 				"test": {{
-					TLSConfig: commoncfg.TLSConfig{
+					TLSConfig: &commoncfg.TLSConfig{
 						CAFile: "/file",
 					},
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"*HTTPClientConfig with http_headers files": {
+			input: &commoncfg.HTTPClientConfig{
+				HTTPHeaders: &commoncfg.Headers{
+					Headers: map[string]commoncfg.Header{
+						"X-Canary": {Files: []string{"/secrets"}},
+					},
+				},
+			},
+			expected: errHTTPHeadersFilesNotAllowed,
+		},
+		"struct containing *HTTPClientConfig with http_headers files as direct child": {
+			input: config.GlobalConfig{
+				HTTPConfig: &commoncfg.HTTPClientConfig{
+					HTTPHeaders: &commoncfg.Headers{
+						Headers: map[string]commoncfg.Header{
+							"X-Canary": {Files: []string{"/secrets"}},
+						},
+					},
+				},
+			},
+			expected: errHTTPHeadersFilesNotAllowed,
+		},
+		"struct containing *HTTPClientConfig with http_headers files as nested child within a slice": {
+			input: config.Config{
+				Receivers: []config.Receiver{{
+					Name: "test",
+					WebhookConfigs: []*webhook.WebhookConfig{{
+						HTTPConfig: &commoncfg.HTTPClientConfig{
+							HTTPHeaders: &commoncfg.Headers{
+								Headers: map[string]commoncfg.Header{
+									"X-Canary": {Files: []string{"/secrets"}},
+								},
+							},
+						},
+					}}},
+				},
+			},
+			expected: errHTTPHeadersFilesNotAllowed,
+		},
+		"*HTTPClientConfig with http_headers values only": {
+			input: &commoncfg.HTTPClientConfig{
+				HTTPHeaders: &commoncfg.Headers{
+					Headers: map[string]commoncfg.Header{
+						"X-Canary": {Values: []string{"value"}},
+					},
+				},
+			},
+			expected: nil,
+		},
+		"*HTTPClientConfig with http_headers secrets only": {
+			input: &commoncfg.HTTPClientConfig{
+				HTTPHeaders: &commoncfg.Headers{
+					Headers: map[string]commoncfg.Header{
+						"X-Canary": {Secrets: []commoncfg.Secret{"secret"}},
+					},
+				},
+			},
+			expected: nil,
+		},
+		"*HTTPClientConfig with http_headers empty files": {
+			input: &commoncfg.HTTPClientConfig{
+				HTTPHeaders: &commoncfg.Headers{
+					Headers: map[string]commoncfg.Header{
+						"X-Canary": {Values: []string{"value"}, Files: []string{}},
+					},
+				},
+			},
+			expected: nil,
+		},
+		"GlobalConfig with mattermost_webhook_url_file": {
+			input: config.GlobalConfig{
+				MattermostWebhookURLFile: "/secrets",
+			},
+			expected: errMatterMostWebhookUrlFileNotAllowed,
 		},
 	}
 
@@ -809,4 +1521,40 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			assert.ErrorIs(t, err, testData.expected)
 		})
 	}
+}
+
+func TestValidateAlertmanagerConfig_DoesNotPanicOnNilInterfaceValues(t *testing.T) {
+	tests := map[string]any{
+		"nil root interface":        any(nil),
+		"map value nil interface":   map[string]any{"test": nil},
+		"slice value nil interface": []any{nil},
+	}
+
+	for testName, input := range tests {
+		t.Run(testName, func(t *testing.T) {
+			require.NotPanics(t, func() {
+				err := validateAlertmanagerConfig(input)
+				assert.NoError(t, err)
+			})
+		})
+	}
+}
+
+func TestValidateAlertmanagerConfig_PagerdutyDetailsNullValue(t *testing.T) {
+	amCfg, err := config.Load(`
+route:
+  receiver: pd
+receivers:
+  - name: pd
+    pagerduty_configs:
+      - routing_key: "abc123"
+        details:
+          foo: null
+`)
+	require.NoError(t, err)
+
+	require.NotPanics(t, func() {
+		err = validateAlertmanagerConfig(amCfg)
+	})
+	assert.NoError(t, err)
 }

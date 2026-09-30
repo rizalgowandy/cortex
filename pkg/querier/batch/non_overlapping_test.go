@@ -9,17 +9,19 @@ import (
 )
 
 func TestNonOverlappingIter(t *testing.T) {
+	t.Parallel()
 	forEncodings(t, func(t *testing.T, enc encoding.Encoding) {
 		cs := []GenericChunk(nil)
-		for i := int64(0); i < 100; i++ {
+		for i := range int64(100) {
 			cs = append(cs, mkGenericChunk(t, model.TimeFromUnix(i*10), 10, enc))
 		}
-		testIter(t, 10*100, newIteratorAdapter(newNonOverlappingIterator(cs)))
-		testSeek(t, 10*100, newIteratorAdapter(newNonOverlappingIterator(cs)))
+		testIter(t, 10*100, newIteratorAdapter(newNonOverlappingIterator(cs)), enc)
+		testSeek(t, 10*100, newIteratorAdapter(newNonOverlappingIterator(cs)), enc)
 	})
 }
 
 func TestNonOverlappingIterSparse(t *testing.T) {
+	t.Parallel()
 	forEncodings(t, func(t *testing.T, enc encoding.Encoding) {
 		cs := []GenericChunk{
 			mkGenericChunk(t, model.TimeFromUnix(0), 1, enc),
@@ -29,7 +31,7 @@ func TestNonOverlappingIterSparse(t *testing.T) {
 			mkGenericChunk(t, model.TimeFromUnix(95), 1, enc),
 			mkGenericChunk(t, model.TimeFromUnix(96), 4, enc),
 		}
-		testIter(t, 100, newIteratorAdapter(newNonOverlappingIterator(cs)))
-		testSeek(t, 100, newIteratorAdapter(newNonOverlappingIterator(cs)))
+		testIter(t, 100, newIteratorAdapter(newNonOverlappingIterator(cs)), enc)
+		testSeek(t, 100, newIteratorAdapter(newNonOverlappingIterator(cs)), enc)
 	})
 }

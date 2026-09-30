@@ -6,12 +6,12 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/objstore"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketindex"
@@ -19,6 +19,7 @@ import (
 
 const (
 	corruptedBucketIndex = "corrupted-bucket-index"
+	keyAccessDenied      = "key-access-denied"
 	noBucketIndex        = "no-bucket-index"
 )
 
@@ -30,7 +31,6 @@ type BucketIndexMetadataFetcher struct {
 	cfgProvider bucket.TenantConfigProvider
 	logger      log.Logger
 	filters     []block.MetadataFilter
-	modifiers   []block.MetadataModifier
 	metrics     *block.FetcherMetrics
 }
 
@@ -42,7 +42,6 @@ func NewBucketIndexMetadataFetcher(
 	logger log.Logger,
 	reg prometheus.Registerer,
 	filters []block.MetadataFilter,
-	modifiers []block.MetadataModifier,
 ) *BucketIndexMetadataFetcher {
 	return &BucketIndexMetadataFetcher{
 		userID:      userID,
@@ -51,7 +50,6 @@ func NewBucketIndexMetadataFetcher(
 		cfgProvider: cfgProvider,
 		logger:      logger,
 		filters:     filters,
-		modifiers:   modifiers,
 		metrics:     block.NewFetcherMetrics(reg, [][]string{{corruptedBucketIndex}, {noBucketIndex}}, nil),
 	}
 }
@@ -70,7 +68,7 @@ func (f *BucketIndexMetadataFetcher) Fetch(ctx context.Context) (metas map[ulid.
 	start := time.Now()
 	defer func() {
 		f.metrics.SyncDuration.Observe(time.Since(start).Seconds())
-		if err != nil {
+		if err != nil && !errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied) {
 			f.metrics.SyncFailures.Inc()
 		}
 	}()
@@ -96,6 +94,17 @@ func (f *BucketIndexMetadataFetcher) Fetch(ctx context.Context) (metas map[ulid.
 
 		return nil, nil, nil
 	}
+
+	if errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied) {
+		// stop the job and return the error
+		// this error should be used to return Access Denied to the caller
+		level.Error(f.logger).Log("msg", "bucket index key permission revoked", "user", f.userID, "err", err)
+		f.metrics.Synced.WithLabelValues(keyAccessDenied).Set(1)
+		f.metrics.Submit()
+
+		return nil, nil, err
+	}
+
 	if err != nil {
 		f.metrics.Synced.WithLabelValues(block.FailedMeta).Set(1)
 		f.metrics.Submit()
@@ -116,18 +125,11 @@ func (f *BucketIndexMetadataFetcher) Fetch(ctx context.Context) (metas map[ulid.
 		if customFilter, ok := filter.(MetadataFilterWithBucketIndex); ok {
 			err = customFilter.FilterWithBucketIndex(ctx, metas, idx, f.metrics.Synced)
 		} else {
-			err = filter.Filter(ctx, metas, f.metrics.Synced)
+			err = filter.Filter(ctx, metas, f.metrics.Synced, f.metrics.Modified)
 		}
 
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "filter metas")
-		}
-	}
-
-	for _, m := range f.modifiers {
-		// NOTE: modifier can update modified metric accordingly to the reason of the modification.
-		if err := m.Modify(ctx, metas, f.metrics.Modified); err != nil {
-			return nil, nil, errors.Wrap(err, "modify metas")
 		}
 	}
 

@@ -6,17 +6,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 
 	bucket_http "github.com/cortexproject/cortex/pkg/storage/bucket/http"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // defaultConfig should match the default flag values defined in RegisterFlagsWithPrefix.
 var defaultConfig = Config{
 	SignatureVersion: SignatureVersionV4,
+	BucketLookupType: BucketAutoLookup,
+	SendContentMd5:   true,
 	HTTP: HTTPConfig{
 		Config: bucket_http.Config{
 			IdleConnTimeout:       90 * time.Second,
@@ -49,10 +51,12 @@ func TestConfig(t *testing.T) {
 endpoint: test-endpoint
 region: test-region
 bucket_name: test-bucket-name
+disable_dualstack: true
 secret_access_key: test-secret-access-key
 access_key_id: test-access-key-id
 insecure: true
 signature_version: test-signature-version
+bucket_lookup_type: virtual-hosted
 sse:
   type: test-type
   kms_key_id: test-kms-key-id
@@ -71,10 +75,13 @@ http:
 				Endpoint:         "test-endpoint",
 				Region:           "test-region",
 				BucketName:       "test-bucket-name",
+				DisableDualstack: true,
 				SecretAccessKey:  flagext.Secret{Value: "test-secret-access-key"},
 				AccessKeyID:      "test-access-key-id",
 				Insecure:         true,
 				SignatureVersion: "test-signature-version",
+				BucketLookupType: BucketVirtualHostLookup,
+				SendContentMd5:   true,
 				SSE: SSEConfig{
 					Type:                 "test-type",
 					KMSKeyID:             "test-kms-key-id",
@@ -103,7 +110,6 @@ http:
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 
 		t.Run(testName, func(t *testing.T) {
 			cfg := Config{}
@@ -159,6 +165,61 @@ func TestSSEConfig_Validate(t *testing.T) {
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
 			assert.Equal(t, testData.expected, testData.setup().Validate())
+		})
+	}
+}
+
+func TestS3Config_Validate(t *testing.T) {
+	tests := map[string]struct {
+		cfg         *Config
+		expectedErr error
+	}{
+		"should pass with valid config": {
+			cfg: &Config{
+				SignatureVersion:   SignatureVersionV4,
+				BucketLookupType:   BucketAutoLookup,
+				ListObjectsVersion: ListObjectsVersionV2,
+			},
+			expectedErr: nil,
+		},
+		"should fail with invalid signature version": {
+			cfg: &Config{
+				SignatureVersion:   "v3",
+				BucketLookupType:   BucketAutoLookup,
+				ListObjectsVersion: ListObjectsVersionV2,
+			},
+			expectedErr: errUnsupportedSignatureVersion,
+		},
+		"should fail with invalid bucket lookup type": {
+			cfg: &Config{
+				SignatureVersion:   SignatureVersionV4,
+				BucketLookupType:   "dummy",
+				ListObjectsVersion: ListObjectsVersionV2,
+			},
+			expectedErr: errInvalidBucketLookupType,
+		},
+		"should fail with invalid list objects version": {
+			cfg: &Config{
+				SignatureVersion:   SignatureVersionV4,
+				BucketLookupType:   BucketAutoLookup,
+				ListObjectsVersion: "v3",
+			},
+			expectedErr: errInvalidListObjectsVersion,
+		},
+		"should pass with empty list objects version": {
+			cfg: &Config{
+				SignatureVersion:   SignatureVersionV4,
+				BucketLookupType:   BucketAutoLookup,
+				ListObjectsVersion: "",
+			},
+			expectedErr: nil,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			err := test.cfg.Validate()
+			require.Equal(t, test.expectedErr, err)
 		})
 	}
 }

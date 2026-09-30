@@ -2,35 +2,11 @@ package lazyquery
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
-
-	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/querier/chunkstore"
+	"github.com/prometheus/prometheus/util/annotations"
 )
-
-// LazyQueryable wraps a storage.Queryable
-type LazyQueryable struct {
-	q storage.Queryable
-}
-
-// Querier implements storage.Queryable
-func (lq LazyQueryable) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-	q, err := lq.q.Querier(ctx, mint, maxt)
-	if err != nil {
-		return nil, err
-	}
-
-	return NewLazyQuerier(q), nil
-}
-
-// NewLazyQueryable returns a lazily wrapped queryable
-func NewLazyQueryable(q storage.Queryable) storage.Queryable {
-	return LazyQueryable{q}
-}
 
 // LazyQuerier is a lazy-loaded adapter for a storage.Querier
 type LazyQuerier struct {
@@ -44,12 +20,12 @@ func NewLazyQuerier(next storage.Querier) storage.Querier {
 }
 
 // Select implements Storage.Querier
-func (l LazyQuerier) Select(selectSorted bool, params *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+func (l LazyQuerier) Select(ctx context.Context, selectSorted bool, params *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	// make sure there is space in the buffer, to unblock the goroutine and let it die even if nobody is
 	// waiting for the result yet (or anymore).
 	future := make(chan storage.SeriesSet, 1)
 	go func() {
-		future <- l.next.Select(selectSorted, params, matchers...)
+		future <- l.next.Select(ctx, selectSorted, params, matchers...)
 	}()
 
 	return &lazySeriesSet{
@@ -58,28 +34,18 @@ func (l LazyQuerier) Select(selectSorted bool, params *storage.SelectHints, matc
 }
 
 // LabelValues implements Storage.Querier
-func (l LazyQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
-	return l.next.LabelValues(name, matchers...)
+func (l LazyQuerier) LabelValues(ctx context.Context, name string, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return l.next.LabelValues(ctx, name, hints, matchers...)
 }
 
 // LabelNames implements Storage.Querier
-func (l LazyQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
-	return l.next.LabelNames(matchers...)
+func (l LazyQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return l.next.LabelNames(ctx, hints, matchers...)
 }
 
 // Close implements Storage.Querier
 func (l LazyQuerier) Close() error {
 	return l.next.Close()
-}
-
-// Get implements chunk.Store for the chunk tar HTTP handler.
-func (l LazyQuerier) Get(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) ([]chunk.Chunk, error) {
-	store, ok := l.next.(chunkstore.ChunkStore)
-	if !ok {
-		return nil, fmt.Errorf("not supported")
-	}
-
-	return store.Get(ctx, userID, from, through, matchers...)
 }
 
 type lazySeriesSet struct {
@@ -112,6 +78,9 @@ func (s *lazySeriesSet) Err() error {
 }
 
 // Warnings implements storage.SeriesSet.
-func (s *lazySeriesSet) Warnings() storage.Warnings {
-	return nil
+func (s *lazySeriesSet) Warnings() annotations.Annotations {
+	if s.next == nil {
+		s.next = <-s.future
+	}
+	return s.next.Warnings()
 }

@@ -8,11 +8,6 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/backoff"
-	"github.com/grafana/dskit/grpcclient"
-	dsmiddleware "github.com/grafana/dskit/middleware"
-	"github.com/grafana/dskit/ring/client"
-	"github.com/grafana/dskit/services"
 	otgrpc "github.com/opentracing-contrib/go-grpc"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,24 +20,37 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	querier_stats "github.com/cortexproject/cortex/pkg/querier/stats"
+	"github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
+	"github.com/cortexproject/cortex/pkg/util/backoff"
+	"github.com/cortexproject/cortex/pkg/util/grpcclient"
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	cortexmiddleware "github.com/cortexproject/cortex/pkg/util/middleware"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
-func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, reg prometheus.Registerer) (*schedulerProcessor, []services.Service) {
+func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, reg prometheus.Registerer, querierAddress string) (*schedulerProcessor, []services.Service) {
 	p := &schedulerProcessor{
 		log:            log,
 		handler:        handler,
 		maxMessageSize: cfg.GRPCClientConfig.MaxSendMsgSize,
 		querierID:      cfg.QuerierID,
 		grpcConfig:     cfg.GRPCClientConfig,
-
+		targetHeaders:  cfg.TargetHeaders,
+		schedulerClientFactory: func(conn *grpc.ClientConn) schedulerpb.SchedulerForQuerierClient {
+			return schedulerpb.NewSchedulerForQuerierClient(conn)
+		},
 		frontendClientRequestDuration: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "cortex_querier_query_frontend_request_duration_seconds",
-			Help:    "Time spend doing requests to frontend.",
-			Buckets: prometheus.ExponentialBuckets(0.001, 4, 6),
+			Name:                            "cortex_querier_query_frontend_request_duration_seconds",
+			Help:                            "Time spend doing requests to frontend.",
+			Buckets:                         prometheus.ExponentialBuckets(0.001, 4, 6),
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
 		}, []string{"operation", "status_code"}),
+		querierAddress: querierAddress,
 	}
 
 	frontendClientsGauge := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
@@ -67,14 +75,18 @@ type schedulerProcessor struct {
 	grpcConfig     grpcclient.Config
 	maxMessageSize int
 	querierID      string
+	querierAddress string
 
 	frontendPool                  *client.Pool
 	frontendClientRequestDuration *prometheus.HistogramVec
+
+	targetHeaders          []string
+	schedulerClientFactory func(conn *grpc.ClientConn) schedulerpb.SchedulerForQuerierClient
 }
 
 // notifyShutdown implements processor.
 func (sp *schedulerProcessor) notifyShutdown(ctx context.Context, conn *grpc.ClientConn, address string) {
-	client := schedulerpb.NewSchedulerForQuerierClient(conn)
+	client := sp.schedulerClientFactory(conn)
 
 	req := &schedulerpb.NotifyQuerierShutdownRequest{QuerierID: sp.querierID}
 	if _, err := client.NotifyQuerierShutdown(ctx, req); err != nil {
@@ -84,13 +96,13 @@ func (sp *schedulerProcessor) notifyShutdown(ctx context.Context, conn *grpc.Cli
 }
 
 func (sp *schedulerProcessor) processQueriesOnSingleStream(ctx context.Context, conn *grpc.ClientConn, address string) {
-	schedulerClient := schedulerpb.NewSchedulerForQuerierClient(conn)
+	schedulerClient := sp.schedulerClientFactory(conn)
 
 	backoff := backoff.New(ctx, processorBackoffConfig)
 	for backoff.Ongoing() {
 		c, err := schedulerClient.QuerierLoop(ctx)
 		if err == nil {
-			err = c.Send(&schedulerpb.QuerierToScheduler{QuerierID: sp.querierID})
+			err = c.Send(&schedulerpb.QuerierToScheduler{QuerierID: sp.querierID, QuerierAddress: sp.querierAddress})
 		}
 
 		if err != nil {
@@ -130,6 +142,12 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 			// We need to inject user into context for sending response back.
 			ctx := user.InjectOrgID(ctx, request.UserID)
 
+			headers := make(map[string]string, 0)
+			for _, h := range request.HttpRequest.Headers {
+				headers[h.Key] = h.Values[0]
+			}
+			ctx = requestmeta.ContextWithRequestMetadataMapFromHeaders(ctx, headers, sp.targetHeaders)
+
 			tracer := opentracing.GlobalTracer()
 			// Ignore errors here. If we cannot get parent span, we just don't create new one.
 			parentSpanContext, _ := httpgrpcutil.GetParentSpanForRequest(tracer, request.HttpRequest)
@@ -140,8 +158,14 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 				ctx = spanCtx
 			}
 			logger := util_log.WithContext(ctx, sp.log)
-
+			if request.StatsEnabled {
+				level.Info(logger).Log("msg", "started running request")
+			}
 			sp.runRequest(ctx, logger, request.QueryID, request.FrontendAddress, request.StatsEnabled, request.HttpRequest)
+
+			if err = ctx.Err(); err != nil {
+				return
+			}
 
 			// Report back to scheduler that processing of the query has finished.
 			if err := c.Send(&schedulerpb.QuerierToScheduler{}); err != nil {
@@ -152,9 +176,10 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 }
 
 func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger, queryID uint64, frontendAddress string, statsEnabled bool, request *httpgrpc.HTTPRequest) {
-	var stats *querier_stats.Stats
+	var stats *querier_stats.QueryStats
 	if statsEnabled {
 		stats, ctx = querier_stats.ContextWithEmptyStats(ctx)
+		querier_stats.ExtractQueueTimeHeader(request, stats)
 	}
 
 	response, err := sp.handler.Handle(ctx, request)
@@ -167,6 +192,16 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 				Body: []byte(err.Error()),
 			}
 		}
+	}
+	if statsEnabled {
+		level.Info(logger).Log("msg", "finished request", "status_code", response.Code, "response_size", len(response.GetBody()))
+	}
+
+	// Compute timing breakdown before sending stats back to the frontend.
+	stats.ComputeAndStoreTimingBreakdown()
+
+	if err = ctx.Err(); err != nil {
+		return
 	}
 
 	// Ensure responses that are too big are not retried.
@@ -182,11 +217,15 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 
 	c, err := sp.frontendPool.GetClientFor(frontendAddress)
 	if err == nil {
+		// To prevent querier panic, the panic could happen when the go-routines not-exited
+		// yet in `fetchSeriesFromStores` are increment query-stats while progressing
+		// (*QueryResultRequest).MarshalToSizedBuffer under the same query-stat objects are used.
+		copiedStats := stats.Copy()
 		// Response is empty and uninteresting.
 		_, err = c.(frontendv2pb.FrontendForQuerierClient).QueryResult(ctx, &frontendv2pb.QueryResultRequest{
 			QueryID:      queryID,
 			HttpResponse: response,
-			Stats:        stats,
+			Stats:        copiedStats,
 		})
 	}
 	if err != nil {
@@ -198,14 +237,14 @@ func (sp *schedulerProcessor) createFrontendClient(addr string) (client.PoolClie
 	opts, err := sp.grpcConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor,
-		dsmiddleware.PrometheusGRPCUnaryInstrumentation(sp.frontendClientRequestDuration),
+		cortexmiddleware.PrometheusGRPCUnaryInstrumentation(sp.frontendClientRequestDuration),
 	}, nil)
 
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := grpc.Dial(addr, opts...)
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, err
 	}

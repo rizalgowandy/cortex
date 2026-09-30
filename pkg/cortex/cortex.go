@@ -8,20 +8,14 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/grpcutil"
-	"github.com/grafana/dskit/kv/memberlist"
-	"github.com/grafana/dskit/modules"
-	"github.com/grafana/dskit/ring"
-	"github.com/grafana/dskit/runtimeconfig"
-	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/common/model"
 	prom_storage "github.com/prometheus/prometheus/storage"
 	"github.com/weaveworks/common/server"
 	"github.com/weaveworks/common/signals"
@@ -31,41 +25,54 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
 	"github.com/cortexproject/cortex/pkg/api"
-	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/chunk/encoding"
-	"github.com/cortexproject/cortex/pkg/chunk/purger"
-	"github.com/cortexproject/cortex/pkg/chunk/storage"
-	chunk_util "github.com/cortexproject/cortex/pkg/chunk/util"
 	"github.com/cortexproject/cortex/pkg/compactor"
 	"github.com/cortexproject/cortex/pkg/configs"
 	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/configs/db"
+	"github.com/cortexproject/cortex/pkg/cortex/storage"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
+	"github.com/cortexproject/cortex/pkg/engine"
 	"github.com/cortexproject/cortex/pkg/flusher"
 	"github.com/cortexproject/cortex/pkg/frontend"
 	frontendv1 "github.com/cortexproject/cortex/pkg/frontend/v1"
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
+	"github.com/cortexproject/cortex/pkg/overrides"
+	"github.com/cortexproject/cortex/pkg/parquetconverter"
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
 	"github.com/cortexproject/cortex/pkg/querier"
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/cortexproject/cortex/pkg/querier/tenantfederation"
+	"github.com/cortexproject/cortex/pkg/querier/tripperware"
+	"github.com/cortexproject/cortex/pkg/querier/tripperware/queryrange"
 	querier_worker "github.com/cortexproject/cortex/pkg/querier/worker"
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	"github.com/cortexproject/cortex/pkg/ruler"
 	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
 	"github.com/cortexproject/cortex/pkg/scheduler"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/storegateway"
-	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/tracing"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/fakeauth"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/grpcclient"
+	"github.com/cortexproject/cortex/pkg/util/grpcutil"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/modules"
 	"github.com/cortexproject/cortex/pkg/util/process"
+	"github.com/cortexproject/cortex/pkg/util/resource"
+	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/users"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 var (
-	errInvalidHTTPPrefix = errors.New("HTTP prefix should be empty or start with /")
+	errInvalidHTTPPrefix                          = errors.New("HTTP prefix should be empty or start with /")
+	errRulerFederatedRulesRequireTenantFederation = errors.New("-ruler.enable-federated-rules requires -tenant-federation.enabled")
+	errTimeoutClassificationRequiresQueryStats    = errors.New("timeout classification requires query stats to be enabled (frontend.query-stats-enabled)")
 )
 
 // The design pattern for Cortex is a series of config objects, which are
@@ -87,10 +94,17 @@ var (
 
 // Config is the root config for Cortex.
 type Config struct {
-	Target      flagext.StringSliceCSV `yaml:"target"`
-	AuthEnabled bool                   `yaml:"auth_enabled"`
-	PrintConfig bool                   `yaml:"-"`
-	HTTPPrefix  string                 `yaml:"http_prefix"`
+	Target               flagext.StringSliceCSV `yaml:"target"`
+	AuthEnabled          bool                   `yaml:"auth_enabled"`
+	PrintConfig          bool                   `yaml:"-"`
+	HTTPPrefix           string                 `yaml:"http_prefix"`
+	NameValidationScheme model.ValidationScheme `yaml:"name_validation_scheme"`
+	yamlRootNodeStates   map[string]yamlRootNodeState
+
+	ResourceMonitor configs.ResourceMonitor `yaml:"resource_monitor"`
+
+	ExternalQueryable prom_storage.Queryable `yaml:"-"`
+	ExternalPusher    ruler.Pusher           `yaml:"-"`
 
 	API              api.Config                      `yaml:"api"`
 	Server           server.Config                   `yaml:"server"`
@@ -100,19 +114,15 @@ type Config struct {
 	Ingester         ingester.Config                 `yaml:"ingester"`
 	Flusher          flusher.Config                  `yaml:"flusher"`
 	Storage          storage.Config                  `yaml:"storage"`
-	ChunkStore       chunk.StoreConfig               `yaml:"chunk_store"`
-	Schema           chunk.SchemaConfig              `yaml:"schema" doc:"hidden"` // Doc generation tool doesn't support it because part of the SchemaConfig doesn't support CLI flags (needs manual documentation)
 	LimitsConfig     validation.Limits               `yaml:"limits"`
 	Prealloc         cortexpb.PreallocConfig         `yaml:"prealloc" doc:"hidden"`
 	Worker           querier_worker.Config           `yaml:"frontend_worker"`
 	Frontend         frontend.CombinedFrontendConfig `yaml:"frontend"`
 	QueryRange       queryrange.Config               `yaml:"query_range"`
-	TableManager     chunk.TableManagerConfig        `yaml:"table_manager"`
-	Encoding         encoding.Config                 `yaml:"-"` // No yaml for this, it only works with flags.
 	BlocksStorage    tsdb.BlocksStorageConfig        `yaml:"blocks_storage"`
 	Compactor        compactor.Config                `yaml:"compactor"`
+	ParquetConverter parquetconverter.Config         `yaml:"parquet_converter"`
 	StoreGateway     storegateway.Config             `yaml:"store_gateway"`
-	PurgerConfig     purger.Config                   `yaml:"purger"`
 	TenantFederation tenantfederation.Config         `yaml:"tenant_federation"`
 
 	Ruler               ruler.Config                               `yaml:"ruler"`
@@ -123,12 +133,63 @@ type Config struct {
 	RuntimeConfig       runtimeconfig.Config                       `yaml:"runtime_config"`
 	MemberlistKV        memberlist.KVConfig                        `yaml:"memberlist"`
 	QueryScheduler      scheduler.Config                           `yaml:"query_scheduler"`
+
+	Tracing tracing.Config `yaml:"tracing"`
+}
+
+type yamlRootNodeState int
+
+const (
+	yamlRootNodeEmpty yamlRootNodeState = iota
+	yamlRootNodeNonEmpty
+)
+
+// SetYAMLRootNodeStates records whether root-level YAML config keys were empty.
+// This lets validation distinguish "querier:" from explicit zero values such
+// as "flusher: { exit_after_flush: false }" after unmarshalling.
+func (c *Config) SetYAMLRootNodeStates(buf []byte) error {
+	var root map[any]any
+	if err := yaml.Unmarshal(buf, &root); err != nil {
+		return err
+	}
+
+	c.yamlRootNodeStates = map[string]yamlRootNodeState{}
+	for key, value := range root {
+		name, ok := key.(string)
+		if !ok {
+			continue
+		}
+
+		if isEmptyYAMLRootNode(value) {
+			c.yamlRootNodeStates[name] = yamlRootNodeEmpty
+		} else {
+			c.yamlRootNodeStates[name] = yamlRootNodeNonEmpty
+		}
+	}
+
+	return nil
+}
+
+func isEmptyYAMLRootNode(value any) bool {
+	if value == nil {
+		return true
+	}
+
+	switch typed := value.(type) {
+	case map[any]any:
+		return len(typed) == 0
+	case []any:
+		return len(typed) == 0
+	default:
+		return false
+	}
 }
 
 // RegisterFlags registers flag.
 func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Server.MetricsNamespace = "cortex"
 	c.Server.ExcludeRequestInLog = true
+	c.Server.MetricsNativeHistogramFactor = 1.1
 
 	// Set the default module list to 'all'
 	c.Target = []string{All}
@@ -138,6 +199,8 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 		"Use '-modules' command line flag to get a list of available modules, and to see which modules are included in 'all'.")
 
 	f.BoolVar(&c.AuthEnabled, "auth.enabled", true, "Set to false to disable auth.")
+	_ = c.NameValidationScheme.Set(model.LegacyValidation.String())
+	f.Var(&c.NameValidationScheme, "name-validation-scheme", fmt.Sprintf("Name validation scheme for metric names and label names, Support values are: %s.", strings.Join([]string{model.LegacyValidation.String(), model.UTF8Validation.String()}, ", ")))
 	f.BoolVar(&c.PrintConfig, "print.config", false, "Print the config and exit.")
 	f.StringVar(&c.HTTPPrefix, "http.prefix", "/api/prom", "HTTP path prefix for Cortex API.")
 
@@ -149,20 +212,17 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Ingester.RegisterFlags(f)
 	c.Flusher.RegisterFlags(f)
 	c.Storage.RegisterFlags(f)
-	c.ChunkStore.RegisterFlags(f)
-	c.Schema.RegisterFlags(f)
 	c.LimitsConfig.RegisterFlags(f)
 	c.Prealloc.RegisterFlags(f)
 	c.Worker.RegisterFlags(f)
 	c.Frontend.RegisterFlags(f)
 	c.QueryRange.RegisterFlags(f)
-	c.TableManager.RegisterFlags(f)
-	c.Encoding.RegisterFlags(f)
 	c.BlocksStorage.RegisterFlags(f)
 	c.Compactor.RegisterFlags(f)
+	c.ParquetConverter.RegisterFlags(f)
 	c.StoreGateway.RegisterFlags(f)
-	c.PurgerConfig.RegisterFlags(f)
 	c.TenantFederation.RegisterFlags(f)
+	c.ResourceMonitor.RegisterFlags(f)
 
 	c.Ruler.RegisterFlags(f)
 	c.RulerStorage.RegisterFlags(f)
@@ -172,9 +232,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.RuntimeConfig.RegisterFlags(f)
 	c.MemberlistKV.RegisterFlags(f)
 	c.QueryScheduler.RegisterFlags(f)
-
-	// These don't seem to have a home.
-	f.IntVar(&chunk_util.QueryParallelism, "querier.query-parallelism", 100, "Max subqueries run in parallel per higher-level query.")
+	c.Tracing.RegisterFlags(f)
 }
 
 // Validate the cortex config and returns an error if the validation
@@ -184,21 +242,21 @@ func (c *Config) Validate(log log.Logger) error {
 		return err
 	}
 
+	switch c.NameValidationScheme {
+	case model.LegacyValidation, model.UTF8Validation:
+	default:
+		return fmt.Errorf("unsupported name validation scheme: %s", c.NameValidationScheme)
+	}
+
 	if c.HTTPPrefix != "" && !strings.HasPrefix(c.HTTPPrefix, "/") {
 		return errInvalidHTTPPrefix
 	}
 
-	if err := c.Schema.Validate(); err != nil {
-		return errors.Wrap(err, "invalid schema config")
-	}
-	if err := c.Encoding.Validate(); err != nil {
-		return errors.Wrap(err, "invalid encoding config")
+	if err := c.API.Validate(); err != nil {
+		return errors.Wrap(err, "invalid api config")
 	}
 	if err := c.Storage.Validate(); err != nil {
 		return errors.Wrap(err, "invalid storage config")
-	}
-	if err := c.ChunkStore.Validate(log); err != nil {
-		return errors.Wrap(err, "invalid chunk store config")
 	}
 	if err := c.RulerStorage.Validate(); err != nil {
 		return errors.Wrap(err, "invalid rulestore config")
@@ -206,17 +264,29 @@ func (c *Config) Validate(log log.Logger) error {
 	if err := c.Ruler.Validate(c.LimitsConfig, log); err != nil {
 		return errors.Wrap(err, "invalid ruler config")
 	}
+	if c.Ruler.EnableFederatedRules && !c.TenantFederation.Enabled {
+		return errRulerFederatedRulesRequireTenantFederation
+	}
 	if err := c.BlocksStorage.Validate(); err != nil {
 		return errors.Wrap(err, "invalid TSDB config")
 	}
-	if err := c.LimitsConfig.Validate(c.Distributor.ShardByAllLabels); err != nil {
+	if err := c.LimitsConfig.Validate(c.NameValidationScheme, c.Distributor.ShardByAllLabels, c.Ingester.ActiveSeriesMetricsEnabled, c.Distributor.HATrackerConfig.UpdateTimeout, c.Distributor.HATrackerConfig.UpdateTimeoutJitterMax); err != nil {
 		return errors.Wrap(err, "invalid limits config")
+	}
+	if err := c.LimitsConfig.ValidateQueryLimits("default", c.BlocksStorage.TSDB.CloseIdleTSDBTimeout); err != nil {
+		return errors.Wrap(err, "invalid query routing config")
+	}
+	if err := c.ResourceMonitor.Validate(); err != nil {
+		return errors.Wrap(err, "invalid resource-monitor config")
 	}
 	if err := c.Distributor.Validate(c.LimitsConfig); err != nil {
 		return errors.Wrap(err, "invalid distributor config")
 	}
-	if err := c.Querier.Validate(); err != nil {
+	if err := c.Querier.Validate(c.ResourceMonitor.Resources); err != nil {
 		return errors.Wrap(err, "invalid querier config")
+	}
+	if c.Querier.TimeoutClassificationEnabled && !c.Frontend.Handler.QueryStatsEnabled {
+		return errTimeoutClassificationRequiresQueryStats
 	}
 	if err := c.IngesterClient.Validate(log); err != nil {
 		return errors.Wrap(err, "invalid ingester_client config")
@@ -224,16 +294,13 @@ func (c *Config) Validate(log log.Logger) error {
 	if err := c.Worker.Validate(log); err != nil {
 		return errors.Wrap(err, "invalid frontend_worker config")
 	}
-	if err := c.QueryRange.Validate(); err != nil {
+	if err := c.QueryRange.Validate(c.Querier); err != nil {
 		return errors.Wrap(err, "invalid query_range config")
 	}
-	if err := c.TableManager.Validate(); err != nil {
-		return errors.Wrap(err, "invalid table-manager config")
-	}
-	if err := c.StoreGateway.Validate(c.LimitsConfig); err != nil {
+	if err := c.StoreGateway.Validate(c.LimitsConfig, c.ResourceMonitor.Resources); err != nil {
 		return errors.Wrap(err, "invalid store-gateway config")
 	}
-	if err := c.Compactor.Validate(); err != nil {
+	if err := c.Compactor.Validate(c.LimitsConfig); err != nil {
 		return errors.Wrap(err, "invalid compactor config")
 	}
 	if err := c.AlertmanagerStorage.Validate(); err != nil {
@@ -243,15 +310,23 @@ func (c *Config) Validate(log log.Logger) error {
 		return errors.Wrap(err, "invalid alertmanager config")
 	}
 
-	if c.Storage.Engine == storage.StorageEngineBlocks && c.Querier.SecondStoreEngine != storage.StorageEngineChunks && len(c.Schema.Configs) > 0 {
-		level.Warn(log).Log("schema configuration is not used by the blocks storage engine, and will have no effect")
+	if err := c.Ingester.Validate(c.ResourceMonitor.Resources); err != nil {
+		return errors.Wrap(err, "invalid ingester config")
+	}
+
+	if err := c.Tracing.Validate(); err != nil {
+		return errors.Wrap(err, "invalid tracing config")
+	}
+
+	if err := c.ParquetConverter.Validate(); err != nil {
+		return errors.Wrap(err, "invalid parquet-converter config")
 	}
 
 	return nil
 }
 
 func (c *Config) isModuleEnabled(m string) bool {
-	return util.StringsContain(c.Target, m)
+	return slices.Contains(c.Target, m)
 }
 
 // validateYAMLEmptyNodes ensure that no empty node has been specified in the YAML config file.
@@ -274,11 +349,23 @@ func (c *Config) validateYAMLEmptyNodes() error {
 		// If the struct has been reset due to empty YAML value and the zero struct value
 		// doesn't match the default one, then we should warn the user about the issue.
 		if cfgStruct.Field(i).Kind() == reflect.Struct && cfgStruct.Field(i).IsZero() && !defStruct.Field(i).IsZero() {
+			if c.yamlRootNodeStates != nil {
+				yamlName := yamlFieldName(cfgStruct.Type().Field(i))
+				if c.yamlRootNodeStates[yamlName] == yamlRootNodeNonEmpty {
+					continue
+				}
+			}
 			return fmt.Errorf("the %s configuration in YAML has been specified as an empty YAML node", cfgStruct.Type().Field(i).Name)
 		}
 	}
 
 	return nil
+}
+
+func yamlFieldName(field reflect.StructField) string {
+	tag := field.Tag.Get("yaml")
+	name, _, _ := strings.Cut(tag, ",")
+	return name
 }
 
 func (c *Config) registerServerFlagsWithChangedDefaultValues(fs *flag.FlagSet) {
@@ -314,30 +401,32 @@ type Cortex struct {
 	Server                   *server.Server
 	Ring                     *ring.Ring
 	TenantLimits             validation.TenantLimits
-	Overrides                *validation.Overrides
+	OverridesConfig          *validation.Overrides
+	Overrides                *overrides.API
 	Distributor              *distributor.Distributor
 	Ingester                 *ingester.Ingester
 	Flusher                  *flusher.Flusher
-	Store                    chunk.Store
-	DeletesStore             *purger.DeleteStore
 	Frontend                 *frontendv1.Frontend
-	TableManager             *chunk.TableManager
 	RuntimeConfig            *runtimeconfig.Manager
-	Purger                   *purger.Purger
-	TombstonesLoader         *purger.TombstonesLoader
 	QuerierQueryable         prom_storage.SampleAndChunkQueryable
 	ExemplarQueryable        prom_storage.ExemplarQueryable
-	QuerierEngine            *promql.Engine
-	QueryFrontendTripperware queryrange.Tripperware
+	MetadataQuerier          querier.MetadataQuerier
+	QuerierEngine            engine.QueryEngine
+	QueryFrontendTripperware tripperware.Tripperware
+	ResourceMonitor          *resource.Monitor
 
-	Ruler        *ruler.Ruler
-	RulerStorage rulestore.RuleStore
-	ConfigAPI    *configAPI.API
-	ConfigDB     db.DB
-	Alertmanager *alertmanager.MultitenantAlertmanager
-	Compactor    *compactor.Compactor
-	StoreGateway *storegateway.StoreGateway
-	MemberlistKV *memberlist.KVInitService
+	Ruler            *ruler.Ruler
+	RulerStorage     rulestore.RuleStore
+	ConfigAPI        *configAPI.API
+	ConfigDB         db.DB
+	Alertmanager     *alertmanager.MultitenantAlertmanager
+	Compactor        *compactor.Compactor
+	Parquetconverter *parquetconverter.Converter
+	StoreGateway     *storegateway.StoreGateway
+	MemberlistKV     *memberlist.KVInitService
+
+	// RegexResolver is set when tenant-federation.regex-matcher-enabled=true.
+	RegexResolver *tenantfederation.RegexResolver
 
 	// Queryables that the querier should use to query the long
 	// term storage. It depends on the storage engine used.
@@ -355,17 +444,13 @@ func New(cfg Config) (*Cortex, error) {
 
 	// Swap out the default resolver to support multiple tenant IDs separated by a '|'
 	if cfg.TenantFederation.Enabled {
-		util_log.WarnExperimentalUse("tenant-federation")
-		tenant.WithDefaultResolver(tenant.NewMultiResolver())
+		users.WithDefaultResolver(users.NewMultiResolver())
 	}
 
-	// Don't check auth header on TransferChunks, as we weren't originally
-	// sending it and this could cause transfers to fail on update.
 	cfg.API.HTTPAuthMiddleware = fakeauth.SetupAuthMiddleware(&cfg.Server, cfg.AuthEnabled,
 		// Also don't check auth for these gRPC methods, since single call is used for multiple users (or no user like health check).
 		[]string{
 			"/grpc.health.v1.Health/Check",
-			"/cortex.Ingester/TransferChunks",
 			"/frontend.Frontend/Process",
 			"/frontend.Frontend/NotifyClientShutdown",
 			"/schedulerpb.SchedulerForFrontend/FrontendLoop",
@@ -377,12 +462,18 @@ func New(cfg Config) (*Cortex, error) {
 		Cfg: cfg,
 	}
 
+	// set name validation scheme
+	model.NameValidationScheme = cfg.NameValidationScheme //nolint:staticcheck
+
 	cortex.setupThanosTracing()
+	cortex.setupGRPCHeaderForwarding()
+	cortex.setupRequestSigning()
 
 	if err := cortex.setupModuleManager(); err != nil {
 		return nil, err
 	}
 
+	cortex.setupPromQLFunctions()
 	return cortex, nil
 }
 
@@ -391,6 +482,27 @@ func New(cfg Config) (*Cortex, error) {
 func (t *Cortex) setupThanosTracing() {
 	t.Cfg.Server.GRPCMiddleware = append(t.Cfg.Server.GRPCMiddleware, ThanosTracerUnaryInterceptor)
 	t.Cfg.Server.GRPCStreamMiddleware = append(t.Cfg.Server.GRPCStreamMiddleware, ThanosTracerStreamInterceptor)
+}
+
+// setupGRPCHeaderForwarding appends a gRPC middleware used to enable the propagation of
+// HTTP Headers through child gRPC calls
+func (t *Cortex) setupGRPCHeaderForwarding() {
+	t.Cfg.Server.GRPCMiddleware = append(t.Cfg.Server.GRPCMiddleware, grpcutil.HTTPHeaderPropagationServerInterceptor)
+	t.Cfg.Server.GRPCStreamMiddleware = append(t.Cfg.Server.GRPCStreamMiddleware, grpcutil.HTTPHeaderPropagationStreamServerInterceptor)
+}
+
+func (t *Cortex) setupRequestSigning() {
+	if t.Cfg.Distributor.SignWriteRequestsEnabled {
+		util_log.WarnExperimentalUse("Distributor SignWriteRequestsEnabled")
+		t.Cfg.Server.GRPCMiddleware = append(t.Cfg.Server.GRPCMiddleware, grpcclient.UnarySigningServerInterceptor)
+
+		// When signing keys are configured, authenticate PushStream connections.
+		// All keys in the list are accepted by the server; the first key is used by
+		// the client to sign.  Multiple keys enable zero-downtime key rotation.
+		if keys := t.Cfg.Distributor.SignWriteRequestsKeys.Value(); len(keys) > 0 {
+			t.Cfg.Server.GRPCStreamMiddleware = append(t.Cfg.Server.GRPCStreamMiddleware, grpcclient.NewStreamSigningServerInterceptor(keys...))
+		}
+	}
 }
 
 // Run starts Cortex running, and blocks until a Cortex stops.
@@ -497,7 +609,7 @@ func (t *Cortex) readyHandler(sm *services.Manager) http.HandlerFunc {
 
 			byState := sm.ServicesByState()
 			for st, ls := range byState {
-				msg.WriteString(fmt.Sprintf("%v: %d\n", st, len(ls)))
+				fmt.Fprintf(&msg, "%v: %d\n", st, len(ls))
 			}
 
 			http.Error(w, msg.String(), http.StatusServiceUnavailable)
@@ -524,4 +636,8 @@ func (t *Cortex) readyHandler(sm *services.Manager) http.HandlerFunc {
 
 		util.WriteTextResponse(w, "ready")
 	}
+}
+
+func (t *Cortex) setupPromQLFunctions() {
+	cortexparser.Setup(t.Cfg.Querier.EnablePromQLExperimentalFunctions, true)
 }

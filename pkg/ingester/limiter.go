@@ -5,18 +5,26 @@ import (
 	"math"
 
 	"github.com/pkg/errors"
+	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/cortexproject/cortex/pkg/util"
-	util_math "github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 var (
-	errMaxSeriesPerMetricLimitExceeded   = errors.New("per-metric series limit exceeded")
-	errMaxMetadataPerMetricLimitExceeded = errors.New("per-metric metadata limit exceeded")
-	errMaxSeriesPerUserLimitExceeded     = errors.New("per-user series limit exceeded")
-	errMaxMetadataPerUserLimitExceeded   = errors.New("per-user metric metadata limit exceeded")
+	errMaxSeriesPerMetricLimitExceeded              = errors.New("per-metric series limit exceeded")
+	errMaxMetadataPerMetricLimitExceeded            = errors.New("per-metric metadata limit exceeded")
+	errMaxSeriesPerUserLimitExceeded                = errors.New("per-user series limit exceeded")
+	errMaxNativeHistogramSeriesPerUserLimitExceeded = errors.New("per-user native histogram series limit exceeded")
+	errMaxMetadataPerUserLimitExceeded              = errors.New("per-user metric metadata limit exceeded")
 )
+
+type errMaxSeriesPerLabelSetLimitExceeded struct {
+	error
+	id               string
+	actualLocalLimit int
+	globalLimit      int
+}
 
 // RingCount is the interface exposed by a ring implementation which allows
 // to count members
@@ -34,6 +42,7 @@ type Limiter struct {
 	shuffleShardingEnabled bool
 	shardByAllLabels       bool
 	zoneAwarenessEnabled   bool
+	AdminLimitMessage      string
 }
 
 // NewLimiter makes a new in-memory series limiter
@@ -44,6 +53,7 @@ func NewLimiter(
 	shardByAllLabels bool,
 	replicationFactor int,
 	zoneAwarenessEnabled bool,
+	AdminLimitMessage string,
 ) *Limiter {
 	return &Limiter{
 		limits:                 limits,
@@ -52,6 +62,7 @@ func NewLimiter(
 		shuffleShardingEnabled: shardingStrategy == util.ShardingStrategyShuffle,
 		shardByAllLabels:       shardByAllLabels,
 		zoneAwarenessEnabled:   zoneAwarenessEnabled,
+		AdminLimitMessage:      AdminLimitMessage,
 	}
 }
 
@@ -85,6 +96,16 @@ func (l *Limiter) AssertMaxSeriesPerUser(userID string, series int) error {
 	return errMaxSeriesPerUserLimitExceeded
 }
 
+// AssertMaxNativeHistogramSeriesPerUser limit has not been reached compared to the current
+// number of native histogram series in input and returns an error if so.
+func (l *Limiter) AssertMaxNativeHistogramSeriesPerUser(userID string, series int) error {
+	if actualLimit := l.maxNativeHistogramSeriesPerUser(userID); series < actualLimit {
+		return nil
+	}
+
+	return errMaxNativeHistogramSeriesPerUserLimitExceeded
+}
+
 // AssertMaxMetricsWithMetadataPerUser limit has not been reached compared to the current
 // number of metrics with metadata in input and returns an error if so.
 func (l *Limiter) AssertMaxMetricsWithMetadataPerUser(userID string, metrics int) error {
@@ -95,23 +116,47 @@ func (l *Limiter) AssertMaxMetricsWithMetadataPerUser(userID string, metrics int
 	return errMaxMetadataPerUserLimitExceeded
 }
 
-// MaxSeriesPerQuery returns the maximum number of series a query is allowed to hit.
-func (l *Limiter) MaxSeriesPerQuery(userID string) int {
-	return l.limits.MaxSeriesPerQuery(userID)
+// AssertMaxSeriesPerLabelSet limit has not been reached compared to the current
+// number of metrics with metadata in input and returns an error if so.
+func (l *Limiter) AssertMaxSeriesPerLabelSet(userID string, metric labels.Labels, f func(allLimits []validation.LimitsPerLabelSet, limit validation.LimitsPerLabelSet) (int, error)) error {
+	limits := l.limits.LimitsPerLabelSet(userID)
+	matchedLimits := validation.LimitsPerLabelSetsForSeries(limits, metric)
+	for _, limit := range matchedLimits {
+		maxSeriesFunc := func(string) int {
+			return limit.Limits.MaxSeries
+		}
+		local := l.maxByLocalAndGlobal(userID, maxSeriesFunc, maxSeriesFunc)
+		if u, err := f(limits, limit); err != nil {
+			return err
+		} else if u >= local {
+			return errMaxSeriesPerLabelSetLimitExceeded{
+				id:               limit.Id,
+				actualLocalLimit: local,
+				globalLimit:      limit.Limits.MaxSeries,
+			}
+		}
+	}
+	return nil
 }
 
 // FormatError returns the input error enriched with the actual limits for the given user.
 // It acts as pass-through if the input error is unknown.
-func (l *Limiter) FormatError(userID string, err error) error {
-	switch err {
-	case errMaxSeriesPerUserLimitExceeded:
+func (l *Limiter) FormatError(userID string, err error, lbls labels.Labels) error {
+	switch {
+	case errors.Is(err, errMaxSeriesPerUserLimitExceeded):
 		return l.formatMaxSeriesPerUserError(userID)
-	case errMaxSeriesPerMetricLimitExceeded:
-		return l.formatMaxSeriesPerMetricError(userID)
-	case errMaxMetadataPerUserLimitExceeded:
+	case errors.Is(err, errMaxNativeHistogramSeriesPerUserLimitExceeded):
+		return l.formatMaxNativeHistogramsSeriesPerUserError(userID)
+	case errors.Is(err, errMaxSeriesPerMetricLimitExceeded):
+		return l.formatMaxSeriesPerMetricError(userID, lbls.Get(labels.MetricName))
+	case errors.Is(err, errMaxMetadataPerUserLimitExceeded):
 		return l.formatMaxMetadataPerUserError(userID)
-	case errMaxMetadataPerMetricLimitExceeded:
-		return l.formatMaxMetadataPerMetricError(userID)
+	case errors.Is(err, errMaxMetadataPerMetricLimitExceeded):
+		return l.formatMaxMetadataPerMetricError(userID, lbls.Get(labels.MetricName))
+	case errors.As(err, &errMaxSeriesPerLabelSetLimitExceeded{}):
+		e := errMaxSeriesPerLabelSetLimitExceeded{}
+		errors.As(err, &e)
+		return l.formatMaxSeriesPerLabelSetError(e)
 	default:
 		return err
 	}
@@ -122,17 +167,26 @@ func (l *Limiter) formatMaxSeriesPerUserError(userID string) error {
 	localLimit := l.limits.MaxLocalSeriesPerUser(userID)
 	globalLimit := l.limits.MaxGlobalSeriesPerUser(userID)
 
-	return fmt.Errorf("per-user series limit of %d exceeded, please contact administrator to raise it (local limit: %d global limit: %d actual local limit: %d)",
-		minNonZero(localLimit, globalLimit), localLimit, globalLimit, actualLimit)
+	return fmt.Errorf("per-user series limit of %d exceeded, %s (local limit: %d global limit: %d actual local limit: %d)",
+		minNonZero(localLimit, globalLimit), l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
 }
 
-func (l *Limiter) formatMaxSeriesPerMetricError(userID string) error {
+func (l *Limiter) formatMaxNativeHistogramsSeriesPerUserError(userID string) error {
+	actualLimit := l.maxNativeHistogramSeriesPerUser(userID)
+	localLimit := l.limits.MaxLocalNativeHistogramSeriesPerUser(userID)
+	globalLimit := l.limits.MaxGlobalNativeHistogramSeriesPerUser(userID)
+
+	return fmt.Errorf("per-user native histogram series limit of %d exceeded, %s (local limit: %d global limit: %d actual local limit: %d)",
+		minNonZero(localLimit, globalLimit), l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
+}
+
+func (l *Limiter) formatMaxSeriesPerMetricError(userID string, metric string) error {
 	actualLimit := l.maxSeriesPerMetric(userID)
 	localLimit := l.limits.MaxLocalSeriesPerMetric(userID)
 	globalLimit := l.limits.MaxGlobalSeriesPerMetric(userID)
 
-	return fmt.Errorf("per-metric series limit of %d exceeded, please contact administrator to raise it (local limit: %d global limit: %d actual local limit: %d)",
-		minNonZero(localLimit, globalLimit), localLimit, globalLimit, actualLimit)
+	return fmt.Errorf("per-metric series limit of %d exceeded for metric %s, %s (local limit: %d global limit: %d actual local limit: %d)",
+		minNonZero(localLimit, globalLimit), metric, l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
 }
 
 func (l *Limiter) formatMaxMetadataPerUserError(userID string) error {
@@ -140,17 +194,27 @@ func (l *Limiter) formatMaxMetadataPerUserError(userID string) error {
 	localLimit := l.limits.MaxLocalMetricsWithMetadataPerUser(userID)
 	globalLimit := l.limits.MaxGlobalMetricsWithMetadataPerUser(userID)
 
-	return fmt.Errorf("per-user metric metadata limit of %d exceeded, please contact administrator to raise it (local limit: %d global limit: %d actual local limit: %d)",
-		minNonZero(localLimit, globalLimit), localLimit, globalLimit, actualLimit)
+	return fmt.Errorf("per-user metric metadata limit of %d exceeded, %s (local limit: %d global limit: %d actual local limit: %d)",
+		minNonZero(localLimit, globalLimit), l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
 }
 
-func (l *Limiter) formatMaxMetadataPerMetricError(userID string) error {
+func (l *Limiter) formatMaxMetadataPerMetricError(userID string, metric string) error {
 	actualLimit := l.maxMetadataPerMetric(userID)
 	localLimit := l.limits.MaxLocalMetadataPerMetric(userID)
 	globalLimit := l.limits.MaxGlobalMetadataPerMetric(userID)
 
-	return fmt.Errorf("per-metric metadata limit of %d exceeded, please contact administrator to raise it (local limit: %d global limit: %d actual local limit: %d)",
-		minNonZero(localLimit, globalLimit), localLimit, globalLimit, actualLimit)
+	return fmt.Errorf("per-metric metadata limit of %d exceeded for metric %s, %s (local limit: %d global limit: %d actual local limit: %d)",
+		minNonZero(localLimit, globalLimit), metric, l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
+}
+
+func (l *Limiter) formatMaxSeriesPerLabelSetError(err errMaxSeriesPerLabelSetLimitExceeded) error {
+	return fmt.Errorf("per-labelset series limit of %d exceeded (labelSet: %s, global limit: %d actual local limit: %d)",
+		minNonZero(err.globalLimit, err.actualLocalLimit), err.id, err.globalLimit, err.actualLocalLimit)
+}
+
+func (l *Limiter) limitsPerLabelSets(userID string, metric labels.Labels) []validation.LimitsPerLabelSet {
+	m := l.limits.LimitsPerLabelSet(userID)
+	return validation.LimitsPerLabelSetsForSeries(m, metric)
 }
 
 func (l *Limiter) maxSeriesPerMetric(userID string) int {
@@ -206,6 +270,14 @@ func (l *Limiter) maxSeriesPerUser(userID string) int {
 	)
 }
 
+func (l *Limiter) maxNativeHistogramSeriesPerUser(userID string) int {
+	return l.maxByLocalAndGlobal(
+		userID,
+		l.limits.MaxLocalNativeHistogramSeriesPerUser,
+		l.limits.MaxGlobalNativeHistogramSeriesPerUser,
+	)
+}
+
 func (l *Limiter) maxMetadataPerUser(userID string) int {
 	return l.maxByLocalAndGlobal(
 		userID,
@@ -258,7 +330,7 @@ func (l *Limiter) convertGlobalToLocalLimit(userID string, globalLimit int) int 
 	// be written to more ingesters than it.
 	if shardSize := l.getShardSize(userID); shardSize > 0 {
 		// We use Min() to protect from the case the expected shard size is > available ingesters.
-		numIngesters = util_math.Min(numIngesters, util.ShuffleShardExpectedInstances(shardSize, l.getNumZones()))
+		numIngesters = min(numIngesters, util.ShuffleShardExpectedInstances(shardSize, l.getNumZones()))
 	}
 
 	return int((float64(globalLimit) / float64(numIngesters)) * float64(l.replicationFactor))
@@ -274,7 +346,7 @@ func (l *Limiter) getShardSize(userID string) int {
 
 func (l *Limiter) getNumZones() int {
 	if l.zoneAwarenessEnabled {
-		return util_math.Max(l.ring.ZonesCount(), 1)
+		return max(l.ring.ZonesCount(), 1)
 	}
 	return 1
 }

@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/prometheus/alertmanager/types"
+	"github.com/prometheus/alertmanager/alert"
+	"github.com/prometheus/alertmanager/silence"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -21,6 +22,7 @@ var integrations = []string{
 	"webhook",
 	"victorops",
 }
+var reason = "clientError"
 
 func TestAlertmanagerMetricsStore(t *testing.T) {
 	mainReg := prometheus.NewPedanticRegistry()
@@ -48,14 +50,25 @@ func TestAlertmanagerMetricsStore(t *testing.T) {
 		cortex_alertmanager_alerts_invalid_total{user="user3"} 200
 		# HELP cortex_alertmanager_alerts_received_total The total number of received alerts.
 		# TYPE cortex_alertmanager_alerts_received_total counter
-		cortex_alertmanager_alerts_received_total{user="user1"} 10
-		cortex_alertmanager_alerts_received_total{user="user2"} 100
-		cortex_alertmanager_alerts_received_total{user="user3"} 1000
+		cortex_alertmanager_alerts_received_total{status="firing",user="user1"} 4
+		cortex_alertmanager_alerts_received_total{status="resolved",user="user1"} 6
+		cortex_alertmanager_alerts_received_total{status="firing",user="user2"} 40
+		cortex_alertmanager_alerts_received_total{status="resolved",user="user2"} 60
+		cortex_alertmanager_alerts_received_total{status="firing",user="user3"} 400
+		cortex_alertmanager_alerts_received_total{status="resolved",user="user3"} 600
 		# HELP cortex_alertmanager_config_hash Hash of the currently loaded alertmanager configuration.
 		# TYPE cortex_alertmanager_config_hash gauge
 		cortex_alertmanager_config_hash{user="user1"} 0
 		cortex_alertmanager_config_hash{user="user2"} 0
 		cortex_alertmanager_config_hash{user="user3"} 0
+		# HELP cortex_alertmanager_dispatcher_alert_processing_duration_seconds Summary of latencies for the processing of alerts.
+		# TYPE cortex_alertmanager_dispatcher_alert_processing_duration_seconds summary
+		cortex_alertmanager_dispatcher_alert_processing_duration_seconds_sum{user="user1"} 0
+		cortex_alertmanager_dispatcher_alert_processing_duration_seconds_count{user="user1"} 0
+		cortex_alertmanager_dispatcher_alert_processing_duration_seconds_sum{user="user2"} 0
+		cortex_alertmanager_dispatcher_alert_processing_duration_seconds_count{user="user2"} 0
+		cortex_alertmanager_dispatcher_alert_processing_duration_seconds_sum{user="user3"} 0
+		cortex_alertmanager_dispatcher_alert_processing_duration_seconds_count{user="user3"} 0
 		# HELP cortex_alertmanager_nflog_gc_duration_seconds Duration of the last notification log garbage collection cycle.
 		# TYPE cortex_alertmanager_nflog_gc_duration_seconds summary
 		cortex_alertmanager_nflog_gc_duration_seconds_sum 111
@@ -92,6 +105,12 @@ func TestAlertmanagerMetricsStore(t *testing.T) {
 		# HELP cortex_alertmanager_nflog_snapshot_size_bytes Size of the last notification log snapshot in bytes.
 		# TYPE cortex_alertmanager_nflog_snapshot_size_bytes gauge
 		cortex_alertmanager_nflog_snapshot_size_bytes 111
+		# HELP cortex_alertmanager_nflog_maintenance_total How many maintenances were executed for the notification log.
+		# TYPE cortex_alertmanager_nflog_maintenance_total counter
+		cortex_alertmanager_nflog_maintenance_total 111
+		# HELP cortex_alertmanager_nflog_maintenance_errors_total How many maintenances were executed for the notification log that failed.
+		# TYPE cortex_alertmanager_nflog_maintenance_errors_total counter
+		cortex_alertmanager_nflog_maintenance_errors_total 111
 		# HELP cortex_alertmanager_notification_latency_seconds The latency of notifications in seconds.
 		# TYPE cortex_alertmanager_notification_latency_seconds histogram
 		cortex_alertmanager_notification_latency_seconds_bucket{le="1"} 14
@@ -104,30 +123,30 @@ func TestAlertmanagerMetricsStore(t *testing.T) {
 		cortex_alertmanager_notification_latency_seconds_count 24
 		# HELP cortex_alertmanager_notifications_failed_total The total number of failed notifications.
 		# TYPE cortex_alertmanager_notifications_failed_total counter
-		cortex_alertmanager_notifications_failed_total{integration="email",user="user1"} 0
-		cortex_alertmanager_notifications_failed_total{integration="email",user="user2"} 0
-		cortex_alertmanager_notifications_failed_total{integration="email",user="user3"} 0
-		cortex_alertmanager_notifications_failed_total{integration="opsgenie",user="user1"} 5
-		cortex_alertmanager_notifications_failed_total{integration="opsgenie",user="user2"} 50
-		cortex_alertmanager_notifications_failed_total{integration="opsgenie",user="user3"} 500
-		cortex_alertmanager_notifications_failed_total{integration="pagerduty",user="user1"} 1
-		cortex_alertmanager_notifications_failed_total{integration="pagerduty",user="user2"} 10
-		cortex_alertmanager_notifications_failed_total{integration="pagerduty",user="user3"} 100
-		cortex_alertmanager_notifications_failed_total{integration="pushover",user="user1"} 3
-		cortex_alertmanager_notifications_failed_total{integration="pushover",user="user2"} 30
-		cortex_alertmanager_notifications_failed_total{integration="pushover",user="user3"} 300
-		cortex_alertmanager_notifications_failed_total{integration="slack",user="user1"} 4
-		cortex_alertmanager_notifications_failed_total{integration="slack",user="user2"} 40
-		cortex_alertmanager_notifications_failed_total{integration="slack",user="user3"} 400
-		cortex_alertmanager_notifications_failed_total{integration="victorops",user="user1"} 7
-		cortex_alertmanager_notifications_failed_total{integration="victorops",user="user2"} 70
-		cortex_alertmanager_notifications_failed_total{integration="victorops",user="user3"} 700
-		cortex_alertmanager_notifications_failed_total{integration="webhook",user="user1"} 6
-		cortex_alertmanager_notifications_failed_total{integration="webhook",user="user2"} 60
-		cortex_alertmanager_notifications_failed_total{integration="webhook",user="user3"} 600
-		cortex_alertmanager_notifications_failed_total{integration="wechat",user="user1"} 2
-		cortex_alertmanager_notifications_failed_total{integration="wechat",user="user2"} 20
-		cortex_alertmanager_notifications_failed_total{integration="wechat",user="user3"} 200
+		cortex_alertmanager_notifications_failed_total{integration="email",reason="clientError",user="user1"} 0
+		cortex_alertmanager_notifications_failed_total{integration="email",reason="clientError",user="user2"} 0
+		cortex_alertmanager_notifications_failed_total{integration="email",reason="clientError",user="user3"} 0
+		cortex_alertmanager_notifications_failed_total{integration="opsgenie",reason="clientError",user="user1"} 5
+		cortex_alertmanager_notifications_failed_total{integration="opsgenie",reason="clientError",user="user2"} 50
+		cortex_alertmanager_notifications_failed_total{integration="opsgenie",reason="clientError",user="user3"} 500
+		cortex_alertmanager_notifications_failed_total{integration="pagerduty",reason="clientError",user="user1"} 1
+		cortex_alertmanager_notifications_failed_total{integration="pagerduty",reason="clientError",user="user2"} 10
+		cortex_alertmanager_notifications_failed_total{integration="pagerduty",reason="clientError",user="user3"} 100
+		cortex_alertmanager_notifications_failed_total{integration="pushover",reason="clientError",user="user1"} 3
+		cortex_alertmanager_notifications_failed_total{integration="pushover",reason="clientError",user="user2"} 30
+		cortex_alertmanager_notifications_failed_total{integration="pushover",reason="clientError",user="user3"} 300
+		cortex_alertmanager_notifications_failed_total{integration="slack",reason="clientError",user="user1"} 4
+		cortex_alertmanager_notifications_failed_total{integration="slack",reason="clientError",user="user2"} 40
+		cortex_alertmanager_notifications_failed_total{integration="slack",reason="clientError",user="user3"} 400
+		cortex_alertmanager_notifications_failed_total{integration="victorops",reason="clientError",user="user1"} 7
+		cortex_alertmanager_notifications_failed_total{integration="victorops",reason="clientError",user="user2"} 70
+		cortex_alertmanager_notifications_failed_total{integration="victorops",reason="clientError",user="user3"} 700
+		cortex_alertmanager_notifications_failed_total{integration="webhook",reason="clientError",user="user1"} 6
+		cortex_alertmanager_notifications_failed_total{integration="webhook",reason="clientError",user="user2"} 60
+		cortex_alertmanager_notifications_failed_total{integration="webhook",reason="clientError",user="user3"} 600
+		cortex_alertmanager_notifications_failed_total{integration="wechat",reason="clientError",user="user1"} 2
+		cortex_alertmanager_notifications_failed_total{integration="wechat",reason="clientError",user="user2"} 20
+		cortex_alertmanager_notifications_failed_total{integration="wechat",reason="clientError",user="user3"} 200
 		# HELP cortex_alertmanager_notification_requests_total The total number of attempted notification requests.
 		# TYPE cortex_alertmanager_notification_requests_total counter
 		cortex_alertmanager_notification_requests_total{integration="email",user="user1"} 0
@@ -207,6 +226,17 @@ func TestAlertmanagerMetricsStore(t *testing.T) {
 		cortex_alertmanager_notifications_total{integration="wechat",user="user2"} 20
 		cortex_alertmanager_notifications_total{integration="wechat",user="user3"} 200
 
+		# HELP cortex_alertmanager_partial_state_merges_failed_total Number of times we have failed to merge a partial state received for a key.
+		# TYPE cortex_alertmanager_partial_state_merges_failed_total counter
+		cortex_alertmanager_partial_state_merges_failed_total{type="nfl",user="user1"} 2
+		cortex_alertmanager_partial_state_merges_failed_total{type="nfl",user="user2"} 20
+		cortex_alertmanager_partial_state_merges_failed_total{type="nfl",user="user3"} 200
+		# HELP cortex_alertmanager_partial_state_merges_total Number of times we have received a partial state to merge for a key.
+		# TYPE cortex_alertmanager_partial_state_merges_total counter
+		cortex_alertmanager_partial_state_merges_total{type="nfl",user="user1"} 3
+		cortex_alertmanager_partial_state_merges_total{type="nfl",user="user2"} 30
+		cortex_alertmanager_partial_state_merges_total{type="nfl",user="user3"} 300
+
 		# HELP cortex_alertmanager_silences How many silences by state.
 		# TYPE cortex_alertmanager_silences gauge
 		cortex_alertmanager_silences{state="active",user="user1"} 1
@@ -254,6 +284,12 @@ func TestAlertmanagerMetricsStore(t *testing.T) {
 		# HELP cortex_alertmanager_silences_snapshot_size_bytes Size of the last silence snapshot in bytes.
 		# TYPE cortex_alertmanager_silences_snapshot_size_bytes gauge
 		cortex_alertmanager_silences_snapshot_size_bytes 111
+		# HELP cortex_alertmanager_silences_maintenance_total How many maintenances were executed for silences.
+		# TYPE cortex_alertmanager_silences_maintenance_total counter
+		cortex_alertmanager_silences_maintenance_total 111
+		# HELP cortex_alertmanager_silences_maintenance_errors_total How many maintenances were executed for silences that failed.
+		# TYPE cortex_alertmanager_silences_maintenance_errors_total counter
+		cortex_alertmanager_silences_maintenance_errors_total 111
 		# HELP cortex_alertmanager_state_fetch_replica_state_failed_total Number of times we have failed to read and merge the full state from another replica.
 		# TYPE cortex_alertmanager_state_fetch_replica_state_failed_total counter
 		cortex_alertmanager_state_fetch_replica_state_failed_total 0
@@ -327,15 +363,26 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
 
         	            # HELP cortex_alertmanager_alerts_received_total The total number of received alerts.
         	            # TYPE cortex_alertmanager_alerts_received_total counter
-        	            cortex_alertmanager_alerts_received_total{user="user1"} 10
-        	            cortex_alertmanager_alerts_received_total{user="user2"} 100
-        	            cortex_alertmanager_alerts_received_total{user="user3"} 1000
+        	            cortex_alertmanager_alerts_received_total{status="firing",user="user1"} 4
+						cortex_alertmanager_alerts_received_total{status="resolved",user="user1"} 6
+						cortex_alertmanager_alerts_received_total{status="firing",user="user2"} 40
+						cortex_alertmanager_alerts_received_total{status="resolved",user="user2"} 60
+						cortex_alertmanager_alerts_received_total{status="firing",user="user3"} 400
+						cortex_alertmanager_alerts_received_total{status="resolved",user="user3"} 600
 
         	            # HELP cortex_alertmanager_config_hash Hash of the currently loaded alertmanager configuration.
         	            # TYPE cortex_alertmanager_config_hash gauge
         	            cortex_alertmanager_config_hash{user="user1"} 0
         	            cortex_alertmanager_config_hash{user="user2"} 0
         	            cortex_alertmanager_config_hash{user="user3"} 0
+						# HELP cortex_alertmanager_dispatcher_alert_processing_duration_seconds Summary of latencies for the processing of alerts.
+						# TYPE cortex_alertmanager_dispatcher_alert_processing_duration_seconds summary
+						cortex_alertmanager_dispatcher_alert_processing_duration_seconds_sum{user="user1"} 0
+						cortex_alertmanager_dispatcher_alert_processing_duration_seconds_count{user="user1"} 0
+						cortex_alertmanager_dispatcher_alert_processing_duration_seconds_sum{user="user2"} 0
+						cortex_alertmanager_dispatcher_alert_processing_duration_seconds_count{user="user2"} 0
+						cortex_alertmanager_dispatcher_alert_processing_duration_seconds_sum{user="user3"} 0
+						cortex_alertmanager_dispatcher_alert_processing_duration_seconds_count{user="user3"} 0
 
         	            # HELP cortex_alertmanager_nflog_gc_duration_seconds Duration of the last notification log garbage collection cycle.
         	            # TYPE cortex_alertmanager_nflog_gc_duration_seconds summary
@@ -379,6 +426,13 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
         	            # HELP cortex_alertmanager_nflog_snapshot_size_bytes Size of the last notification log snapshot in bytes.
         	            # TYPE cortex_alertmanager_nflog_snapshot_size_bytes gauge
         	            cortex_alertmanager_nflog_snapshot_size_bytes 111
+
+						# HELP cortex_alertmanager_nflog_maintenance_total How many maintenances were executed for the notification log.
+						# TYPE cortex_alertmanager_nflog_maintenance_total counter
+						cortex_alertmanager_nflog_maintenance_total 111
+						# HELP cortex_alertmanager_nflog_maintenance_errors_total How many maintenances were executed for the notification log that failed.
+						# TYPE cortex_alertmanager_nflog_maintenance_errors_total counter
+						cortex_alertmanager_nflog_maintenance_errors_total 111
 
 						# HELP cortex_alertmanager_notification_latency_seconds The latency of notifications in seconds.
         	           	# TYPE cortex_alertmanager_notification_latency_seconds histogram
@@ -447,30 +501,30 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
 
         	            # HELP cortex_alertmanager_notifications_failed_total The total number of failed notifications.
         	            # TYPE cortex_alertmanager_notifications_failed_total counter
-        	            cortex_alertmanager_notifications_failed_total{integration="email",user="user1"} 0
-        	            cortex_alertmanager_notifications_failed_total{integration="email",user="user2"} 0
-        	            cortex_alertmanager_notifications_failed_total{integration="email",user="user3"} 0
-        	            cortex_alertmanager_notifications_failed_total{integration="opsgenie",user="user1"} 5
-        	            cortex_alertmanager_notifications_failed_total{integration="opsgenie",user="user2"} 50
-        	            cortex_alertmanager_notifications_failed_total{integration="opsgenie",user="user3"} 500
-        	            cortex_alertmanager_notifications_failed_total{integration="pagerduty",user="user1"} 1
-        	            cortex_alertmanager_notifications_failed_total{integration="pagerduty",user="user2"} 10
-        	            cortex_alertmanager_notifications_failed_total{integration="pagerduty",user="user3"} 100
-        	            cortex_alertmanager_notifications_failed_total{integration="pushover",user="user1"} 3
-        	            cortex_alertmanager_notifications_failed_total{integration="pushover",user="user2"} 30
-        	            cortex_alertmanager_notifications_failed_total{integration="pushover",user="user3"} 300
-        	            cortex_alertmanager_notifications_failed_total{integration="slack",user="user1"} 4
-        	            cortex_alertmanager_notifications_failed_total{integration="slack",user="user2"} 40
-        	            cortex_alertmanager_notifications_failed_total{integration="slack",user="user3"} 400
-        	            cortex_alertmanager_notifications_failed_total{integration="victorops",user="user1"} 7
-        	            cortex_alertmanager_notifications_failed_total{integration="victorops",user="user2"} 70
-        	            cortex_alertmanager_notifications_failed_total{integration="victorops",user="user3"} 700
-        	            cortex_alertmanager_notifications_failed_total{integration="webhook",user="user1"} 6
-        	            cortex_alertmanager_notifications_failed_total{integration="webhook",user="user2"} 60
-        	            cortex_alertmanager_notifications_failed_total{integration="webhook",user="user3"} 600
-        	            cortex_alertmanager_notifications_failed_total{integration="wechat",user="user1"} 2
-        	            cortex_alertmanager_notifications_failed_total{integration="wechat",user="user2"} 20
-        	            cortex_alertmanager_notifications_failed_total{integration="wechat",user="user3"} 200
+        	            cortex_alertmanager_notifications_failed_total{integration="email",reason="clientError",user="user1"} 0
+        	            cortex_alertmanager_notifications_failed_total{integration="email",reason="clientError",user="user2"} 0
+        	            cortex_alertmanager_notifications_failed_total{integration="email",reason="clientError",user="user3"} 0
+        	            cortex_alertmanager_notifications_failed_total{integration="opsgenie",reason="clientError",user="user1"} 5
+        	            cortex_alertmanager_notifications_failed_total{integration="opsgenie",reason="clientError",user="user2"} 50
+        	            cortex_alertmanager_notifications_failed_total{integration="opsgenie",reason="clientError",user="user3"} 500
+        	            cortex_alertmanager_notifications_failed_total{integration="pagerduty",reason="clientError",user="user1"} 1
+        	            cortex_alertmanager_notifications_failed_total{integration="pagerduty",reason="clientError",user="user2"} 10
+        	            cortex_alertmanager_notifications_failed_total{integration="pagerduty",reason="clientError",user="user3"} 100
+        	            cortex_alertmanager_notifications_failed_total{integration="pushover",reason="clientError",user="user1"} 3
+        	            cortex_alertmanager_notifications_failed_total{integration="pushover",reason="clientError",user="user2"} 30
+        	            cortex_alertmanager_notifications_failed_total{integration="pushover",reason="clientError",user="user3"} 300
+        	            cortex_alertmanager_notifications_failed_total{integration="slack",reason="clientError",user="user1"} 4
+        	            cortex_alertmanager_notifications_failed_total{integration="slack",reason="clientError",user="user2"} 40
+        	            cortex_alertmanager_notifications_failed_total{integration="slack",reason="clientError",user="user3"} 400
+        	            cortex_alertmanager_notifications_failed_total{integration="victorops",reason="clientError",user="user1"} 7
+        	            cortex_alertmanager_notifications_failed_total{integration="victorops",reason="clientError",user="user2"} 70
+        	            cortex_alertmanager_notifications_failed_total{integration="victorops",reason="clientError",user="user3"} 700
+        	            cortex_alertmanager_notifications_failed_total{integration="webhook",reason="clientError",user="user1"} 6
+        	            cortex_alertmanager_notifications_failed_total{integration="webhook",reason="clientError",user="user2"} 60
+        	            cortex_alertmanager_notifications_failed_total{integration="webhook",reason="clientError",user="user3"} 600
+        	            cortex_alertmanager_notifications_failed_total{integration="wechat",reason="clientError",user="user1"} 2
+        	            cortex_alertmanager_notifications_failed_total{integration="wechat",reason="clientError",user="user2"} 20
+        	            cortex_alertmanager_notifications_failed_total{integration="wechat",reason="clientError",user="user3"} 200
 
         	            # HELP cortex_alertmanager_notifications_total The total number of attempted notifications.
         	            # TYPE cortex_alertmanager_notifications_total counter
@@ -498,6 +552,17 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
         	            cortex_alertmanager_notifications_total{integration="wechat",user="user1"} 2
         	            cortex_alertmanager_notifications_total{integration="wechat",user="user2"} 20
         	            cortex_alertmanager_notifications_total{integration="wechat",user="user3"} 200
+
+        	            # HELP cortex_alertmanager_partial_state_merges_failed_total Number of times we have failed to merge a partial state received for a key.
+        	            # TYPE cortex_alertmanager_partial_state_merges_failed_total counter
+        	            cortex_alertmanager_partial_state_merges_failed_total{type="nfl",user="user1"} 2
+        	            cortex_alertmanager_partial_state_merges_failed_total{type="nfl",user="user2"} 20
+        	            cortex_alertmanager_partial_state_merges_failed_total{type="nfl",user="user3"} 200
+        	            # HELP cortex_alertmanager_partial_state_merges_total Number of times we have received a partial state to merge for a key.
+        	            # TYPE cortex_alertmanager_partial_state_merges_total counter
+        	            cortex_alertmanager_partial_state_merges_total{type="nfl",user="user1"} 3
+        	            cortex_alertmanager_partial_state_merges_total{type="nfl",user="user2"} 30
+        	            cortex_alertmanager_partial_state_merges_total{type="nfl",user="user3"} 300
 
         	            # HELP cortex_alertmanager_silences How many silences by state.
         	            # TYPE cortex_alertmanager_silences gauge
@@ -553,6 +618,14 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
 						# HELP cortex_alertmanager_silences_snapshot_size_bytes Size of the last silence snapshot in bytes.
 						# TYPE cortex_alertmanager_silences_snapshot_size_bytes gauge
 						cortex_alertmanager_silences_snapshot_size_bytes 111
+
+						# HELP cortex_alertmanager_silences_maintenance_total How many maintenances were executed for silences.
+						# TYPE cortex_alertmanager_silences_maintenance_total counter
+						cortex_alertmanager_silences_maintenance_total 111
+						# HELP cortex_alertmanager_silences_maintenance_errors_total How many maintenances were executed for silences that failed.
+						# TYPE cortex_alertmanager_silences_maintenance_errors_total counter
+						cortex_alertmanager_silences_maintenance_errors_total 111
+
 						# HELP cortex_alertmanager_state_fetch_replica_state_failed_total Number of times we have failed to read and merge the full state from another replica.
 						# TYPE cortex_alertmanager_state_fetch_replica_state_failed_total counter
 						cortex_alertmanager_state_fetch_replica_state_failed_total 0
@@ -611,13 +684,21 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
 
     		# HELP cortex_alertmanager_alerts_received_total The total number of received alerts.
     		# TYPE cortex_alertmanager_alerts_received_total counter
-    		cortex_alertmanager_alerts_received_total{user="user1"} 10
-    		cortex_alertmanager_alerts_received_total{user="user2"} 100
+    		cortex_alertmanager_alerts_received_total{status="firing",user="user1"} 4
+			cortex_alertmanager_alerts_received_total{status="resolved",user="user1"} 6
+			cortex_alertmanager_alerts_received_total{status="firing",user="user2"} 40
+			cortex_alertmanager_alerts_received_total{status="resolved",user="user2"} 60
 
     		# HELP cortex_alertmanager_config_hash Hash of the currently loaded alertmanager configuration.
     		# TYPE cortex_alertmanager_config_hash gauge
     		cortex_alertmanager_config_hash{user="user1"} 0
     		cortex_alertmanager_config_hash{user="user2"} 0
+			# HELP cortex_alertmanager_dispatcher_alert_processing_duration_seconds Summary of latencies for the processing of alerts.
+			# TYPE cortex_alertmanager_dispatcher_alert_processing_duration_seconds summary
+			cortex_alertmanager_dispatcher_alert_processing_duration_seconds_sum{user="user1"} 0
+			cortex_alertmanager_dispatcher_alert_processing_duration_seconds_count{user="user1"} 0
+			cortex_alertmanager_dispatcher_alert_processing_duration_seconds_sum{user="user2"} 0
+			cortex_alertmanager_dispatcher_alert_processing_duration_seconds_count{user="user2"} 0
 
     		# HELP cortex_alertmanager_nflog_gc_duration_seconds Duration of the last notification log garbage collection cycle.
     		# TYPE cortex_alertmanager_nflog_gc_duration_seconds summary
@@ -661,6 +742,13 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
     		# HELP cortex_alertmanager_nflog_snapshot_size_bytes Size of the last notification log snapshot in bytes.
     		# TYPE cortex_alertmanager_nflog_snapshot_size_bytes gauge
     		cortex_alertmanager_nflog_snapshot_size_bytes 11
+
+			# HELP cortex_alertmanager_nflog_maintenance_total How many maintenances were executed for the notification log.
+			# TYPE cortex_alertmanager_nflog_maintenance_total counter
+			cortex_alertmanager_nflog_maintenance_total 111
+			# HELP cortex_alertmanager_nflog_maintenance_errors_total How many maintenances were executed for the notification log that failed.
+			# TYPE cortex_alertmanager_nflog_maintenance_errors_total counter
+			cortex_alertmanager_nflog_maintenance_errors_total 111
 
     		# HELP cortex_alertmanager_notification_latency_seconds The latency of notifications in seconds.
     		# TYPE cortex_alertmanager_notification_latency_seconds histogram
@@ -713,22 +801,22 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
 
     		# HELP cortex_alertmanager_notifications_failed_total The total number of failed notifications.
     		# TYPE cortex_alertmanager_notifications_failed_total counter
-    		cortex_alertmanager_notifications_failed_total{integration="email",user="user1"} 0
-    		cortex_alertmanager_notifications_failed_total{integration="email",user="user2"} 0
-    		cortex_alertmanager_notifications_failed_total{integration="opsgenie",user="user1"} 5
-    		cortex_alertmanager_notifications_failed_total{integration="opsgenie",user="user2"} 50
-    		cortex_alertmanager_notifications_failed_total{integration="pagerduty",user="user1"} 1
-    		cortex_alertmanager_notifications_failed_total{integration="pagerduty",user="user2"} 10
-    		cortex_alertmanager_notifications_failed_total{integration="pushover",user="user1"} 3
-    		cortex_alertmanager_notifications_failed_total{integration="pushover",user="user2"} 30
-    		cortex_alertmanager_notifications_failed_total{integration="slack",user="user1"} 4
-    		cortex_alertmanager_notifications_failed_total{integration="slack",user="user2"} 40
-    		cortex_alertmanager_notifications_failed_total{integration="victorops",user="user1"} 7
-    		cortex_alertmanager_notifications_failed_total{integration="victorops",user="user2"} 70
-    		cortex_alertmanager_notifications_failed_total{integration="webhook",user="user1"} 6
-    		cortex_alertmanager_notifications_failed_total{integration="webhook",user="user2"} 60
-    		cortex_alertmanager_notifications_failed_total{integration="wechat",user="user1"} 2
-    		cortex_alertmanager_notifications_failed_total{integration="wechat",user="user2"} 20
+    		cortex_alertmanager_notifications_failed_total{integration="email",reason="clientError",user="user1"} 0
+    		cortex_alertmanager_notifications_failed_total{integration="email",reason="clientError",user="user2"} 0
+    		cortex_alertmanager_notifications_failed_total{integration="opsgenie",reason="clientError",user="user1"} 5
+    		cortex_alertmanager_notifications_failed_total{integration="opsgenie",reason="clientError",user="user2"} 50
+    		cortex_alertmanager_notifications_failed_total{integration="pagerduty",reason="clientError",user="user1"} 1
+    		cortex_alertmanager_notifications_failed_total{integration="pagerduty",reason="clientError",user="user2"} 10
+    		cortex_alertmanager_notifications_failed_total{integration="pushover",reason="clientError",user="user1"} 3
+    		cortex_alertmanager_notifications_failed_total{integration="pushover",reason="clientError",user="user2"} 30
+    		cortex_alertmanager_notifications_failed_total{integration="slack",reason="clientError",user="user1"} 4
+    		cortex_alertmanager_notifications_failed_total{integration="slack",reason="clientError",user="user2"} 40
+    		cortex_alertmanager_notifications_failed_total{integration="victorops",reason="clientError",user="user1"} 7
+    		cortex_alertmanager_notifications_failed_total{integration="victorops",reason="clientError",user="user2"} 70
+    		cortex_alertmanager_notifications_failed_total{integration="webhook",reason="clientError",user="user1"} 6
+    		cortex_alertmanager_notifications_failed_total{integration="webhook",reason="clientError",user="user2"} 60
+    		cortex_alertmanager_notifications_failed_total{integration="wechat",reason="clientError",user="user1"} 2
+    		cortex_alertmanager_notifications_failed_total{integration="wechat",reason="clientError",user="user2"} 20
 
     		# HELP cortex_alertmanager_notifications_total The total number of attempted notifications.
     		# TYPE cortex_alertmanager_notifications_total counter
@@ -748,6 +836,15 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
     		cortex_alertmanager_notifications_total{integration="webhook",user="user2"} 60
     		cortex_alertmanager_notifications_total{integration="wechat",user="user1"} 2
     		cortex_alertmanager_notifications_total{integration="wechat",user="user2"} 20
+
+    		# HELP cortex_alertmanager_partial_state_merges_failed_total Number of times we have failed to merge a partial state received for a key.
+    		# TYPE cortex_alertmanager_partial_state_merges_failed_total counter
+    		cortex_alertmanager_partial_state_merges_failed_total{type="nfl",user="user1"} 2
+    		cortex_alertmanager_partial_state_merges_failed_total{type="nfl",user="user2"} 20
+    		# HELP cortex_alertmanager_partial_state_merges_total Number of times we have received a partial state to merge for a key.
+    		# TYPE cortex_alertmanager_partial_state_merges_total counter
+    		cortex_alertmanager_partial_state_merges_total{type="nfl",user="user1"} 3
+    		cortex_alertmanager_partial_state_merges_total{type="nfl",user="user2"} 30
 
     		# HELP cortex_alertmanager_silences How many silences by state.
     		# TYPE cortex_alertmanager_silences gauge
@@ -801,6 +898,13 @@ func TestAlertmanagerMetricsRemoval(t *testing.T) {
 			# TYPE cortex_alertmanager_silences_snapshot_size_bytes gauge
 			cortex_alertmanager_silences_snapshot_size_bytes 11
 
+			# HELP cortex_alertmanager_silences_maintenance_total How many maintenances were executed for silences.
+			# TYPE cortex_alertmanager_silences_maintenance_total counter
+			cortex_alertmanager_silences_maintenance_total 111
+			# HELP cortex_alertmanager_silences_maintenance_errors_total How many maintenances were executed for silences that failed.
+			# TYPE cortex_alertmanager_silences_maintenance_errors_total counter
+			cortex_alertmanager_silences_maintenance_errors_total 111
+
 			# HELP cortex_alertmanager_state_fetch_replica_state_failed_total Number of times we have failed to read and merge the full state from another replica.
 			# TYPE cortex_alertmanager_state_fetch_replica_state_failed_total counter
 			cortex_alertmanager_state_fetch_replica_state_failed_total 0
@@ -851,6 +955,8 @@ func populateAlertmanager(base float64) *prometheus.Registry {
 	s.silencesActive.Set(base)
 	s.silencesExpired.Set(base * 2)
 	s.silencesPending.Set(base * 3)
+	s.silencesMaintenanceTotal.Add(base)
+	s.silencesMaintenanceErrorsTotal.Add(base)
 
 	n := newNflogMetrics(reg)
 	n.gcDuration.Observe(base)
@@ -860,19 +966,21 @@ func populateAlertmanager(base float64) *prometheus.Registry {
 	n.queryErrorsTotal.Add(base)
 	n.queryDuration.Observe(base)
 	n.propagatedMessagesTotal.Add(base)
+	n.maintenanceTotal.Add(base)
+	n.maintenanceErrorsTotal.Add(base)
 
 	nm := newNotifyMetrics(reg)
 	for i, integration := range integrations {
 		nm.numNotifications.WithLabelValues(integration).Add(base * float64(i))
-		nm.numFailedNotifications.WithLabelValues(integration).Add(base * float64(i))
+		nm.numFailedNotifications.WithLabelValues(integration, reason).Add(base * float64(i))
 		nm.numNotificationRequestsTotal.WithLabelValues(integration).Add(base * float64(i))
 		nm.numNotificationRequestsFailedTotal.WithLabelValues(integration).Add(base * float64(i))
 		nm.notificationLatencySeconds.WithLabelValues(integration).Observe(base * float64(i) * 0.025)
 	}
 
 	m := newMarkerMetrics(reg)
-	m.alerts.WithLabelValues(string(types.AlertStateActive)).Add(base)
-	m.alerts.WithLabelValues(string(types.AlertStateSuppressed)).Add(base * 2)
+	m.alerts.WithLabelValues(string(alert.AlertStateActive)).Add(base)
+	m.alerts.WithLabelValues(string(alert.AlertStateSuppressed)).Add(base * 2)
 
 	v1APIMetrics := newAPIMetrics("v1", reg)
 	v1APIMetrics.firing.Add(base * 2)
@@ -889,6 +997,10 @@ func populateAlertmanager(base float64) *prometheus.Registry {
 	lm.size.Set(100 * base)
 	lm.insertFailures.Add(7 * base)
 
+	sr := newStateReplicationMetrics(reg)
+	sr.partialStateMergesFailed.WithLabelValues("nfl").Add(base * 2)
+	sr.partialStateMergesTotal.WithLabelValues("nfl").Add(base * 3)
+
 	return reg
 }
 
@@ -901,6 +1013,8 @@ type nflogMetrics struct {
 	queryErrorsTotal        prometheus.Counter
 	queryDuration           prometheus.Histogram
 	propagatedMessagesTotal prometheus.Counter
+	maintenanceTotal        prometheus.Counter
+	maintenanceErrorsTotal  prometheus.Counter
 }
 
 func newNflogMetrics(r prometheus.Registerer) *nflogMetrics {
@@ -936,22 +1050,32 @@ func newNflogMetrics(r prometheus.Registerer) *nflogMetrics {
 		Name: "alertmanager_nflog_gossip_messages_propagated_total",
 		Help: "Number of received gossip messages that have been further gossiped.",
 	})
+	m.maintenanceTotal = promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_nflog_maintenance_total",
+		Help: "How many maintenances were executed for the notification log.",
+	})
+	m.maintenanceErrorsTotal = promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_nflog_maintenance_errors_total",
+		Help: "How many maintenances were executed for the notification log that failed.",
+	})
 
 	return m
 }
 
 // Copied from github.com/alertmanager/silence/silence.go
 type silenceMetrics struct {
-	gcDuration              prometheus.Summary
-	snapshotDuration        prometheus.Summary
-	snapshotSize            prometheus.Gauge
-	queriesTotal            prometheus.Counter
-	queryErrorsTotal        prometheus.Counter
-	queryDuration           prometheus.Histogram
-	silencesActive          prometheus.Gauge
-	silencesPending         prometheus.Gauge
-	silencesExpired         prometheus.Gauge
-	propagatedMessagesTotal prometheus.Counter
+	gcDuration                     prometheus.Summary
+	snapshotDuration               prometheus.Summary
+	snapshotSize                   prometheus.Gauge
+	queriesTotal                   prometheus.Counter
+	queryErrorsTotal               prometheus.Counter
+	queryDuration                  prometheus.Histogram
+	silencesActive                 prometheus.Gauge
+	silencesPending                prometheus.Gauge
+	silencesExpired                prometheus.Gauge
+	propagatedMessagesTotal        prometheus.Counter
+	silencesMaintenanceTotal       prometheus.Counter
+	silencesMaintenanceErrorsTotal prometheus.Counter
 }
 
 func newSilenceMetrics(r prometheus.Registerer) *silenceMetrics {
@@ -990,17 +1114,25 @@ func newSilenceMetrics(r prometheus.Registerer) *silenceMetrics {
 	m.silencesActive = promauto.With(r).NewGauge(prometheus.GaugeOpts{
 		Name:        "alertmanager_silences",
 		Help:        "How many silences by state.",
-		ConstLabels: prometheus.Labels{"state": string(types.SilenceStateActive)},
+		ConstLabels: prometheus.Labels{"state": string(silence.SilenceStateActive)},
 	})
 	m.silencesPending = promauto.With(r).NewGauge(prometheus.GaugeOpts{
 		Name:        "alertmanager_silences",
 		Help:        "How many silences by state.",
-		ConstLabels: prometheus.Labels{"state": string(types.SilenceStatePending)},
+		ConstLabels: prometheus.Labels{"state": string(silence.SilenceStatePending)},
 	})
 	m.silencesExpired = promauto.With(r).NewGauge(prometheus.GaugeOpts{
 		Name:        "alertmanager_silences",
 		Help:        "How many silences by state.",
-		ConstLabels: prometheus.Labels{"state": string(types.SilenceStateExpired)},
+		ConstLabels: prometheus.Labels{"state": string(silence.SilenceStateExpired)},
+	})
+	m.silencesMaintenanceTotal = promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_silences_maintenance_total",
+		Help: "How many maintenances were executed for silences.",
+	})
+	m.silencesMaintenanceErrorsTotal = promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_silences_maintenance_errors_total",
+		Help: "How many maintenances were executed for silences that failed.",
 	})
 
 	return m
@@ -1026,7 +1158,7 @@ func newNotifyMetrics(r prometheus.Registerer) *notifyMetrics {
 			Namespace: "alertmanager",
 			Name:      "notifications_failed_total",
 			Help:      "The total number of failed notifications.",
-		}, []string{"integration"}),
+		}, []string{"integration", "reason"}),
 		numNotificationRequestsTotal: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
 			Namespace: "alertmanager",
 			Name:      "notification_requests_total",
@@ -1046,7 +1178,7 @@ func newNotifyMetrics(r prometheus.Registerer) *notifyMetrics {
 	}
 	for _, integration := range integrations {
 		m.numNotifications.WithLabelValues(integration)
-		m.numFailedNotifications.WithLabelValues(integration)
+		m.numFailedNotifications.WithLabelValues(integration, reason)
 		m.numNotificationRequestsTotal.WithLabelValues(integration)
 		m.numNotificationRequestsFailedTotal.WithLabelValues(integration)
 		m.notificationLatencySeconds.WithLabelValues(integration)
@@ -1119,5 +1251,26 @@ func newLimiterMetrics(r prometheus.Registerer) *limiterMetrics {
 		count:          count,
 		size:           size,
 		insertFailures: insertAlertFailures,
+	}
+}
+
+type stateReplicationMetrics struct {
+	partialStateMergesTotal  *prometheus.CounterVec
+	partialStateMergesFailed *prometheus.CounterVec
+}
+
+func newStateReplicationMetrics(r prometheus.Registerer) *stateReplicationMetrics {
+	partialStateMergesTotal := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+		Name: "alertmanager_partial_state_merges_total",
+		Help: "Number of times we have received a partial state to merge for a key.",
+	}, []string{"type"})
+	partialStateMergesFailed := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+		Name: "alertmanager_partial_state_merges_failed_total",
+		Help: "Number of times we have failed to merge a partial state received for a key.",
+	}, []string{"type"})
+
+	return &stateReplicationMetrics{
+		partialStateMergesTotal:  partialStateMergesTotal,
+		partialStateMergesFailed: partialStateMergesFailed,
 	}
 }

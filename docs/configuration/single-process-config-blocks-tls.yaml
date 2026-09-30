@@ -1,4 +1,4 @@
-
+# yaml-language-server: $schema=https://raw.githubusercontent.com/cortexproject/cortex/master/schemas/cortex-config-schema.json
 # Configuration for running Cortex in single-process mode.
 # This should not be used in production.  It is only for getting started
 # and development.
@@ -43,7 +43,6 @@ ingester:
     # address: 127.0.0.1
 
     # We want to start immediately and flush on shutdown.
-    join_after: 0
     min_ready_duration: 0s
     final_sleep: 0s
     num_tokens: 512
@@ -53,9 +52,6 @@ ingester:
       kvstore:
         store: inmemory
       replication_factor: 1
-
-storage:
-  engine: blocks
 
 blocks_storage:
   tsdb:
@@ -101,9 +97,17 @@ frontend_worker:
 
 ruler:
   enable_api: true
-  enable_sharding: false
 
 ruler_storage:
   backend: local
   local:
     directory: /tmp/cortex/rules
+
+alertmanager:
+  external_url: http://localhost/alertmanager
+
+alertmanager_storage:
+  backend: local
+  local:
+    # Make sure file exist
+    path: /tmp/cortex/alerts

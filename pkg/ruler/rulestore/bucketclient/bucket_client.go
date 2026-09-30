@@ -5,19 +5,24 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"strings"
+	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/thanos/pkg/extprom"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
+	"github.com/cortexproject/cortex/pkg/util/multierror"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 const (
@@ -40,14 +45,40 @@ type BucketRuleStore struct {
 	bucket      objstore.Bucket
 	cfgProvider bucket.TenantConfigProvider
 	logger      log.Logger
+
+	usersScanner     users.Scanner
+	userIndexUpdater *users.UserIndexUpdater
 }
 
-func NewBucketRuleStore(bkt objstore.Bucket, cfgProvider bucket.TenantConfigProvider, logger log.Logger) *BucketRuleStore {
-	return &BucketRuleStore{
-		bucket:      bucket.NewPrefixedBucketClient(bkt, rulesPrefix),
-		cfgProvider: cfgProvider,
-		logger:      logger,
+func NewBucketRuleStore(bkt objstore.Bucket, userScannerCfg users.UsersScannerConfig, cfgProvider bucket.TenantConfigProvider, logger log.Logger, reg prometheus.Registerer) (*BucketRuleStore, error) {
+	rulesBucket := bucket.NewPrefixedBucketClient(bkt, rulesPrefix)
+
+	regWithComponent := extprom.WrapRegistererWith(prometheus.Labels{"component": "ruler"}, reg)
+	usersScanner, err := users.NewScanner(userScannerCfg, rulesBucket, logger, regWithComponent)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to initialize ruler users scanner")
 	}
+
+	var userIndexUpdater *users.UserIndexUpdater
+	if userScannerCfg.Strategy == users.UserScanStrategyUserIndex {
+		// We hardcode strategy to be list so can ignore error.
+		baseScanner, _ := users.NewScanner(users.UsersScannerConfig{
+			Strategy: users.UserScanStrategyList,
+		}, rulesBucket, logger, regWithComponent)
+		userIndexUpdater = users.NewUserIndexUpdater(rulesBucket, userScannerCfg.UpdateInterval, baseScanner, regWithComponent)
+	}
+
+	return &BucketRuleStore{
+		bucket:           rulesBucket,
+		cfgProvider:      cfgProvider,
+		logger:           logger,
+		usersScanner:     usersScanner,
+		userIndexUpdater: userIndexUpdater,
+	}, nil
+}
+
+func (b *BucketRuleStore) GetUserIndexUpdater() *users.UserIndexUpdater {
+	return b.userIndexUpdater
 }
 
 // getRuleGroup loads and return a rules group. If existing rule group is supplied, it is Reset and reused. If nil, new RuleGroupDesc is allocated.
@@ -61,12 +92,17 @@ func (b *BucketRuleStore) getRuleGroup(ctx context.Context, userID, namespace, g
 		return nil, rulestore.ErrGroupNotFound
 	}
 
+	if userBucket.IsAccessDeniedErr(err) {
+		level.Debug(b.logger).Log("msg", "permission denied when loading group", "user", userID, "key", objectKey)
+		return nil, rulestore.ErrAccessDenied
+	}
+
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get rule group %s", objectKey)
 	}
 	defer func() { _ = reader.Close() }()
 
-	buf, err := ioutil.ReadAll(reader)
+	buf, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to read rule group %s", objectKey)
 	}
@@ -87,16 +123,14 @@ func (b *BucketRuleStore) getRuleGroup(ctx context.Context, userID, namespace, g
 
 // ListAllUsers implements rules.RuleStore.
 func (b *BucketRuleStore) ListAllUsers(ctx context.Context) ([]string, error) {
-	var users []string
-	err := b.bucket.Iter(ctx, "", func(user string) error {
-		users = append(users, strings.TrimSuffix(user, objstore.DirDelim))
-		return nil
-	})
+	active, deleting, _, err := b.usersScanner.ScanUsers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("unable to list users in rule store bucket: %w", err)
 	}
-
-	return users, nil
+	userIDs := make([]string, 0, len(active)+len(deleting))
+	userIDs = append(userIDs, active...)
+	userIDs = append(userIDs, deleting...)
+	return userIDs, nil
 }
 
 // ListAllRuleGroups implements rules.RuleStore.
@@ -105,6 +139,11 @@ func (b *BucketRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rul
 
 	// List rule groups for all tenants.
 	err := b.bucket.Iter(ctx, "", func(key string) error {
+		if key == users.UserIndexCompressedFilename {
+			// skip user-index.json.gz
+			return nil
+		}
+
 		userID, namespace, group, err := parseRuleGroupObjectKeyWithUser(key)
 		if err != nil {
 			level.Warn(b.logger).Log("msg", "invalid rule group object key found while listing rule groups", "key", key, "err", err)
@@ -119,7 +158,7 @@ func (b *BucketRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rul
 			Name:      group,
 		})
 		return nil
-	}, objstore.WithRecursiveIter)
+	}, objstore.WithRecursiveIter())
 
 	if err != nil {
 		return nil, err
@@ -156,7 +195,7 @@ func (b *BucketRuleStore) ListRuleGroupsForUserAndNamespace(ctx context.Context,
 			Name:      group,
 		})
 		return nil
-	}, objstore.WithRecursiveIter)
+	}, objstore.WithRecursiveIter())
 	if err != nil {
 		return nil, err
 	}
@@ -165,29 +204,44 @@ func (b *BucketRuleStore) ListRuleGroupsForUserAndNamespace(ctx context.Context,
 }
 
 // LoadRuleGroups implements rules.RuleStore.
-func (b *BucketRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) error {
+func (b *BucketRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) (map[string]rulespb.RuleGroupList, error) {
 	ch := make(chan *rulespb.RuleGroupDesc)
+	loadedGroups := make(map[string]rulespb.RuleGroupList, len(groupsToLoad))
+	errs := multierror.MultiError{}
+	m := sync.Mutex{}
 
 	// Given we store one file per rule group. With this, we create a pool of workers that will
 	// download all rule groups in parallel. We limit the number of workers to avoid a
 	// particular user having too many rule groups rate limiting us with the object storage.
 	g, gCtx := errgroup.WithContext(ctx)
-	for i := 0; i < loadConcurrency; i++ {
+	for range loadConcurrency {
 		g.Go(func() error {
 			for gr := range ch {
 				user, namespace, group := gr.GetUser(), gr.GetNamespace(), gr.GetName()
 				if user == "" || namespace == "" || group == "" {
-					return fmt.Errorf("invalid rule group: user=%q, namespace=%q, group=%q", user, namespace, group)
+					m.Lock()
+					errs.Add(fmt.Errorf("invalid rule group: user=%q, namespace=%q, group=%q", user, namespace, group))
+					m.Unlock()
+					continue
 				}
 
 				gr, err := b.getRuleGroup(gCtx, user, namespace, group, gr) // reuse group pointer from the map.
 				if err != nil {
-					return errors.Wrapf(err, "get rule group user=%q, namespace=%q, name=%q", user, namespace, group)
+					m.Lock()
+					errs.Add(errors.Wrapf(err, "get rule group user=%q, namespace=%q, name=%q", user, namespace, group))
+					m.Unlock()
+					continue
 				}
 
 				if user != gr.User || namespace != gr.Namespace || group != gr.Name {
-					return fmt.Errorf("mismatch between requested rule group and loaded rule group, requested: user=%q, namespace=%q, group=%q, loaded: user=%q, namespace=%q, group=%q", user, namespace, group, gr.User, gr.Namespace, gr.Name)
+					m.Lock()
+					errs.Add(fmt.Errorf("mismatch between requested rule group and loaded rule group, requested: user=%q, namespace=%q, group=%q, loaded: user=%q, namespace=%q, group=%q", user, namespace, group, gr.User, gr.Namespace, gr.Name))
+					m.Unlock()
+					continue
 				}
+				m.Lock()
+				loadedGroups[user] = append(loadedGroups[user], gr)
+				m.Unlock()
 			}
 
 			return nil
@@ -210,7 +264,11 @@ outer:
 	}
 	close(ch)
 
-	return g.Wait()
+	if e := g.Wait(); e != nil {
+		return loadedGroups, e
+	}
+
+	return loadedGroups, errs.Err()
 }
 
 // GetRuleGroup implements rules.RuleStore.
@@ -226,7 +284,7 @@ func (b *BucketRuleStore) SetRuleGroup(ctx context.Context, userID string, names
 		return err
 	}
 
-	return userBucket.Upload(ctx, getRuleGroupObjectKey(namespace, group.Name), bytes.NewBuffer(data))
+	return userBucket.Upload(ctx, getRuleGroupObjectKey(namespace, group.Name), bytes.NewReader(data))
 }
 
 // DeleteRuleGroup implements rules.RuleStore.

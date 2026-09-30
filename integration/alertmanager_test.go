@@ -1,5 +1,4 @@
-//go:build requires_docker
-// +build requires_docker
+//go:build integration_alertmanager
 
 package integration
 
@@ -7,28 +6,40 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
 
-	amlabels "github.com/prometheus/alertmanager/pkg/labels"
-	"github.com/prometheus/alertmanager/types"
+	"github.com/go-openapi/strfmt"
+	open_api_models "github.com/prometheus/alertmanager/api/v2/models"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/thanos-io/objstore/providers/s3"
 
 	"github.com/cortexproject/cortex/integration/e2e"
 	e2edb "github.com/cortexproject/cortex/integration/e2e/db"
 	"github.com/cortexproject/cortex/integration/e2ecortex"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
-	s3 "github.com/cortexproject/cortex/pkg/chunk/aws"
 )
 
 const simpleAlertmanagerConfig = `route:
   receiver: dummy
   group_by: [group]
+receivers:
+  - name: dummy`
+
+// routeLabelsAlertmanagerConfig adds two child routes that only differ in their route labels,
+// so alerts with the same group labels and receiver can land in distinct alert groups.
+const routeLabelsAlertmanagerConfig = `route:
+  receiver: dummy
+  group_by: [group]
+  routes:
+    - matchers: [team="a"]
+      labels: {owner: team-a}
+    - matchers: [team="b"]
+      labels: {owner: team-b}
 receivers:
   - name: dummy`
 
@@ -67,170 +78,163 @@ func TestAlertmanager(t *testing.T) {
 
 	// Ensure no service-specific metrics prefix is used by the wrong service.
 	assertServiceMetricsPrefixes(t, AlertManager, alertmanager)
+}
 
-	// Test compression by inspecting the response Headers
-	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/api/v1/alerts", alertmanager.HTTPEndpoint()), nil)
+func TestAlertmanagerWithUserIndexUpdater(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
 	require.NoError(t, err)
+	defer s.Close()
 
-	req.Header.Set("X-Scope-OrgID", "user-1")
-	req.Header.Set("Accept-Encoding", "gzip")
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs/user-1.yaml", []byte(cortexAlertmanagerUserConfigYaml)))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Start dependencies.
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, alertsBucketName)
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
 
-	// Execute HTTP request
-	res, err := http.DefaultClient.Do(req.WithContext(ctx))
-	require.NoError(t, err)
+	baseFlags := mergeFlags(AlertmanagerFlags(), AlertmanagerS3Flags())
+	flags := mergeFlags(baseFlags, AlertmanagerShardingFlags(consul.NetworkHTTPEndpoint(), 1), map[string]string{
+		"-alertmanager-storage.users-scanner.strategy":                   "user_index",
+		"-alertmanager-storage.users-scanner.user-index.update-interval": "15s",
+		"-alertmanager.configs.poll-interval":                            "5s",
+	})
 
-	defer res.Body.Close()
-	// We assert on the Vary header as the minimum response size for enabling compression is 1500 bytes.
-	// This is enough to know whenever the handler for compression is enabled or not.
-	require.Equal(t, "Accept-Encoding", res.Header.Get("Vary"))
+	am := e2ecortex.NewAlertmanager(
+		"alertmanager",
+		flags,
+		"",
+	)
+
+	require.NoError(t, s.StartAndWaitReady(am))
+	// To make sure user index file is updated/scanned
+	require.NoError(t, am.WaitSumMetricsWithOptions(e2e.Greater(float64(0)), []string{"cortex_user_index_last_successful_update_timestamp_seconds"},
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "component", "alertmanager")),
+	))
+	require.NoError(t, am.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(float64(1)), []string{"cortex_user_index_scan_succeeded_total"},
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "component", "alertmanager")),
+	))
 }
 
 func TestAlertmanagerStoreAPI(t *testing.T) {
-	tests := map[string]struct {
-		legacyAlertStore bool
-	}{
-		"legacy alertstore": {legacyAlertStore: true},
-		"bucket alertstore": {legacyAlertStore: false},
-	}
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
 
-	for testName, testCfg := range tests {
-		t.Run(testName, func(t *testing.T) {
-			s, err := e2e.NewScenario(networkName)
-			require.NoError(t, err)
-			defer s.Close()
+	flags := mergeFlags(AlertmanagerFlags(), AlertmanagerS3Flags())
 
-			flags := mergeFlags(AlertmanagerFlags(), AlertmanagerS3Flags(testCfg.legacyAlertStore))
+	minio := e2edb.NewMinio(9000, alertsBucketName)
+	require.NoError(t, s.StartAndWaitReady(minio))
 
-			minio := e2edb.NewMinio(9000, alertsBucketName)
-			require.NoError(t, s.StartAndWaitReady(minio))
+	am := e2ecortex.NewAlertmanager(
+		"alertmanager",
+		flags,
+		"",
+	)
 
-			am := e2ecortex.NewAlertmanager(
-				"alertmanager",
-				flags,
-				"",
-			)
+	require.NoError(t, s.StartAndWaitReady(am))
+	require.NoError(t, am.WaitSumMetrics(e2e.Equals(1), "alertmanager_cluster_members"))
 
-			require.NoError(t, s.StartAndWaitReady(am))
-			require.NoError(t, am.WaitSumMetrics(e2e.Equals(1), "alertmanager_cluster_members"))
+	c, err := e2ecortex.NewClient("", "", am.HTTPEndpoint(), "", "user-1")
+	require.NoError(t, err)
 
-			c, err := e2ecortex.NewClient("", "", am.HTTPEndpoint(), "", "user-1")
-			require.NoError(t, err)
+	_, err = c.GetAlertmanagerConfig(context.Background())
+	require.Error(t, err)
+	require.EqualError(t, err, e2ecortex.ErrNotFound.Error())
 
-			_, err = c.GetAlertmanagerConfig(context.Background())
-			require.Error(t, err)
-			require.EqualError(t, err, e2ecortex.ErrNotFound.Error())
+	err = c.SetAlertmanagerConfig(context.Background(), cortexAlertmanagerUserConfigYaml, map[string]string{})
+	require.NoError(t, err)
 
-			err = c.SetAlertmanagerConfig(context.Background(), cortexAlertmanagerUserConfigYaml, map[string]string{})
-			require.NoError(t, err)
+	require.NoError(t, am.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_alertmanager_config_last_reload_successful"},
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "user", "user-1")),
+		e2e.WaitMissingMetrics))
+	require.NoError(t, am.WaitSumMetricsWithOptions(e2e.Greater(0), []string{"cortex_alertmanager_config_last_reload_successful_seconds"},
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "user", "user-1")),
+		e2e.WaitMissingMetrics))
 
-			require.NoError(t, am.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_alertmanager_config_last_reload_successful"},
-				e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "user", "user-1")),
-				e2e.WaitMissingMetrics))
-			require.NoError(t, am.WaitSumMetricsWithOptions(e2e.Greater(0), []string{"cortex_alertmanager_config_last_reload_successful_seconds"},
-				e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "user", "user-1")),
-				e2e.WaitMissingMetrics))
+	cfg, err := c.GetAlertmanagerConfig(context.Background())
+	require.NoError(t, err)
 
-			cfg, err := c.GetAlertmanagerConfig(context.Background())
-			require.NoError(t, err)
+	// Ensure the returned status config matches the loaded config
+	require.NotNil(t, cfg)
+	require.Equal(t, "example_receiver", cfg.Route.Receiver)
+	require.Len(t, cfg.Route.GroupByStr, 1)
+	require.Equal(t, "example_groupby", cfg.Route.GroupByStr[0])
+	require.Len(t, cfg.Receivers, 1)
+	require.Equal(t, "example_receiver", cfg.Receivers[0].Name)
 
-			// Ensure the returned status config matches the loaded config
-			require.NotNil(t, cfg)
-			require.Equal(t, "example_receiver", cfg.Route.Receiver)
-			require.Len(t, cfg.Route.GroupByStr, 1)
-			require.Equal(t, "example_groupby", cfg.Route.GroupByStr[0])
-			require.Len(t, cfg.Receivers, 1)
-			require.Equal(t, "example_receiver", cfg.Receivers[0].Name)
+	err = c.SendAlertToAlermanager(context.Background(), &model.Alert{Labels: model.LabelSet{"foo": "bar"}})
+	require.NoError(t, err)
 
-			err = c.SendAlertToAlermanager(context.Background(), &model.Alert{Labels: model.LabelSet{"foo": "bar"}})
-			require.NoError(t, err)
+	require.NoError(t, am.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_alertmanager_alerts_received_total"},
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "user", "user-1")),
+		e2e.WaitMissingMetrics))
 
-			require.NoError(t, am.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_alertmanager_alerts_received_total"},
-				e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "user", "user-1")),
-				e2e.WaitMissingMetrics))
+	err = c.DeleteAlertmanagerConfig(context.Background())
+	require.NoError(t, err)
 
-			err = c.DeleteAlertmanagerConfig(context.Background())
-			require.NoError(t, err)
+	// The deleted config is applied asynchronously, so we should wait until the metric
+	// disappear for the specific user.
+	require.NoError(t, am.WaitRemovedMetric("cortex_alertmanager_config_last_reload_successful", e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "user", "user-1"))))
+	require.NoError(t, am.WaitRemovedMetric("cortex_alertmanager_config_last_reload_successful_seconds", e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "user", "user-1"))))
 
-			// The deleted config is applied asynchronously, so we should wait until the metric
-			// disappear for the specific user.
-			require.NoError(t, am.WaitRemovedMetric("cortex_alertmanager_config_last_reload_successful", e2e.WithLabelMatchers(
-				labels.MustNewMatcher(labels.MatchEqual, "user", "user-1"))))
-			require.NoError(t, am.WaitRemovedMetric("cortex_alertmanager_config_last_reload_successful_seconds", e2e.WithLabelMatchers(
-				labels.MustNewMatcher(labels.MatchEqual, "user", "user-1"))))
-
-			cfg, err = c.GetAlertmanagerConfig(context.Background())
-			require.Error(t, err)
-			require.Nil(t, cfg)
-			require.EqualError(t, err, "not found")
-		})
-	}
+	cfg, err = c.GetAlertmanagerConfig(context.Background())
+	require.Error(t, err)
+	require.Nil(t, cfg)
+	require.EqualError(t, err, "not found")
 }
 
 func TestAlertmanagerClustering(t *testing.T) {
-	tests := map[string]struct {
-		legacyAlertStore bool
-	}{
-		"legacy alertstore": {legacyAlertStore: true},
-		"bucket alertstore": {legacyAlertStore: false},
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	flags := mergeFlags(AlertmanagerFlags(), AlertmanagerS3Flags())
+
+	// Start dependencies.
+	minio := e2edb.NewMinio(9000, alertsBucketName)
+	require.NoError(t, s.StartAndWaitReady(minio))
+
+	client, err := s3.NewBucketWithConfig(nil, s3.Config{
+		Endpoint:  minio.HTTPEndpoint(),
+		Insecure:  true,
+		Bucket:    alertsBucketName,
+		AccessKey: e2edb.MinioAccessKey,
+		SecretKey: e2edb.MinioSecretKey,
+	}, "alertmanager-test", nil)
+	require.NoError(t, err)
+
+	// Create and upload an Alertmanager configuration.
+	user := "user-1"
+	desc := alertspb.AlertConfigDesc{RawConfig: simpleAlertmanagerConfig, User: user, Templates: []*alertspb.TemplateDesc{}}
+
+	d, err := desc.Marshal()
+	require.NoError(t, err)
+	err = client.Upload(context.Background(), fmt.Sprintf("/alerts/%s", user), bytes.NewReader(d))
+	require.NoError(t, err)
+
+	peers := strings.Join([]string{
+		e2e.NetworkContainerHostPort(networkName, "alertmanager-1", e2ecortex.GossipPort),
+		e2e.NetworkContainerHostPort(networkName, "alertmanager-2", e2ecortex.GossipPort),
+	}, ",")
+	flags = mergeFlags(flags, AlertmanagerClusterFlags(peers))
+
+	// Wait for the Alertmanagers to start.
+	alertmanager1 := e2ecortex.NewAlertmanager("alertmanager-1", flags, "")
+	alertmanager2 := e2ecortex.NewAlertmanager("alertmanager-2", flags, "")
+
+	alertmanagers := e2ecortex.NewCompositeCortexService(alertmanager1, alertmanager2)
+
+	// Start Alertmanager instances.
+	for _, am := range alertmanagers.Instances() {
+		require.NoError(t, s.StartAndWaitReady(am))
 	}
 
-	for testName, testCfg := range tests {
-		t.Run(testName, func(t *testing.T) {
-			s, err := e2e.NewScenario(networkName)
-			require.NoError(t, err)
-			defer s.Close()
-
-			flags := mergeFlags(AlertmanagerFlags(), AlertmanagerS3Flags(testCfg.legacyAlertStore))
-
-			// Start dependencies.
-			minio := e2edb.NewMinio(9000, alertsBucketName)
-			require.NoError(t, s.StartAndWaitReady(minio))
-
-			client, err := s3.NewS3ObjectClient(s3.S3Config{
-				Endpoint:         minio.HTTPEndpoint(),
-				S3ForcePathStyle: true,
-				Insecure:         true,
-				BucketNames:      alertsBucketName,
-				AccessKeyID:      e2edb.MinioAccessKey,
-				SecretAccessKey:  e2edb.MinioSecretKey,
-			})
-			require.NoError(t, err)
-
-			// Create and upload an Alertmanager configuration.
-			user := "user-1"
-			desc := alertspb.AlertConfigDesc{RawConfig: simpleAlertmanagerConfig, User: user, Templates: []*alertspb.TemplateDesc{}}
-
-			d, err := desc.Marshal()
-			require.NoError(t, err)
-			err = client.PutObject(context.Background(), fmt.Sprintf("/alerts/%s", user), bytes.NewReader(d))
-			require.NoError(t, err)
-
-			peers := strings.Join([]string{
-				e2e.NetworkContainerHostPort(networkName, "alertmanager-1", e2ecortex.GossipPort),
-				e2e.NetworkContainerHostPort(networkName, "alertmanager-2", e2ecortex.GossipPort),
-			}, ",")
-			flags = mergeFlags(flags, AlertmanagerClusterFlags(peers))
-
-			// Wait for the Alertmanagers to start.
-			alertmanager1 := e2ecortex.NewAlertmanager("alertmanager-1", flags, "")
-			alertmanager2 := e2ecortex.NewAlertmanager("alertmanager-2", flags, "")
-
-			alertmanagers := e2ecortex.NewCompositeCortexService(alertmanager1, alertmanager2)
-
-			// Start Alertmanager instances.
-			for _, am := range alertmanagers.Instances() {
-				require.NoError(t, s.StartAndWaitReady(am))
-			}
-
-			for _, am := range alertmanagers.Instances() {
-				require.NoError(t, am.WaitSumMetrics(e2e.Equals(float64(0)), "alertmanager_cluster_health_score")) // Lower means healthier, 0 being totally healthy.
-				require.NoError(t, am.WaitSumMetrics(e2e.Equals(float64(0)), "alertmanager_cluster_failed_peers"))
-				require.NoError(t, am.WaitSumMetrics(e2e.Equals(float64(2)), "alertmanager_cluster_members"))
-			}
-		})
+	for _, am := range alertmanagers.Instances() {
+		require.NoError(t, am.WaitSumMetrics(e2e.Equals(float64(0)), "alertmanager_cluster_health_score")) // Lower means healthier, 0 being totally healthy.
+		require.NoError(t, am.WaitSumMetrics(e2e.Equals(float64(0)), "alertmanager_cluster_failed_peers"))
+		require.NoError(t, am.WaitSumMetrics(e2e.Equals(float64(2)), "alertmanager_cluster_members"))
 	}
 }
 
@@ -248,35 +252,34 @@ func TestAlertmanagerSharding(t *testing.T) {
 			require.NoError(t, err)
 			defer s.Close()
 
-			flags := mergeFlags(AlertmanagerFlags(), AlertmanagerS3Flags(false))
+			flags := mergeFlags(AlertmanagerFlags(), AlertmanagerS3Flags())
 
 			// Start dependencies.
 			consul := e2edb.NewConsul()
 			minio := e2edb.NewMinio(9000, alertsBucketName)
 			require.NoError(t, s.StartAndWaitReady(consul, minio))
 
-			client, err := s3.NewS3ObjectClient(s3.S3Config{
-				Endpoint:         minio.HTTPEndpoint(),
-				S3ForcePathStyle: true,
-				Insecure:         true,
-				BucketNames:      alertsBucketName,
-				AccessKeyID:      e2edb.MinioAccessKey,
-				SecretAccessKey:  e2edb.MinioSecretKey,
-			})
+			client, err := s3.NewBucketWithConfig(nil, s3.Config{
+				Endpoint:  minio.HTTPEndpoint(),
+				Insecure:  true,
+				Bucket:    alertsBucketName,
+				AccessKey: e2edb.MinioAccessKey,
+				SecretKey: e2edb.MinioSecretKey,
+			}, "alertmanager-test", nil)
 			require.NoError(t, err)
 
 			// Create and upload Alertmanager configurations.
 			for i := 1; i <= 30; i++ {
 				user := fmt.Sprintf("user-%d", i)
 				desc := alertspb.AlertConfigDesc{
-					RawConfig: simpleAlertmanagerConfig,
+					RawConfig: routeLabelsAlertmanagerConfig,
 					User:      user,
 					Templates: []*alertspb.TemplateDesc{},
 				}
 
 				d, err := desc.Marshal()
 				require.NoError(t, err)
-				err = client.PutObject(context.Background(), fmt.Sprintf("/alerts/%s", user), bytes.NewReader(d))
+				err = client.Upload(context.Background(), fmt.Sprintf("/alerts/%s", user), bytes.NewReader(d))
 				require.NoError(t, err)
 			}
 
@@ -315,14 +318,23 @@ func TestAlertmanagerSharding(t *testing.T) {
 			comment := func(i int) string {
 				return fmt.Sprintf("Silence Comment #%d", i)
 			}
-			silence := func(i int) types.Silence {
-				return types.Silence{
-					Matchers: amlabels.Matchers{
-						{Name: "instance", Value: "prometheus-one"},
+			silence := func(i int) open_api_models.Silence {
+				commentStr := comment(i)
+				createdBy := "integration-test"
+				isRegex := false
+				isEqual := true
+				name := "instance"
+				value := "prometheus-one"
+				startsAt := strfmt.DateTime(time.Now())
+				endsAt := strfmt.DateTime(time.Now().Add(time.Hour))
+				return open_api_models.Silence{
+					Matchers: open_api_models.Matchers{
+						{Name: &name, Value: &value, IsRegex: &isRegex, IsEqual: &isEqual},
 					},
-					Comment:  comment(i),
-					StartsAt: time.Now(),
-					EndsAt:   time.Now().Add(time.Hour),
+					Comment:   &commentStr,
+					CreatedBy: &createdBy,
+					StartsAt:  &startsAt,
+					EndsAt:    &endsAt,
 				}
 			}
 
@@ -365,60 +377,30 @@ func TestAlertmanagerSharding(t *testing.T) {
 				require.NoError(t, waitForSilences("active", 3*testCfg.replicationFactor))
 			}
 
-			assertSilences := func(list []types.Silence, s1, s2, s3 types.SilenceState) {
+			assertSilences := func(list []open_api_models.GettableSilence, s1, s2, s3 string) {
 				assert.Equal(t, 3, len(list))
 
-				ids := make(map[string]types.Silence, len(list))
+				ids := make(map[string]open_api_models.GettableSilence, len(list))
 				for _, s := range list {
-					ids[s.ID] = s
+					ids[*s.ID] = s
 				}
 
 				require.Contains(t, ids, id1)
-				assert.Equal(t, comment(1), ids[id1].Comment)
-				assert.Equal(t, s1, ids[id1].Status.State)
+				assert.Equal(t, comment(1), *ids[id1].Comment)
+				assert.Equal(t, s1, *ids[id1].Status.State)
 				require.Contains(t, ids, id2)
-				assert.Equal(t, comment(2), ids[id2].Comment)
-				assert.Equal(t, s2, ids[id2].Status.State)
+				assert.Equal(t, comment(2), *ids[id2].Comment)
+				assert.Equal(t, s2, *ids[id2].Status.State)
 				require.Contains(t, ids, id3)
-				assert.Equal(t, comment(3), ids[id3].Comment)
-				assert.Equal(t, s3, ids[id3].Status.State)
+				assert.Equal(t, comment(3), *ids[id3].Comment)
+				assert.Equal(t, s3, *ids[id3].Status.State)
 			}
-
-			// Endpoint: GET /v1/silences
-			{
-				for _, c := range clients {
-					list, err := c.GetSilencesV1(context.Background())
-					require.NoError(t, err)
-					assertSilences(list, types.SilenceStateActive, types.SilenceStateActive, types.SilenceStateActive)
-				}
-			}
-
 			// Endpoint: GET /v2/silences
 			{
 				for _, c := range clients {
 					list, err := c.GetSilencesV2(context.Background())
 					require.NoError(t, err)
-					assertSilences(list, types.SilenceStateActive, types.SilenceStateActive, types.SilenceStateActive)
-				}
-			}
-
-			// Endpoint: GET /v1/silence/{id}
-			{
-				for _, c := range clients {
-					sil1, err := c.GetSilenceV1(context.Background(), id1)
-					require.NoError(t, err)
-					assert.Equal(t, comment(1), sil1.Comment)
-					assert.Equal(t, types.SilenceStateActive, sil1.Status.State)
-
-					sil2, err := c.GetSilenceV1(context.Background(), id2)
-					require.NoError(t, err)
-					assert.Equal(t, comment(2), sil2.Comment)
-					assert.Equal(t, types.SilenceStateActive, sil2.Status.State)
-
-					sil3, err := c.GetSilenceV1(context.Background(), id3)
-					require.NoError(t, err)
-					assert.Equal(t, comment(3), sil3.Comment)
-					assert.Equal(t, types.SilenceStateActive, sil3.Status.State)
+					assertSilences(list, open_api_models.SilenceStatusStateActive, open_api_models.SilenceStatusStateActive, open_api_models.SilenceStatusStateActive)
 				}
 			}
 
@@ -427,18 +409,18 @@ func TestAlertmanagerSharding(t *testing.T) {
 				for _, c := range clients {
 					sil1, err := c.GetSilenceV2(context.Background(), id1)
 					require.NoError(t, err)
-					assert.Equal(t, comment(1), sil1.Comment)
-					assert.Equal(t, types.SilenceStateActive, sil1.Status.State)
+					assert.Equal(t, comment(1), *sil1.Comment)
+					assert.Equal(t, open_api_models.SilenceStatusStateActive, *sil1.Status.State)
 
 					sil2, err := c.GetSilenceV2(context.Background(), id2)
 					require.NoError(t, err)
-					assert.Equal(t, comment(2), sil2.Comment)
-					assert.Equal(t, types.SilenceStateActive, sil2.Status.State)
+					assert.Equal(t, comment(2), *sil2.Comment)
+					assert.Equal(t, open_api_models.SilenceStatusStateActive, *sil2.Status.State)
 
 					sil3, err := c.GetSilenceV2(context.Background(), id3)
 					require.NoError(t, err)
-					assert.Equal(t, comment(3), sil3.Comment)
-					assert.Equal(t, types.SilenceStateActive, sil3.Status.State)
+					assert.Equal(t, comment(3), *sil3.Comment)
+					assert.Equal(t, open_api_models.SilenceStatusStateActive, *sil3.Status.State)
 				}
 			}
 
@@ -482,7 +464,7 @@ func TestAlertmanagerSharding(t *testing.T) {
 				for _, c := range clients {
 					list, err := c.GetSilencesV2(context.Background())
 					require.NoError(t, err)
-					assertSilences(list, types.SilenceStateActive, types.SilenceStateExpired, types.SilenceStateActive)
+					assertSilences(list, open_api_models.SilenceStatusStateActive, open_api_models.SilenceStatusStateExpired, open_api_models.SilenceStatusStateActive)
 				}
 
 				err = c2.DeleteSilence(context.Background(), id3)
@@ -492,7 +474,7 @@ func TestAlertmanagerSharding(t *testing.T) {
 				for _, c := range clients {
 					list, err := c.GetSilencesV2(context.Background())
 					require.NoError(t, err)
-					assertSilences(list, types.SilenceStateActive, types.SilenceStateExpired, types.SilenceStateExpired)
+					assertSilences(list, open_api_models.SilenceStatusStateActive, open_api_models.SilenceStatusStateExpired, open_api_models.SilenceStatusStateExpired)
 				}
 
 				err = c3.DeleteSilence(context.Background(), id1)
@@ -502,7 +484,7 @@ func TestAlertmanagerSharding(t *testing.T) {
 				for _, c := range clients {
 					list, err := c.GetSilencesV2(context.Background())
 					require.NoError(t, err)
-					assertSilences(list, types.SilenceStateExpired, types.SilenceStateExpired, types.SilenceStateExpired)
+					assertSilences(list, open_api_models.SilenceStatusStateExpired, open_api_models.SilenceStatusStateExpired, open_api_models.SilenceStatusStateExpired)
 				}
 			}
 
@@ -540,18 +522,6 @@ func TestAlertmanagerSharding(t *testing.T) {
 					e2e.SkipMissingMetrics))
 			}
 
-			// Endpoint: GET /v1/alerts
-			{
-				// Reads will query at least two replicas and merge the results.
-				// Therefore, the alerts we posted should always be visible.
-
-				for _, c := range clients {
-					list, err := c.GetAlertsV1(context.Background())
-					require.NoError(t, err)
-					assert.ElementsMatch(t, []string{"alert_1", "alert_2", "alert_3"}, alertNames(list))
-				}
-			}
-
 			// Endpoint: GET /v2/alerts
 			{
 				for _, c := range clients {
@@ -578,8 +548,6 @@ func TestAlertmanagerSharding(t *testing.T) {
 					require.Contains(t, groups, "group_2")
 					assert.ElementsMatch(t, []string{"alert_3"}, alertNames(groups["group_2"]))
 				}
-
-				// Note: /v1/alerts/groups does not exist.
 			}
 
 			// Check the alerts were eventually written to every replica.
@@ -587,6 +555,47 @@ func TestAlertmanagerSharding(t *testing.T) {
 				e2e.Equals(float64(3*testCfg.replicationFactor)),
 				[]string{"cortex_alertmanager_alerts_received_total"},
 				e2e.SkipMissingMetrics))
+
+			// Endpoint: GET /v2/alerts/groups with route labels
+			{
+				// Both alerts share the group labels and receiver, but match different
+				// child routes
+				routedAlert := func(i int, team string) *model.Alert {
+					a := alert(i, 3)
+					a.Labels["team"] = model.LabelValue(team)
+					return a
+				}
+				err = c1.SendAlertToAlermanager(context.Background(), routedAlert(4, "a"))
+				require.NoError(t, err)
+				err = c2.SendAlertToAlermanager(context.Background(), routedAlert(5, "b"))
+				require.NoError(t, err)
+
+				require.NoError(t, alertmanagers.WaitSumMetricsWithOptions(
+					e2e.Equals(float64(5*testCfg.replicationFactor)),
+					[]string{"cortex_alertmanager_alerts_received_total"},
+					e2e.SkipMissingMetrics))
+
+				for _, c := range clients {
+					list, err := c.GetAlertGroups(context.Background())
+					require.NoError(t, err)
+
+					assert.Equal(t, 4, len(list))
+					groups := make(map[string][]model.Alert)
+					for _, g := range list {
+						key := fmt.Sprintf("%s/%s", g.Labels["group"], g.RouteLabels["owner"])
+						groups[key] = g.Alerts
+					}
+
+					require.Contains(t, groups, "group_1/")
+					assert.ElementsMatch(t, []string{"alert_1", "alert_2"}, alertNames(groups["group_1/"]))
+					require.Contains(t, groups, "group_2/")
+					assert.ElementsMatch(t, []string{"alert_3"}, alertNames(groups["group_2/"]))
+					require.Contains(t, groups, "group_3/team-a")
+					assert.ElementsMatch(t, []string{"alert_4"}, alertNames(groups["group_3/team-a"]))
+					require.Contains(t, groups, "group_3/team-b")
+					assert.ElementsMatch(t, []string{"alert_5"}, alertNames(groups["group_3/team-b"]))
+				}
+			}
 		})
 	}
 }
@@ -618,14 +627,13 @@ func TestAlertmanagerShardingScaling(t *testing.T) {
 			minio := e2edb.NewMinio(9000, alertsBucketName)
 			require.NoError(t, s.StartAndWaitReady(consul, minio))
 
-			client, err := s3.NewS3ObjectClient(s3.S3Config{
-				Endpoint:         minio.HTTPEndpoint(),
-				S3ForcePathStyle: true,
-				Insecure:         true,
-				BucketNames:      alertsBucketName,
-				AccessKeyID:      e2edb.MinioAccessKey,
-				SecretAccessKey:  e2edb.MinioSecretKey,
-			})
+			client, err := s3.NewBucketWithConfig(nil, s3.Config{
+				Endpoint:  minio.HTTPEndpoint(),
+				Insecure:  true,
+				Bucket:    alertsBucketName,
+				AccessKey: e2edb.MinioAccessKey,
+				SecretKey: e2edb.MinioSecretKey,
+			}, "alertmanager-test", nil)
 			require.NoError(t, err)
 
 			// Create and upload Alertmanager configurations.
@@ -640,7 +648,7 @@ func TestAlertmanagerShardingScaling(t *testing.T) {
 
 				d, err := desc.Marshal()
 				require.NoError(t, err)
-				err = client.PutObject(context.Background(), fmt.Sprintf("/alerts/%s", user), bytes.NewReader(d))
+				err = client.Upload(context.Background(), fmt.Sprintf("/alerts/%s", user), bytes.NewReader(d))
 				require.NoError(t, err)
 			}
 
@@ -650,7 +658,7 @@ func TestAlertmanagerShardingScaling(t *testing.T) {
 			}
 
 			flags := mergeFlags(AlertmanagerFlags(),
-				AlertmanagerS3Flags(false),
+				AlertmanagerS3Flags(),
 				AlertmanagerShardingFlags(consul.NetworkHTTPEndpoint(), testCfg.replicationFactor),
 				AlertmanagerPersisterFlags(persistInterval))
 
@@ -685,12 +693,7 @@ func TestAlertmanagerShardingScaling(t *testing.T) {
 
 				// If the number of instances has not yet reached the replication
 				// factor, then effective replication will be reduced.
-				var expectedReplication int
-				if len(instances) <= testCfg.replicationFactor {
-					expectedReplication = len(instances)
-				} else {
-					expectedReplication = testCfg.replicationFactor
-				}
+				expectedReplication := min(len(instances), testCfg.replicationFactor)
 
 				require.NoError(t, ams.WaitSumMetrics(
 					e2e.Equals(float64(numUsers*expectedReplication)),
@@ -721,13 +724,22 @@ func TestAlertmanagerShardingScaling(t *testing.T) {
 					require.NoError(t, err)
 
 					for j := 1; j <= 10; j++ {
-						silence := types.Silence{
-							Matchers: amlabels.Matchers{
-								{Name: "instance", Value: "prometheus-one"},
+						commentStr := fmt.Sprintf("Silence Comment #%d", j)
+						createdBy := "integration-test"
+						isRegex := false
+						isEqual := true
+						name := "instance"
+						value := "prometheus-one"
+						startsAt := strfmt.DateTime(time.Now())
+						endsAt := strfmt.DateTime(time.Now().Add(time.Hour))
+						silence := open_api_models.Silence{
+							Matchers: open_api_models.Matchers{
+								{Name: &name, Value: &value, IsRegex: &isRegex, IsEqual: &isEqual},
 							},
-							Comment:  fmt.Sprintf("Silence Comment #%d", j),
-							StartsAt: time.Now(),
-							EndsAt:   time.Now().Add(time.Hour),
+							Comment:   &commentStr,
+							CreatedBy: &createdBy,
+							StartsAt:  &startsAt,
+							EndsAt:    &endsAt,
 						}
 
 						_, err = client.CreateSilence(context.Background(), silence)

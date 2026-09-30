@@ -1,10 +1,10 @@
 package alertmanager
 
 import (
-	"github.com/grafana/dskit/ring"
+	"github.com/cortexproject/cortex/pkg/ring"
 )
 
-func (r *MultitenantAlertmanager) OnRingInstanceRegister(_ *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, instanceID string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
+func (r *MultitenantAlertmanager) OnRingInstanceRegister(lc *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, instanceID string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
 	// When we initialize the alertmanager instance in the ring we want to start from
 	// a clean situation, so whatever is the state we set it JOINING, while we keep existing
 	// tokens (if any).
@@ -13,8 +13,7 @@ func (r *MultitenantAlertmanager) OnRingInstanceRegister(_ *ring.BasicLifecycler
 		tokens = instanceDesc.GetTokens()
 	}
 
-	_, takenTokens := ringDesc.TokensFor(instanceID)
-	newTokens := ring.GenerateTokens(RingNumTokens-len(tokens), takenTokens)
+	newTokens := lc.GenerateTokens(&ringDesc, instanceID, instanceDesc.Zone, RingNumTokens-len(tokens), true)
 
 	// Tokens sorting will be enforced by the parent caller.
 	tokens = append(tokens, newTokens...)

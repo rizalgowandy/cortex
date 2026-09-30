@@ -1,6 +1,8 @@
-FROM       alpine:3.14
-RUN        apk add --no-cache ca-certificates
-COPY       query-tee /
+ARG        BASEIMG=gcr.io/distroless/static-debian12:latest
+FROM       ${BASEIMG}
+ARG TARGETARCH
+
+COPY       query-tee-$TARGETARCH /query-tee
 ENTRYPOINT ["/query-tee"]
 
 ARG revision

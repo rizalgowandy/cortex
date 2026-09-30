@@ -3,7 +3,9 @@ package e2e
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/pkg/errors"
 )
@@ -147,12 +149,19 @@ func (s *Scenario) clean() {
 }
 
 func (s *Scenario) shutdown() {
-	// Kill the services in the opposite order.
-	for i := len(s.services) - 1; i >= 0; i-- {
-		if err := s.services[i].Kill(); err != nil {
-			logger.Log("Unable to kill service", s.services[i].Name(), ":", err.Error())
-		}
+	// Kill the services in parallel. We still iterate in reverse order
+	// to respect service dependencies, but we kill them concurrently.
+	var wg sync.WaitGroup
+	for _, v := range slices.Backward(s.services) {
+		wg.Add(1)
+		go func(service Service) {
+			defer wg.Done()
+			if err := service.Kill(); err != nil {
+				logger.Log("Unable to kill service", service.Name(), ":", err.Error())
+			}
+		}(v)
 	}
+	wg.Wait()
 
 	// Ensure there are no leftover containers.
 	if out, err := RunCommandAndGetOutput(
@@ -163,7 +172,7 @@ func (s *Scenario) shutdown() {
 		"--filter",
 		fmt.Sprintf("network=%s", s.networkName),
 	); err == nil {
-		for _, containerID := range strings.Split(string(out), "\n") {
+		for containerID := range strings.SplitSeq(string(out), "\n") {
 			containerID = strings.TrimSpace(containerID)
 			if containerID == "" {
 				continue

@@ -4,9 +4,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/ring"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func TestRingConfig_DefaultConfigToLifecyclerConfig(t *testing.T) {
@@ -40,6 +41,7 @@ func TestRingConfig_CustomConfigToLifecyclerConfig(t *testing.T) {
 	cfg.InstancePort = 10
 	cfg.InstanceAddr = "1.2.3.4"
 	cfg.ListenPort = 10
+	cfg.TokensFilePath = "testFilePath"
 
 	// The lifecycler config should be generated based upon the compactor
 	// ring config
@@ -51,6 +53,7 @@ func TestRingConfig_CustomConfigToLifecyclerConfig(t *testing.T) {
 	expected.Port = cfg.InstancePort
 	expected.Addr = cfg.InstanceAddr
 	expected.ListenPort = cfg.ListenPort
+	expected.TokensFilePath = cfg.TokensFilePath
 
 	// Hardcoded config
 	expected.RingConfig.ReplicationFactor = 1

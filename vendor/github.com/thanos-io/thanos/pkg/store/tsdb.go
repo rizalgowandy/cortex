@@ -5,12 +5,19 @@ package store
 
 import (
 	"context"
+	"hash"
 	"io"
 	"math"
+	"slices"
 	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"google.golang.org/grpc"
@@ -18,16 +25,40 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/filter"
+	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
-const RemoteReadFrameLimit = 1048576
+const (
+	RemoteReadFrameLimit      = 1048576
+	cuckooStoreFilterCapacity = 1000000
+	storeFilterUpdateInterval = 15 * time.Second
+)
 
 type TSDBReader interface {
 	storage.ChunkQueryable
 	StartTime() (int64, error)
+}
+
+// TSDBStoreOption is a functional option for TSDBStore.
+type TSDBStoreOption func(s *TSDBStore)
+
+// WithCuckooMetricNameStoreFilter returns a TSDBStoreOption that enables the Cuckoo filter for metric names.
+func WithCuckooMetricNameStoreFilter() TSDBStoreOption {
+	return func(s *TSDBStore) {
+		s.storeFilter = filter.NewCuckooMetricNameStoreFilter(cuckooStoreFilterCapacity)
+		s.startStoreFilterUpdate = true
+	}
+}
+
+func WithMatcherCacheInstance(cache storecache.MatchersCache) TSDBStoreOption {
+	return func(s *TSDBStore) {
+		s.matcherCache = cache
+	}
 }
 
 // TSDBStore implements the store API against a local TSDB instance.
@@ -37,8 +68,20 @@ type TSDBStore struct {
 	logger           log.Logger
 	db               TSDBReader
 	component        component.StoreAPI
-	extLset          labels.Labels
+	buffers          sync.Pool
 	maxBytesPerFrame int
+	matcherCache     storecache.MatchersCache
+
+	extLsetAsLabelSets     []labels.Labels
+	startStoreFilterUpdate bool
+	storeFilter            filter.StoreFilter
+	mtx                    sync.RWMutex
+	close                  func()
+	storepb.UnimplementedStoreServer
+}
+
+func (s *TSDBStore) Close() {
+	s.close()
 }
 
 func RegisterWritableStoreServer(storeSrv storepb.WriteableStoreServer) func(*grpc.Server) {
@@ -55,54 +98,120 @@ type ReadWriteTSDBStore struct {
 
 // NewTSDBStore creates a new TSDBStore.
 // NOTE: Given lset has to be sorted.
-func NewTSDBStore(logger log.Logger, db TSDBReader, component component.StoreAPI, extLset labels.Labels) *TSDBStore {
+func NewTSDBStore(
+	logger log.Logger,
+	db TSDBReader,
+	component component.StoreAPI,
+	extLset labels.Labels,
+	options ...TSDBStoreOption,
+) *TSDBStore {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
-	return &TSDBStore{
-		logger:           logger,
-		db:               db,
-		component:        component,
-		extLset:          extLset,
-		maxBytesPerFrame: RemoteReadFrameLimit,
+
+	st := &TSDBStore{
+		logger:             logger,
+		db:                 db,
+		component:          component,
+		extLsetAsLabelSets: []labels.Labels{extLset},
+		maxBytesPerFrame:   RemoteReadFrameLimit,
+		storeFilter:        filter.AllowAllStoreFilter{},
+		close:              func() {},
+		buffers: sync.Pool{New: func() any {
+			b := make([]byte, 0, initialBufSize)
+			return &b
+		}},
+		matcherCache: storecache.NoopMatchersCache,
 	}
+
+	for _, option := range options {
+		option(st)
+	}
+
+	if st.startStoreFilterUpdate {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		updateFilter := func(ctx context.Context) {
+			vals, err := st.LabelValues(ctx, &storepb.LabelValuesRequest{
+				Label: model.MetricNameLabel,
+				End:   math.MaxInt64,
+			})
+			if err != nil {
+				level.Error(logger).Log("msg", "failed to update metric names", "err", err)
+				return
+			}
+
+			st.storeFilter.ResetAndSet(vals.Values...)
+		}
+		st.close = cancel
+		updateFilter(ctx)
+
+		t := time.NewTicker(storeFilterUpdateInterval)
+
+		go func() {
+			for {
+				select {
+				case <-t.C:
+					updateFilter(ctx)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	return st
 }
 
-// Info returns store information about the Prometheus instance.
-func (s *TSDBStore) Info(_ context.Context, _ *storepb.InfoRequest) (*storepb.InfoResponse, error) {
-	minTime, err := s.db.StartTime()
-	if err != nil {
-		return nil, errors.Wrap(err, "TSDB min Time")
-	}
+func (s *TSDBStore) SetExtLset(extLset labels.Labels) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 
-	res := &storepb.InfoResponse{
-		Labels:    labelpb.ZLabelsFromPromLabels(s.extLset),
-		StoreType: s.component.ToProto(),
-		MinTime:   minTime,
-		MaxTime:   math.MaxInt64,
-	}
+	s.extLsetAsLabelSets = []labels.Labels{extLset}
+}
 
-	// Until we deprecate the single labels in the reply, we just duplicate
-	// them here for migration/compatibility purposes.
-	res.LabelSets = []labelpb.ZLabelSet{}
-	if len(res.Labels) > 0 {
-		res.LabelSets = append(res.LabelSets, labelpb.ZLabelSet{
-			Labels: res.Labels,
-		})
-	}
-	return res, nil
+func (s *TSDBStore) getExtLset() labels.Labels {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	return s.extLsetAsLabelSets[0]
+}
+
+// ExtLabelSets returns the external labels exposed by this store as a slice of
+// label sets. Read-only.
+func (s *TSDBStore) ExtLabelSets() []labels.Labels {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	return s.extLsetAsLabelSets
 }
 
 func (s *TSDBStore) LabelSet() []labelpb.ZLabelSet {
-	labels := labelpb.ZLabelsFromPromLabels(s.extLset)
+	labels := labelpb.ZLabelSetsFromPromLabels(s.getExtLset())
 	labelSets := []labelpb.ZLabelSet{}
 	if len(labels) > 0 {
-		labelSets = append(labelSets, labelpb.ZLabelSet{
-			Labels: labels,
-		})
+		labelSets = append(labelSets, labels...)
 	}
 
 	return labelSets
+}
+
+func (s *TSDBStore) TSDBInfos() []infopb.TSDBInfo {
+	labels := s.LabelSet()
+	if len(labels) == 0 {
+		return []infopb.TSDBInfo{}
+	}
+
+	mint, maxt := s.TimeRange()
+	return []infopb.TSDBInfo{
+		{
+			Labels: labelpb.ZLabelSet{
+				Labels: labels[0].Labels,
+			},
+			MinTime: mint,
+			MaxTime: maxt,
+		},
+	}
 }
 
 func (s *TSDBStore) TimeRange() (int64, int64) {
@@ -117,16 +226,49 @@ func (s *TSDBStore) TimeRange() (int64, int64) {
 	return minTime, math.MaxInt64
 }
 
+func (s *TSDBStore) Matches(matchers []*labels.Matcher) bool {
+	return s.storeFilter.Matches(matchers)
+}
+
 // CloseDelegator allows to delegate close (releasing resources used by request to the server).
 // This is useful when we invoke StoreAPI within another StoreAPI and results are ephemeral until copied.
 type CloseDelegator interface {
 	Delegate(io.Closer)
 }
 
+type noopUpstream struct {
+	ctx context.Context
+	storepb.Store_SeriesServer
+}
+
+func (n *noopUpstream) Context() context.Context {
+	return n.ctx
+}
+
+func (s *TSDBStore) SeriesLocal(ctx context.Context, r *storepb.SeriesRequest) ([]*storepb.Series, error) {
+	srv := newFlushableServer(&noopUpstream{ctx: ctx}, sortingStrategyStoreSendNoop)
+	if err := s.Series(r, srv); err != nil {
+		return nil, err
+	}
+
+	rs := srv.(*resortingServer)
+
+	return rs.series, nil
+}
+
 // Series returns all series for a requested time range and label matcher. The returned data may
 // exceed the requested time bounds.
-func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
-	match, matchers, err := matchesExternalLabels(r.Matchers, s.extLset)
+func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_SeriesServer) error {
+	var srv flushableServer
+	if fs, ok := seriesSrv.(flushableServer); !ok {
+		srv = newFlushableServer(
+			newBatchableServer(seriesSrv, int(r.ResponseBatchSize)),
+			sortingStrategyStore)
+	} else {
+		srv = fs
+	}
+
+	match, matchers, err := matchesExternalLabels(r.Matchers, s.getExtLset(), s.matcherCache)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -139,7 +281,7 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 		return status.Error(codes.InvalidArgument, errors.New("no matchers specified (excluding external labels)").Error())
 	}
 
-	q, err := s.db.ChunkQuerier(context.Background(), r.MinTime, r.MaxTime)
+	q, err := s.db.ChunkQuerier(r.MinTime, r.MaxTime)
 	if err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
@@ -150,12 +292,35 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 		defer runutil.CloseWithLogOnErr(s.logger, q, "close tsdb chunk querier series")
 	}
 
-	set := q.Select(false, nil, matchers...)
+	hints := &storage.SelectHints{
+		Start:           r.MinTime,
+		End:             r.MaxTime,
+		Limit:           int(r.Limit),
+		DisableTrimming: true,
+	}
+	set := q.Select(srv.Context(), true, hints, matchers...)
+
+	shardMatcher := r.ShardInfo.Matcher(&s.buffers)
+	defer shardMatcher.Close()
+	hasher := hashPool.Get().(hash.Hash64)
+	defer hashPool.Put(hasher)
+
+	extLsetToRemove := map[string]struct{}{}
+	for _, lbl := range r.WithoutReplicaLabels {
+		extLsetToRemove[lbl] = struct{}{}
+	}
+	finalExtLset := rmLabels(s.extLsetAsLabelSets[0].Copy(), extLsetToRemove)
 
 	// Stream at most one series per frame; series may be split over multiple frames according to maxBytesInFrame.
 	for set.Next() {
 		series := set.At()
-		storeSeries := storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(labelpb.ExtendSortedLabels(series.Labels(), s.extLset))}
+
+		completeLabelset := labelpb.ExtendSortedLabels(rmLabels(series.Labels(), extLsetToRemove), finalExtLset)
+		if !shardMatcher.MatchesLabels(completeLabelset) {
+			continue
+		}
+
+		storeSeries := storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(completeLabelset)}
 		if r.SkipChunks {
 			if err := srv.Send(storepb.NewSeriesResponse(&storeSeries)); err != nil {
 				return status.Error(codes.Aborted, err.Error())
@@ -170,7 +335,7 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 		frameBytesLeft := bytesLeftForChunks
 
 		seriesChunks := []storepb.AggrChunk{}
-		chIter := series.Iterator()
+		chIter := series.Iterator(nil)
 		isNext := chIter.Next()
 		for isNext {
 			chk := chIter.At()
@@ -178,12 +343,15 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 				return status.Errorf(codes.Internal, "TSDBStore: found not populated chunk returned by SeriesSet at ref: %v", chk.Ref)
 			}
 
+			chunkBytes := make([]byte, len(chk.Chunk.Bytes()))
+			copy(chunkBytes, chk.Chunk.Bytes())
 			c := storepb.AggrChunk{
 				MinTime: chk.MinTime,
 				MaxTime: chk.MaxTime,
 				Raw: &storepb.Chunk{
 					Type: storepb.Chunk_Encoding(chk.Chunk.Encoding() - 1), // Proto chunk encoding is one off to TSDB one.
-					Data: chk.Chunk.Bytes(),
+					Data: chunkBytes,
+					Hash: hashChunk(hasher, chunkBytes, enableChunkHashCalculation),
 				},
 			}
 			frameBytesLeft -= c.Size()
@@ -216,14 +384,14 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 			return status.Error(codes.Aborted, err.Error())
 		}
 	}
-	return nil
+	return srv.Flush()
 }
 
 // LabelNames returns all known label names constrained with the given matchers.
 func (s *TSDBStore) LabelNames(ctx context.Context, r *storepb.LabelNamesRequest) (
 	*storepb.LabelNamesResponse, error,
 ) {
-	match, matchers, err := matchesExternalLabels(r.Matchers, s.extLset)
+	match, matchers, err := matchesExternalLabels(r.Matchers, s.getExtLset(), s.matcherCache)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -232,25 +400,43 @@ func (s *TSDBStore) LabelNames(ctx context.Context, r *storepb.LabelNamesRequest
 		return &storepb.LabelNamesResponse{Names: nil}, nil
 	}
 
-	q, err := s.db.ChunkQuerier(ctx, r.Start, r.End)
+	q, err := s.db.ChunkQuerier(r.Start, r.End)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	defer runutil.CloseWithLogOnErr(s.logger, q, "close tsdb querier label names")
 
-	res, _, err := q.LabelNames(matchers...)
+	hints := &storage.LabelHints{
+		Limit: int(r.Limit),
+	}
+	res, _, err := q.LabelNames(ctx, hints, matchers...)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+	extLsetToRemove := map[string]struct{}{}
+	for _, lbl := range r.WithoutReplicaLabels {
+		extLsetToRemove[lbl] = struct{}{}
+	}
 
 	if len(res) > 0 {
-		for _, lbl := range s.extLset {
-			res = append(res, lbl.Name)
-		}
+		s.getExtLset().Range(func(l labels.Label) {
+			if _, ok := extLsetToRemove[l.Name]; !ok {
+				res = append(res, l.Name)
+			}
+		})
 		sort.Strings(res)
 	}
 
-	return &storepb.LabelNamesResponse{Names: res}, nil
+	// Label values can come from a postings table of a memory-mapped block which can be deleted during
+	// head compaction. Since we close the block querier before we return from the function,
+	// we need to copy label values to make sure the client still has access to the data when
+	// a block is deleted.
+	values := make([]string, len(res))
+	for i := range res {
+		values[i] = strings.Clone(res[i])
+	}
+
+	return &storepb.LabelNamesResponse{Names: values}, nil
 }
 
 // LabelValues returns all known label values for a given label name.
@@ -261,29 +447,63 @@ func (s *TSDBStore) LabelValues(ctx context.Context, r *storepb.LabelValuesReque
 		return nil, status.Error(codes.InvalidArgument, "label name parameter cannot be empty")
 	}
 
-	match, matchers, err := matchesExternalLabels(r.Matchers, s.extLset)
+	if slices.Contains(r.WithoutReplicaLabels, r.Label) {
+		return &storepb.LabelValuesResponse{}, nil
+	}
+
+	match, matchers, err := matchesExternalLabels(r.Matchers, s.getExtLset(), s.matcherCache)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-
 	if !match {
-		return &storepb.LabelValuesResponse{Values: nil}, nil
+		return &storepb.LabelValuesResponse{}, nil
 	}
 
-	if v := s.extLset.Get(r.Label); v != "" {
-		return &storepb.LabelValuesResponse{Values: []string{v}}, nil
-	}
-
-	q, err := s.db.ChunkQuerier(ctx, r.Start, r.End)
+	q, err := s.db.ChunkQuerier(r.Start, r.End)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	defer runutil.CloseWithLogOnErr(s.logger, q, "close tsdb querier label values")
 
-	res, _, err := q.LabelValues(r.Label, matchers...)
+	// If we request label values for an external label while selecting an additional matcher for other label values
+	if val := s.getExtLset().Get(r.Label); val != "" {
+		if len(matchers) == 0 {
+			return &storepb.LabelValuesResponse{Values: []string{val}}, nil
+		}
+
+		hints := &storage.SelectHints{
+			Start: r.Start,
+			End:   r.End,
+			Func:  "series",
+			Limit: int(r.Limit),
+		}
+		set := q.Select(ctx, false, hints, matchers...)
+
+		for set.Next() {
+			return &storepb.LabelValuesResponse{Values: []string{val}}, nil
+		}
+		if err := set.Err(); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		return &storepb.LabelValuesResponse{}, nil
+	}
+
+	hints := &storage.LabelHints{
+		Limit: int(r.Limit),
+	}
+	res, _, err := q.LabelValues(ctx, r.Label, hints, matchers...)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	return &storepb.LabelValuesResponse{Values: res}, nil
+	// Label values can come from a postings table of a memory-mapped block which can be deleted during
+	// head compaction. Since we close the block querier before we return from the function,
+	// we need to copy label values to make sure the client still has access to the data when
+	// a block is deleted.
+	values := make([]string, len(res))
+	for i := range res {
+		values[i] = strings.Clone(res[i])
+	}
+
+	return &storepb.LabelValuesResponse{Values: values}, nil
 }

@@ -7,29 +7,36 @@ import (
 	"context"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
+	xsync "golang.org/x/sync/singleflight"
+
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/thanos-io/objstore"
 
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/block/metadata"
 )
 
 // ReaderPoolMetrics holds metrics tracked by ReaderPool.
 type ReaderPoolMetrics struct {
-	lazyReader *LazyBinaryReaderMetrics
+	lazyReader   *LazyBinaryReaderMetrics
+	binaryReader *BinaryReaderMetrics
 }
 
 // NewReaderPoolMetrics makes new ReaderPoolMetrics.
 func NewReaderPoolMetrics(reg prometheus.Registerer) *ReaderPoolMetrics {
 	return &ReaderPoolMetrics{
-		lazyReader: NewLazyBinaryReaderMetrics(reg),
+		lazyReader:   NewLazyBinaryReaderMetrics(reg),
+		binaryReader: NewBinaryReaderMetrics(reg),
 	}
 }
 
-// ReaderPool is used to istantiate new index-header readers and keep track of them.
+// ReaderPool is used to instantiate new index-header readers and keep track of them.
 // When the lazy reader is enabled, the pool keeps track of all instantiated readers
 // and automatically close them once the idle timeout is reached. A closed lazy reader
 // will be automatically re-opened upon next usage.
@@ -45,10 +52,48 @@ type ReaderPool struct {
 	// Keep track of all readers managed by the pool.
 	lazyReadersMx sync.Mutex
 	lazyReaders   map[*LazyBinaryReader]struct{}
+	lazyReadersSF xsync.Group
+
+	lazyDownloadFunc LazyDownloadIndexHeaderFunc
+}
+
+// IndexHeaderLazyDownloadStrategy specifies how to download index headers
+// lazily. Only used when lazy mmap is enabled.
+type IndexHeaderLazyDownloadStrategy string
+
+const (
+	// EagerDownloadStrategy always disables lazy downloading index headers.
+	EagerDownloadStrategy IndexHeaderLazyDownloadStrategy = "eager"
+	// LazyDownloadStrategy always lazily download index headers.
+	LazyDownloadStrategy IndexHeaderLazyDownloadStrategy = "lazy"
+)
+
+func (s IndexHeaderLazyDownloadStrategy) StrategyToDownloadFunc() LazyDownloadIndexHeaderFunc {
+	switch s {
+	case LazyDownloadStrategy:
+		return AlwaysLazyDownloadIndexHeader
+	default:
+		// Always fallback to eager download index header.
+		return AlwaysEagerDownloadIndexHeader
+	}
+}
+
+// LazyDownloadIndexHeaderFunc is used to determine whether to download the index header lazily
+// or not by checking its block metadata. Usecase can be by time or by index file size.
+type LazyDownloadIndexHeaderFunc func(meta *metadata.Meta) bool
+
+// AlwaysEagerDownloadIndexHeader always eagerly download index header.
+func AlwaysEagerDownloadIndexHeader(meta *metadata.Meta) bool {
+	return false
+}
+
+// AlwaysLazyDownloadIndexHeader always lazily download index header.
+func AlwaysLazyDownloadIndexHeader(meta *metadata.Meta) bool {
+	return true
 }
 
 // NewReaderPool makes a new ReaderPool.
-func NewReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTimeout time.Duration, metrics *ReaderPoolMetrics) *ReaderPool {
+func NewReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTimeout time.Duration, metrics *ReaderPoolMetrics, lazyDownloadFunc LazyDownloadIndexHeaderFunc) *ReaderPool {
 	p := &ReaderPool{
 		logger:                logger,
 		metrics:               metrics,
@@ -56,6 +101,7 @@ func NewReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTime
 		lazyReaderIdleTimeout: lazyReaderIdleTimeout,
 		lazyReaders:           make(map[*LazyBinaryReader]struct{}),
 		close:                 make(chan struct{}),
+		lazyDownloadFunc:      lazyDownloadFunc,
 	}
 
 	// Start a goroutine to close idle readers (only if required).
@@ -80,19 +126,22 @@ func NewReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTime
 // NewBinaryReader creates and returns a new binary reader. If the pool has been configured
 // with lazy reader enabled, this function will return a lazy reader. The returned lazy reader
 // is tracked by the pool and automatically closed once the idle timeout expires.
-func (p *ReaderPool) NewBinaryReader(ctx context.Context, logger log.Logger, bkt objstore.BucketReader, dir string, id ulid.ULID, postingOffsetsInMemSampling int) (Reader, error) {
-	var reader Reader
-	var err error
-
-	if p.lazyReaderEnabled {
-		reader, err = NewLazyBinaryReader(ctx, logger, bkt, dir, id, postingOffsetsInMemSampling, p.metrics.lazyReader, p.onLazyReaderClosed)
-	} else {
-		reader, err = NewBinaryReader(ctx, logger, bkt, dir, id, postingOffsetsInMemSampling)
+func (p *ReaderPool) NewBinaryReader(ctx context.Context, logger log.Logger, bkt objstore.BucketReader, dir string, id ulid.ULID, postingOffsetsInMemSampling int, meta *metadata.Meta) (Reader, error) {
+	if !p.lazyReaderEnabled {
+		return NewBinaryReader(ctx, logger, bkt, dir, id, postingOffsetsInMemSampling, p.metrics.binaryReader)
 	}
+
+	idBytes := id.Bytes()
+	lazyReader, err, _ := p.lazyReadersSF.Do(*(*string)(unsafe.Pointer(&idBytes)), func() (any, error) {
+		return NewLazyBinaryReader(ctx, logger, bkt, dir, id, postingOffsetsInMemSampling, p.metrics.lazyReader, p.metrics.binaryReader, p.onLazyReaderClosed, p.lazyDownloadFunc(meta))
+	})
 
 	if err != nil {
+		level.Error(p.logger).Log("msg", "failed to create lazy index-header reader", "block", id.String(), "err", err)
 		return nil, err
 	}
+
+	reader := lazyReader.(Reader)
 
 	// Keep track of lazy readers only if required.
 	if p.lazyReaderEnabled && p.lazyReaderIdleTimeout > 0 {

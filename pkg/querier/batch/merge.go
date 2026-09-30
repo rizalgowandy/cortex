@@ -3,9 +3,27 @@ package batch
 import (
 	"container/heap"
 	"sort"
+	"sync"
 
-	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"go.uber.org/atomic"
+
+	promchunk "github.com/cortexproject/cortex/pkg/chunk"
 )
+
+// poolBatchesBuf controls whether buildNextBatch uses sync.Pool or per-iterator batchesBuf.
+var poolBatchesBuf atomic.Bool
+
+func SetPoolBatchesBuf(enabled bool) {
+	poolBatchesBuf.Store(enabled)
+}
+
+var batchesBufPool = sync.Pool{
+	New: func() any {
+		buf := make(batchStream, 3)
+		return &buf
+	},
+}
 
 type mergeIterator struct {
 	its []*nonOverlappingIterator
@@ -18,25 +36,42 @@ type mergeIterator struct {
 	batchesBuf   batchStream
 	nextBatchBuf [1]promchunk.Batch
 
+	numPartitions int
+	usePool       bool
+
 	currErr error
 }
 
-func newMergeIterator(cs []GenericChunk) *mergeIterator {
+func newMergeIterator(it iterator, cs []GenericChunk) *mergeIterator {
 	css := partitionChunks(cs)
-	its := make([]*nonOverlappingIterator, 0, len(css))
-	for _, cs := range css {
-		its = append(its, newNonOverlappingIterator(cs))
+
+	var c *mergeIterator
+
+	if mIterator, ok := it.(*mergeIterator); ok && cap(mIterator.its) >= len(css) {
+		c = mIterator.Reset(len(css))
+	} else {
+		c = &mergeIterator{
+			h:             make(iteratorHeap, 0, len(css)),
+			batches:       make(batchStream, 0, len(css)),
+			numPartitions: len(css),
+			usePool:       poolBatchesBuf.Load(),
+		}
+
+		if !poolBatchesBuf.Load() {
+			c.batchesBuf = make(batchStream, len(css))
+		}
 	}
 
-	c := &mergeIterator{
-		its:        its,
-		h:          make(iteratorHeap, 0, len(its)),
-		batches:    make(batchStream, 0, len(its)),
-		batchesBuf: make(batchStream, len(its)),
+	if cap(c.its) < len(css) {
+		c.its = make([]*nonOverlappingIterator, 0, len(css))
+	}
+
+	for _, cs := range css {
+		c.its = append(c.its, newNonOverlappingIterator(cs))
 	}
 
 	for _, iter := range c.its {
-		if iter.Next(1) {
+		if iter.Next(1) != chunkenc.ValNone {
 			c.h = append(c.h, iter)
 			continue
 		}
@@ -50,7 +85,33 @@ func newMergeIterator(cs []GenericChunk) *mergeIterator {
 	return c
 }
 
-func (c *mergeIterator) Seek(t int64, size int) bool {
+func (c *mergeIterator) Reset(size int) *mergeIterator {
+	c.its = c.its[:0]
+	c.h = c.h[:0]
+	c.batches = c.batches[:0]
+	c.numPartitions = size
+
+	if !c.usePool {
+		if size > cap(c.batchesBuf) {
+			c.batchesBuf = make(batchStream, size)
+		} else {
+			c.batchesBuf = c.batchesBuf[:size]
+			for i := range size {
+				c.batchesBuf[i] = promchunk.Batch{}
+			}
+		}
+	}
+
+	for i := range len(c.nextBatchBuf) {
+		c.nextBatchBuf[i] = promchunk.Batch{}
+	}
+
+	c.currErr = nil
+
+	return c
+}
+
+func (c *mergeIterator) Seek(t int64, size int) chunkenc.ValueType {
 
 	// Optimisation to see if the seek is within our current caches batches.
 found:
@@ -74,14 +135,14 @@ found:
 		c.batches = c.batches[:0]
 
 		for _, iter := range c.its {
-			if iter.Seek(t, size) {
+			if iter.Seek(t, size) != chunkenc.ValNone {
 				c.h = append(c.h, iter)
 				continue
 			}
 
 			if err := iter.Err(); err != nil {
 				c.currErr = err
-				return false
+				return chunkenc.ValNone
 			}
 		}
 
@@ -91,7 +152,7 @@ found:
 	return c.buildNextBatch(size)
 }
 
-func (c *mergeIterator) Next(size int) bool {
+func (c *mergeIterator) Next(size int) chunkenc.ValueType {
 	// Pop the last built batch in a way that doesn't extend the slice.
 	if len(c.batches) > 0 {
 		copy(c.batches, c.batches[1:])
@@ -106,26 +167,67 @@ func (c *mergeIterator) nextBatchEndTime() int64 {
 	return batch.Timestamps[batch.Length-1]
 }
 
-func (c *mergeIterator) buildNextBatch(size int) bool {
+func (c *mergeIterator) buildNextBatch(size int) chunkenc.ValueType {
+	if len(c.h) == 0 && len(c.batches) > 0 {
+		return c.batches[0].ValType
+	}
+	if len(c.h) == 0 {
+		return chunkenc.ValNone
+	}
+
+	var buf batchStream
+	if c.usePool {
+		bp := batchesBufPool.Get().(*batchStream)
+		defer func() {
+			for i := range *bp {
+				(*bp)[i] = promchunk.Batch{}
+			}
+			batchesBufPool.Put(bp)
+		}()
+		if cap(*bp) < c.numPartitions {
+			*bp = make(batchStream, c.numPartitions)
+		} else {
+			*bp = (*bp)[:c.numPartitions]
+		}
+		buf = *bp
+	} else {
+		buf = c.batchesBuf
+	}
+
 	// All we need to do is get enough batches that our first batch's last entry
 	// is before all iterators next entry.
 	for len(c.h) > 0 && (len(c.batches) == 0 || c.nextBatchEndTime() >= c.h[0].AtTime()) {
 		c.nextBatchBuf[0] = c.h[0].Batch()
-		c.batchesBuf = mergeStreams(c.batches, c.nextBatchBuf[:], c.batchesBuf, size)
-		c.batches = append(c.batches[:0], c.batchesBuf...)
+		buf = mergeStreams(c.batches, c.nextBatchBuf[:], buf, size)
+		c.batches = append(c.batches[:0], buf...)
 
-		if c.h[0].Next(size) {
+		if valType := c.h[0].Next(size); valType != chunkenc.ValNone {
 			heap.Fix(&c.h, 0)
 		} else {
 			heap.Pop(&c.h)
 		}
 	}
 
-	return len(c.batches) > 0
+	if !c.usePool {
+		c.batchesBuf = buf
+	}
+
+	if len(c.batches) > 0 {
+		return c.batches[0].ValType
+	}
+	return chunkenc.ValNone
 }
 
 func (c *mergeIterator) AtTime() int64 {
 	return c.batches[0].Timestamps[0]
+}
+
+func (c *mergeIterator) MaxCurrentChunkTime() int64 {
+	if len(c.h) < 1 {
+		return -1
+	}
+
+	return c.h[0].MaxCurrentChunkTime()
 }
 
 func (c *mergeIterator) Batch() promchunk.Batch {
@@ -147,11 +249,11 @@ func (h *iteratorHeap) Less(i, j int) bool {
 	return iT < jT
 }
 
-func (h *iteratorHeap) Push(x interface{}) {
+func (h *iteratorHeap) Push(x any) {
 	*h = append(*h, x.(iterator))
 }
 
-func (h *iteratorHeap) Pop() interface{} {
+func (h *iteratorHeap) Pop() any {
 	old := *h
 	n := len(old)
 	x := old[n-1]

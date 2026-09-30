@@ -1,4 +1,4 @@
-// +build requires_docker
+//go:build requires_docker
 
 package e2e
 
@@ -10,9 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/backoff"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cortexproject/cortex/pkg/util/backoff"
 )
 
 func TestWaitSumMetric(t *testing.T) {

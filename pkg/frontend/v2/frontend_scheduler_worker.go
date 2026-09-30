@@ -8,8 +8,6 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/backoff"
-	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
 	"github.com/weaveworks/common/httpgrpc"
 	"google.golang.org/grpc"
@@ -17,6 +15,8 @@ import (
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/backoff"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 type frontendSchedulerWorkers struct {
@@ -85,7 +85,7 @@ func (f *frontendSchedulerWorkers) AddressAdded(address string) {
 	}
 
 	level.Info(f.log).Log("msg", "adding connection to scheduler", "addr", address)
-	conn, err := f.connectToScheduler(context.Background(), address)
+	conn, err := f.connectToScheduler(address)
 	if err != nil {
 		level.Error(f.log).Log("msg", "error connecting to scheduler", "addr", address, "err", err)
 		return
@@ -126,14 +126,14 @@ func (f *frontendSchedulerWorkers) getWorkersCount() int {
 	return len(f.workers)
 }
 
-func (f *frontendSchedulerWorkers) connectToScheduler(ctx context.Context, address string) (*grpc.ClientConn, error) {
+func (f *frontendSchedulerWorkers) connectToScheduler(address string) (*grpc.ClientConn, error) {
 	// Because we only use single long-running method, it doesn't make sense to inject user ID, send over tracing or add metrics.
 	opts, err := f.cfg.GRPCClientConfig.DialOption(nil, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := grpc.DialContext(ctx, address, opts...)
+	conn, err := grpc.NewClient(address, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func newFrontendSchedulerWorker(conn *grpc.ClientConn, schedulerAddr string, fro
 		schedulerAddr: schedulerAddr,
 		frontendAddr:  frontendAddr,
 		requestCh:     requestCh,
-		cancelCh:      make(chan uint64),
+		cancelCh:      make(chan uint64, 1000), // Use buffered channel to make sure we can always enqueue to cancel request context.
 	}
 	w.ctx, w.cancel = context.WithCancel(context.Background())
 
@@ -181,11 +181,9 @@ func newFrontendSchedulerWorker(conn *grpc.ClientConn, schedulerAddr string, fro
 func (w *frontendSchedulerWorker) start() {
 	client := schedulerpb.NewSchedulerForFrontendClient(w.conn)
 	for i := 0; i < w.concurrency; i++ {
-		w.wg.Add(1)
-		go func() {
-			defer w.wg.Done()
+		w.wg.Go(func() {
 			w.runOne(w.ctx, client)
-		}()
+		})
 	}
 }
 
@@ -291,17 +289,21 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(resp.GetError()),
 					},
 				}
 
 			case schedulerpb.TOO_MANY_REQUESTS_PER_TENANT:
-				req.enqueue <- enqueueResult{status: waitForResponse}
-				req.response <- &frontendv2pb.QueryResultRequest{
-					HttpResponse: &httpgrpc.HTTPResponse{
-						Code: http.StatusTooManyRequests,
-						Body: []byte("too many outstanding requests"),
-					},
+				if req.retryOnTooManyOutstandingRequests {
+					req.enqueue <- enqueueResult{status: failed}
+				} else {
+					req.enqueue <- enqueueResult{status: waitForResponse}
+					req.response <- &frontendv2pb.QueryResultRequest{
+						HttpResponse: &httpgrpc.HTTPResponse{
+							Code: http.StatusTooManyRequests,
+							Body: []byte("too many outstanding requests"),
+						},
+					}
 				}
 			}
 

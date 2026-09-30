@@ -2,7 +2,6 @@ package process
 
 import (
 	"bytes"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,11 +16,7 @@ func TestProcessCollector(t *testing.T) {
 	const pid = 1
 
 	// Create a mocked proc FS.
-	procDir, err := ioutil.TempDir("", "proc")
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(procDir))
-	}()
+	procDir := t.TempDir()
 
 	mapsPath := processMapsPath(procDir, pid)
 	mapsLimitPath := vmMapsLimitPath(procDir)
@@ -29,8 +24,8 @@ func TestProcessCollector(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(mapsPath), os.ModePerm))
 	require.NoError(t, os.MkdirAll(filepath.Dir(mapsLimitPath), os.ModePerm))
 
-	require.NoError(t, ioutil.WriteFile(mapsPath, []byte("1\n2\n3\n4\n5\n"), os.ModePerm))
-	require.NoError(t, ioutil.WriteFile(mapsLimitPath, []byte("262144\n"), os.ModePerm))
+	require.NoError(t, os.WriteFile(mapsPath, []byte("1\n2\n3\n4\n5\n"), os.ModePerm))
+	require.NoError(t, os.WriteFile(mapsLimitPath, []byte("262144\n"), os.ModePerm))
 
 	// Create a new collector and test metrics.
 	c, err := newProcessCollector(pid, procDir)

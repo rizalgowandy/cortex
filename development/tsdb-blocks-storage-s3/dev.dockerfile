@@ -1,8 +1,8 @@
-FROM golang:1.16
+FROM golang:1.19
 ENV CGO_ENABLED=0
-RUN go get github.com/go-delve/delve/cmd/dlv
+RUN go install github.com/go-delve/delve/cmd/dlv@latest
 
-FROM alpine:3.14
+FROM alpine:3.23
 
 RUN     mkdir /cortex
 WORKDIR /cortex

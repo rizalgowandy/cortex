@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -25,7 +26,7 @@ func TestQueryLimiter_AddSeries_ShouldReturnNoErrorOnLimitNotExceeded(t *testing
 			labels.MetricName: metricName + "_2",
 			"series2":         "1",
 		})
-		limiter = NewQueryLimiter(100, 0, 0)
+		limiter = NewQueryLimiter(100, 0, 0, 0)
 	)
 	err := limiter.AddSeries(cortexpb.FromLabelsToLabelAdapters(series1))
 	assert.NoError(t, err)
@@ -45,24 +46,81 @@ func TestQueryLimiter_AddSeriers_ShouldReturnErrorOnLimitExceeded(t *testing.T) 
 	)
 
 	var (
-		series1 = labels.FromMap(map[string]string{
-			labels.MetricName: metricName + "_1",
+		series1 = []cortexpb.LabelAdapter{
+			{
+				Name:  labels.MetricName,
+				Value: metricName + "_1",
+			},
+			{
+				Name:  "series1",
+				Value: "1",
+			},
+		}
+
+		series1OtherOrderLabels = []cortexpb.LabelAdapter{
+			{
+				Name:  "series1",
+				Value: "1",
+			},
+			{
+				Name:  labels.MetricName,
+				Value: metricName + "_1",
+			},
+		}
+
+		series1FromMap = labels.FromMap(map[string]string{
 			"series1":         "1",
+			labels.MetricName: metricName + "_1",
 		})
 		series2 = labels.FromMap(map[string]string{
 			labels.MetricName: metricName + "_2",
 			"series2":         "1",
 		})
-		limiter = NewQueryLimiter(1, 0, 0)
+		limiter = NewQueryLimiter(1, 0, 0, 0)
 	)
-	err := limiter.AddSeries(cortexpb.FromLabelsToLabelAdapters(series1))
+	err := limiter.AddSeries(series1)
+	require.NoError(t, err)
+	err = limiter.AddSeries(cortexpb.FromLabelsToLabelAdapters(series1FromMap))
+	require.NoError(t, err)
+	err = limiter.AddSeries(series1OtherOrderLabels)
 	require.NoError(t, err)
 	err = limiter.AddSeries(cortexpb.FromLabelsToLabelAdapters(series2))
 	require.Error(t, err)
 }
 
+func TestQueryLimiter_AddSeriesBatch_ShouldReturnErrorOnLimitExceeded(t *testing.T) {
+	const (
+		metricName = "test_metric"
+	)
+
+	limiter := NewQueryLimiter(10, 0, 0, 0)
+	series := make([][]cortexpb.LabelAdapter, 0, 10)
+
+	for i := range 10 {
+		s := []cortexpb.LabelAdapter{
+			{
+				Name:  labels.MetricName,
+				Value: fmt.Sprintf("%v_%v", metricName, i),
+			},
+		}
+		series = append(series, s)
+	}
+	err := limiter.AddSeries(series...)
+	require.NoError(t, err)
+
+	series1 := []cortexpb.LabelAdapter{
+		{
+			Name:  labels.MetricName,
+			Value: metricName + "_11",
+		},
+	}
+
+	err = limiter.AddSeries(series1)
+	require.Error(t, err)
+}
+
 func TestQueryLimiter_AddChunkBytes(t *testing.T) {
-	var limiter = NewQueryLimiter(0, 100, 0)
+	var limiter = NewQueryLimiter(0, 100, 0, 0)
 
 	err := limiter.AddChunkBytes(100)
 	require.NoError(t, err)
@@ -70,24 +128,62 @@ func TestQueryLimiter_AddChunkBytes(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestQueryLimiter_AddDataBytes(t *testing.T) {
+	var limiter = NewQueryLimiter(0, 0, 0, 100)
+
+	err := limiter.AddDataBytes(100)
+	require.NoError(t, err)
+	err = limiter.AddDataBytes(1)
+	require.Error(t, err)
+}
+
 func BenchmarkQueryLimiter_AddSeries(b *testing.B) {
+	AddSeriesConcurrentBench(b, 1)
+}
+
+func BenchmarkQueryLimiter_AddSeriesBatch(b *testing.B) {
+	AddSeriesConcurrentBench(b, 128)
+}
+
+func AddSeriesConcurrentBench(b *testing.B, batchSize int) {
+	b.ResetTimer()
 	const (
 		metricName = "test_metric"
 	)
-	var series []labels.Labels
-	for i := 0; i < b.N; i++ {
-		series = append(series,
-			labels.FromMap(map[string]string{
-				labels.MetricName: metricName + "_1",
-				"series1":         fmt.Sprint(i),
-			}))
-	}
-	b.ResetTimer()
 
-	limiter := NewQueryLimiter(b.N+1, 0, 0)
-	for _, s := range series {
-		err := limiter.AddSeries(cortexpb.FromLabelsToLabelAdapters(s))
-		assert.NoError(b, err)
+	limiter := NewQueryLimiter(b.N+1, 0, 0, 0)
+
+	// Concurrent goroutines trying to add duplicated series
+	const numWorkers = 100
+	var wg sync.WaitGroup
+
+	worker := func(w int) {
+		defer wg.Done()
+		var series []labels.Labels
+		for i := 0; b.Loop(); i++ {
+			series = append(series,
+				labels.FromMap(map[string]string{
+					labels.MetricName: metricName + "_1",
+					"series1":         fmt.Sprint(i),
+				}))
+		}
+
+		for i := 0; i < len(series); i += batchSize {
+			s := make([][]cortexpb.LabelAdapter, 0, batchSize)
+			j := min(i+batchSize, len(series))
+			for k := i; k < j; k++ {
+				s = append(s, cortexpb.FromLabelsToLabelAdapters(series[k]))
+			}
+
+			err := limiter.AddSeries(s...)
+			assert.NoError(b, err)
+		}
 	}
 
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go worker(w)
+	}
+
+	wg.Wait()
 }

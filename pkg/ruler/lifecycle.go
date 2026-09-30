@@ -1,10 +1,10 @@
 package ruler
 
 import (
-	"github.com/grafana/dskit/ring"
+	"github.com/cortexproject/cortex/pkg/ring"
 )
 
-func (r *Ruler) OnRingInstanceRegister(_ *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, instanceID string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
+func (r *Ruler) OnRingInstanceRegister(lc *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, instanceID string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
 	// When we initialize the ruler instance in the ring we want to start from
 	// a clean situation, so whatever is the state we set it ACTIVE, while we keep existing
 	// tokens (if any).
@@ -13,8 +13,7 @@ func (r *Ruler) OnRingInstanceRegister(_ *ring.BasicLifecycler, ringDesc ring.De
 		tokens = instanceDesc.GetTokens()
 	}
 
-	takenTokens := ringDesc.GetTokens()
-	newTokens := ring.GenerateTokens(r.cfg.Ring.NumTokens-len(tokens), takenTokens)
+	newTokens := lc.GenerateTokens(&ringDesc, instanceID, instanceDesc.Zone, r.cfg.Ring.NumTokens-len(tokens), true)
 
 	// Tokens sorting will be enforced by the parent caller.
 	tokens = append(tokens, newTokens...)

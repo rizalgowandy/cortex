@@ -1,6 +1,6 @@
 // Package migrate reads migrations from sources and runs them against databases.
 // Sources are defined by the `source.Driver` and databases by the `database.Driver`
-// interface. The driver interfaces are kept "dump", all migration logic is kept
+// interface. The driver interfaces are kept "dumb", all migration logic is kept
 // in this package.
 package migrate
 
@@ -10,8 +10,6 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	"github.com/hashicorp/go-multierror"
 
 	"github.com/golang-migrate/migrate/v4/database"
 	iurl "github.com/golang-migrate/migrate/v4/internal/url"
@@ -56,10 +54,10 @@ func (e ErrDirty) Error() string {
 }
 
 type Migrate struct {
-	sourceName   string
-	sourceDrv    source.Driver
-	databaseName string
-	databaseDrv  database.Driver
+	sourceName         string
+	sourceDrv          source.Driver
+	databaseDriverName string
+	databaseDrv        database.Driver
 
 	// Log accepts a Logger interface
 	Log Logger
@@ -89,25 +87,25 @@ func New(sourceURL, databaseURL string) (*Migrate, error) {
 
 	sourceName, err := iurl.SchemeFromURL(sourceURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse scheme from source URL: %w", err)
 	}
 	m.sourceName = sourceName
 
-	databaseName, err := iurl.SchemeFromURL(databaseURL)
+	databaseDriverName, err := iurl.SchemeFromURL(databaseURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse scheme from database URL: %w", err)
 	}
-	m.databaseName = databaseName
+	m.databaseDriverName = databaseDriverName
 
 	sourceDrv, err := source.Open(sourceURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open source, %q: %w", sourceURL, err)
 	}
 	m.sourceDrv = sourceDrv
 
 	databaseDrv, err := database.Open(databaseURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 	m.databaseDrv = databaseDrv
 
@@ -116,9 +114,9 @@ func New(sourceURL, databaseURL string) (*Migrate, error) {
 
 // NewWithDatabaseInstance returns a new Migrate instance from a source URL
 // and an existing database instance. The source URL scheme is defined by each driver.
-// Use any string that can serve as an identifier during logging as databaseName.
+// Use any string that can serve as an identifier during logging as databaseDriverName.
 // You are responsible for closing the underlying database client if necessary.
-func NewWithDatabaseInstance(sourceURL string, databaseName string, databaseInstance database.Driver) (*Migrate, error) {
+func NewWithDatabaseInstance(sourceURL string, databaseDriverName string, databaseInstance database.Driver) (*Migrate, error) {
 	m := newCommon()
 
 	sourceName, err := iurl.SchemeFromURL(sourceURL)
@@ -127,11 +125,11 @@ func NewWithDatabaseInstance(sourceURL string, databaseName string, databaseInst
 	}
 	m.sourceName = sourceName
 
-	m.databaseName = databaseName
+	m.databaseDriverName = databaseDriverName
 
 	sourceDrv, err := source.Open(sourceURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open source, %q: %w", sourceURL, err)
 	}
 	m.sourceDrv = sourceDrv
 
@@ -147,17 +145,17 @@ func NewWithDatabaseInstance(sourceURL string, databaseName string, databaseInst
 func NewWithSourceInstance(sourceName string, sourceInstance source.Driver, databaseURL string) (*Migrate, error) {
 	m := newCommon()
 
-	databaseName, err := iurl.SchemeFromURL(databaseURL)
+	databaseDriverName, err := iurl.SchemeFromURL(databaseURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse scheme from database URL: %w", err)
 	}
-	m.databaseName = databaseName
+	m.databaseDriverName = databaseDriverName
 
 	m.sourceName = sourceName
 
 	databaseDrv, err := database.Open(databaseURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 	m.databaseDrv = databaseDrv
 
@@ -168,13 +166,13 @@ func NewWithSourceInstance(sourceName string, sourceInstance source.Driver, data
 
 // NewWithInstance returns a new Migrate instance from an existing source and
 // database instance. Use any string that can serve as an identifier during logging
-// as sourceName and databaseName. You are responsible for closing down
+// as sourceName and databaseDriverName. You are responsible for closing down
 // the underlying source and database client if necessary.
-func NewWithInstance(sourceName string, sourceInstance source.Driver, databaseName string, databaseInstance database.Driver) (*Migrate, error) {
+func NewWithInstance(sourceName string, sourceInstance source.Driver, databaseDriverName string, databaseInstance database.Driver) (*Migrate, error) {
 	m := newCommon()
 
 	m.sourceName = sourceName
-	m.databaseName = databaseName
+	m.databaseDriverName = databaseDriverName
 
 	m.sourceDrv = sourceInstance
 	m.databaseDrv = databaseInstance
@@ -487,7 +485,7 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 			}
 
 			prev, err := m.sourceDrv.Prev(suint(from))
-			if os.IsNotExist(err) && to == -1 {
+			if errors.Is(err, os.ErrNotExist) && to == -1 {
 				// apply nil migration
 				migr, err := m.newMigration(suint(from), -1)
 				if err != nil {
@@ -526,7 +524,7 @@ func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
 	}
 }
 
-// readUp reads up migrations from `from` limitted by `limit`.
+// readUp reads up migrations from `from` limited by `limit`.
 // limit can be -1, implying no limit and reading until there are no more migrations.
 // Each migration is then written to the ret channel.
 // If an error occurs during reading, that error is written to the ret channel, too.
@@ -580,7 +578,7 @@ func (m *Migrate) readUp(from int, limit int, ret chan<- interface{}) {
 
 		// apply next migration
 		next, err := m.sourceDrv.Next(suint(from))
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			// no limit, but no migrations applied?
 			if limit == -1 && count == 0 {
 				ret <- ErrNoChange
@@ -626,7 +624,7 @@ func (m *Migrate) readUp(from int, limit int, ret chan<- interface{}) {
 	}
 }
 
-// readDown reads down migrations from `from` limitted by `limit`.
+// readDown reads down migrations from `from` limited by `limit`.
 // limit can be -1, implying no limit and reading until there are no more migrations.
 // Each migration is then written to the ret channel.
 // If an error occurs during reading, that error is written to the ret channel, too.
@@ -666,7 +664,7 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 		}
 
 		prev, err := m.sourceDrv.Prev(suint(from))
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			// no limit or haven't reached limit, apply "first" migration
 			if limit == -1 || limit-count > 0 {
 				firstVersion, err := m.sourceDrv.First()
@@ -781,13 +779,13 @@ func (m *Migrate) versionExists(version uint) (result error) {
 	if err == nil {
 		defer func() {
 			if errClose := up.Close(); errClose != nil {
-				result = multierror.Append(result, errClose)
+				result = errors.Join(result, errClose)
 			}
 		}()
 	}
-	if os.IsExist(err) {
+	if errors.Is(err, os.ErrExist) {
 		return nil
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
@@ -796,18 +794,19 @@ func (m *Migrate) versionExists(version uint) (result error) {
 	if err == nil {
 		defer func() {
 			if errClose := down.Close(); errClose != nil {
-				result = multierror.Append(result, errClose)
+				result = errors.Join(result, errClose)
 			}
 		}()
 	}
-	if os.IsExist(err) {
+	if errors.Is(err, os.ErrExist) {
 		return nil
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
-	m.logErr(fmt.Errorf("no migration found for version %d", version))
-	return os.ErrNotExist
+	err = fmt.Errorf("no migration found for version %d: %w", version, err)
+	m.logErr(err)
+	return err
 }
 
 // stop returns true if no more migrations should be run against the database
@@ -835,7 +834,7 @@ func (m *Migrate) newMigration(version uint, targetVersion int) (*Migration, err
 
 	if targetVersion >= int(version) {
 		r, identifier, err := m.sourceDrv.ReadUp(version)
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			// create "empty" migration
 			migr, err = NewMigration(nil, "", version, targetVersion)
 			if err != nil {
@@ -855,7 +854,7 @@ func (m *Migrate) newMigration(version uint, targetVersion int) (*Migration, err
 
 	} else {
 		r, identifier, err := m.sourceDrv.ReadDown(version)
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			// create "empty" migration
 			migr, err = NewMigration(nil, "", version, targetVersion)
 			if err != nil {
@@ -953,7 +952,7 @@ func (m *Migrate) unlock() error {
 // if a prevErr is not nil.
 func (m *Migrate) unlockErr(prevErr error) error {
 	if err := m.unlock(); err != nil {
-		return multierror.Append(prevErr, err)
+		prevErr = errors.Join(prevErr, err)
 	}
 	return prevErr
 }

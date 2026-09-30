@@ -4,9 +4,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/require"
 	yaml "gopkg.in/yaml.v2"
+
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // defaultConfig should match the default flag values defined in RegisterFlagsWithPrefix.
@@ -65,7 +66,6 @@ max_connections_per_host: 8
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 
 		t.Run(testName, func(t *testing.T) {
 			cfg := Config{}

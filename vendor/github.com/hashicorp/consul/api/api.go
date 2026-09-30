@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
@@ -7,7 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -73,10 +76,37 @@ const (
 	// other ENV names we use.
 	GRPCAddrEnvName = "CONSUL_GRPC_ADDR"
 
+	// GRPCCAFileEnvName defines an environment variable name which sets the
+	// CA file to use for talking to Consul gRPC over TLS.
+	GRPCCAFileEnvName = "CONSUL_GRPC_CACERT"
+
+	// GRPCCAPathEnvName defines an environment variable name which sets the
+	// path to a directory of CA certs to use for talking to Consul gRPC over TLS.
+	GRPCCAPathEnvName = "CONSUL_GRPC_CAPATH"
+
 	// HTTPNamespaceEnvVar defines an environment variable name which sets
 	// the HTTP Namespace to be used by default. This can still be overridden.
 	HTTPNamespaceEnvName = "CONSUL_NAMESPACE"
+
+	// HTTPPartitionEnvName defines an environment variable name which sets
+	// the HTTP Partition to be used by default. This can still be overridden.
+	HTTPPartitionEnvName = "CONSUL_PARTITION"
+
+	// QueryBackendStreaming Query backend of type streaming
+	QueryBackendStreaming = "streaming"
+
+	// QueryBackendBlockingQuery Query backend of type blocking query
+	QueryBackendBlockingQuery = "blocking-query"
 )
+
+type StatusError struct {
+	Code int
+	Body string
+}
+
+func (e StatusError) Error() string {
+	return fmt.Sprintf("Unexpected response code: %d (%s)", e.Code, e.Body)
+}
 
 // QueryOptions are used to parameterize a query
 type QueryOptions struct {
@@ -84,9 +114,23 @@ type QueryOptions struct {
 	// Note: Namespaces are available only in Consul Enterprise
 	Namespace string
 
+	// Partition overrides the `default` partition
+	// Note: Partitions are available only in Consul Enterprise
+	Partition string
+
+	// SamenessGroup is used find the SamenessGroup in the given
+	// Partition and will find the failover order for the Service
+	// from the SamenessGroup Members, with the given Partition being
+	// the first member.
+	// Note: SamenessGroups are available only in Consul Enterprise
+	SamenessGroup string
+
 	// Providing a datacenter overwrites the DC provided
 	// by the Config
 	Datacenter string
+
+	// Providing a peer name in the query option
+	Peer string
 
 	// AllowStale allows any Consul server (non-leader) to service
 	// a read. This allows for lower latency and higher throughput
@@ -98,7 +142,7 @@ type QueryOptions struct {
 	RequireConsistent bool
 
 	// UseCache requests that the agent cache results locally. See
-	// https://www.consul.io/api/features/caching.html for more details on the
+	// https://developer.hashicorp.com/api/features/caching.html for more details on the
 	// semantics.
 	UseCache bool
 
@@ -108,14 +152,14 @@ type QueryOptions struct {
 	// returned. Clients that wish to allow for stale results on error can set
 	// StaleIfError to a longer duration to change this behavior. It is ignored
 	// if the endpoint supports background refresh caching. See
-	// https://www.consul.io/api/features/caching.html for more details.
+	// https://developer.hashicorp.com/api/features/caching.html for more details.
 	MaxAge time.Duration
 
 	// StaleIfError specifies how stale the client will accept a cached response
 	// if the servers are unavailable to fetch a fresh one. Only makes sense when
 	// UseCache is true and MaxAge is set to a lower, non-zero value. It is
 	// ignored if the endpoint supports background refresh caching. See
-	// https://www.consul.io/api/features/caching.html for more details.
+	// https://developer.hashicorp.com/api/features/caching.html for more details.
 	StaleIfError time.Duration
 
 	// WaitIndex is used to enable a blocking query. Waits
@@ -167,6 +211,16 @@ type QueryOptions struct {
 	// Filter requests filtering data prior to it being returned. The string
 	// is a go-bexpr compatible expression.
 	Filter string
+
+	// MergeCentralConfig returns a service definition merged with the
+	// proxy-defaults/global and service-defaults/:service config entries.
+	// This can be used to ensure a full service definition is returned in the response
+	// especially when the service might not be written into the catalog that way.
+	MergeCentralConfig bool
+
+	// Global is used to request information from all datacenters. Currently only
+	// used for operator usage requests.
+	Global bool
 }
 
 func (o *QueryOptions) Context() context.Context {
@@ -190,6 +244,10 @@ type WriteOptions struct {
 	// Namespace overrides the `default` namespace
 	// Note: Namespaces are available only in Consul Enterprise
 	Namespace string
+
+	// Partition overrides the `default` partition
+	// Note: Partitions are available only in Consul Enterprise
+	Partition string
 
 	// Providing a datacenter overwrites the DC provided
 	// by the Config
@@ -256,16 +314,27 @@ type QueryMeta struct {
 	// response is.
 	CacheAge time.Duration
 
+	// QueryBackend represent which backend served the request.
+	QueryBackend string
+
 	// DefaultACLPolicy is used to control the ACL interaction when there is no
 	// defined policy. This can be "allow" which means ACLs are used to
 	// deny-list, or "deny" which means ACLs are allow-lists.
 	DefaultACLPolicy string
+
+	// ResultsFilteredByACLs is true when some of the query's results were
+	// filtered out by enforcing ACLs. It may be false because nothing was
+	// removed, or because the endpoint does not yet support this flag.
+	ResultsFilteredByACLs bool
 }
 
 // WriteMeta is used to return meta data about a write
 type WriteMeta struct {
 	// How long did the request take
 	RequestTime time.Duration
+
+	// Warnings contains any warning messages from the server
+	Warnings []string
 }
 
 // HttpBasicAuth is used to authenticate http client with HTTP Basic Authentication
@@ -284,6 +353,11 @@ type Config struct {
 
 	// Scheme is the URI scheme for the Consul server
 	Scheme string
+
+	// Prefix for URIs for when consul is behind an API gateway (reverse
+	// proxy).  The API gateway must strip off the PathPrefix before
+	// passing the request onto consul.
+	PathPrefix string
 
 	// Datacenter to use. If not provided, the default agent datacenter is used.
 	Datacenter string
@@ -313,6 +387,10 @@ type Config struct {
 	// Namespace is the name of the namespace to send along for the request
 	// when no other Namespace is present in the QueryOptions
 	Namespace string
+
+	// Partition is the name of the partition to send along for the request
+	// when no other Partition is present in the QueryOptions
+	Partition string
 
 	TLSConfig TLSConfig
 }
@@ -393,7 +471,7 @@ func defaultConfig(logger hclog.Logger, transportFn func() *http.Transport) *Con
 	}
 
 	config := &Config{
-		Address:   "127.0.0.1:8500",
+		Address:   "localhost:8500",
 		Scheme:    "http",
 		Transport: transportFn(),
 	}
@@ -464,6 +542,10 @@ func defaultConfig(logger hclog.Logger, transportFn func() *http.Transport) *Con
 
 	if v := os.Getenv(HTTPNamespaceEnvName); v != "" {
 		config.Namespace = v
+	}
+
+	if v := os.Getenv(HTTPPartitionEnvName); v != "" {
+		config.Partition = v
 	}
 
 	return config
@@ -567,9 +649,7 @@ func (c *Client) Headers() http.Header {
 
 	ret := make(http.Header)
 	for k, v := range c.headers {
-		for _, val := range v {
-			ret[k] = append(ret[k], val)
-		}
+		ret[k] = append(ret[k], v...)
 	}
 
 	return ret
@@ -640,6 +720,14 @@ func NewClient(config *Config) (*Client, error) {
 		}
 	}
 
+	if config.Namespace == "" {
+		config.Namespace = defConfig.Namespace
+	}
+
+	if config.Partition == "" {
+		config.Partition = defConfig.Partition
+	}
+
 	parts := strings.SplitN(config.Address, "://", 2)
 	if len(parts) == 2 {
 		switch parts[0] {
@@ -661,25 +749,52 @@ func NewClient(config *Config) (*Client, error) {
 			return nil, fmt.Errorf("Unknown protocol scheme: %s", parts[0])
 		}
 		config.Address = parts[1]
+
+		// separate out a reverse proxy prefix, if it is present.
+		// NOTE: Rewriting this code to use url.Parse() instead of
+		// strings.SplitN() breaks existing test cases.
+		switch parts[0] {
+		case "http", "https":
+			parts := strings.SplitN(parts[1], "/", 2)
+			if len(parts) == 2 {
+				config.Address = parts[0]
+				config.PathPrefix = "/" + parts[1]
+			}
+		}
 	}
 
 	// If the TokenFile is set, always use that, even if a Token is configured.
 	// This is because when TokenFile is set it is read into the Token field.
 	// We want any derived clients to have to re-read the token file.
-	if config.TokenFile != "" {
-		data, err := ioutil.ReadFile(config.TokenFile)
+	// The precedence of ACL token should be:
+	// 1. -token-file cli option
+	// 2. -token cli option
+	// 3. CONSUL_HTTP_TOKEN_FILE environment variable
+	// 4. CONSUL_HTTP_TOKEN environment variable
+	if config.TokenFile != "" && config.TokenFile != defConfig.TokenFile {
+		data, err := os.ReadFile(config.TokenFile)
 		if err != nil {
-			return nil, fmt.Errorf("Error loading token file: %s", err)
+			return nil, fmt.Errorf("Error loading token file %s : %s", config.TokenFile, err)
 		}
 
 		if token := strings.TrimSpace(string(data)); token != "" {
 			config.Token = token
 		}
-	}
-	if config.Token == "" {
+	} else if config.Token != "" && defConfig.Token != config.Token {
+		// Fall through
+	} else if defConfig.TokenFile != "" {
+		data, err := os.ReadFile(defConfig.TokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("Error loading token file %s : %s", defConfig.TokenFile, err)
+		}
+
+		if token := strings.TrimSpace(string(data)); token != "" {
+			config.Token = token
+			config.TokenFile = defConfig.TokenFile
+		}
+	} else {
 		config.Token = defConfig.Token
 	}
-
 	return &Client{config: *config, headers: make(http.Header)}, nil
 }
 
@@ -730,10 +845,31 @@ func (r *request) setQueryOptions(q *QueryOptions) {
 		return
 	}
 	if q.Namespace != "" {
+		// For backwards-compatibility with existing tests,
+		// use the short-hand query param name "ns"
+		// rather than the alternative long-hand "namespace"
 		r.params.Set("ns", q.Namespace)
 	}
+	if q.Partition != "" {
+		// For backwards-compatibility with existing tests,
+		// use the long-hand query param name "partition"
+		// rather than the alternative short-hand "ap"
+		r.params.Set("partition", q.Partition)
+	}
+	if q.SamenessGroup != "" {
+		// For backwards-compatibility with existing tests,
+		// use the long-hand query param name "sameness-group"
+		// rather than the alternative short-hand "sg"
+		r.params.Set("sameness-group", q.SamenessGroup)
+	}
 	if q.Datacenter != "" {
+		// For backwards-compatibility with existing tests,
+		// use the short-hand query param name "dc"
+		// rather than the alternative long-hand "datacenter"
 		r.params.Set("dc", q.Datacenter)
+	}
+	if q.Peer != "" {
+		r.params.Set("peer", q.Peer)
 	}
 	if q.AllowStale {
 		r.params.Set("stale", "")
@@ -787,6 +923,12 @@ func (r *request) setQueryOptions(q *QueryOptions) {
 			r.header.Set("Cache-Control", strings.Join(cc, ", "))
 		}
 	}
+	if q.MergeCentralConfig {
+		r.params.Set("merge-central-config", "")
+	}
+	if q.Global {
+		r.params.Set("global", "")
+	}
 
 	r.ctx = q.ctx
 }
@@ -831,9 +973,16 @@ func (r *request) setWriteOptions(q *WriteOptions) {
 	if q == nil {
 		return
 	}
+	// For backwards-compatibility, continue to use the shorthand "ns"
+	// rather than "namespace"
 	if q.Namespace != "" {
 		r.params.Set("ns", q.Namespace)
 	}
+	if q.Partition != "" {
+		r.params.Set("partition", q.Partition)
+	}
+	// For backwards-compatibility, continue to use the shorthand "dc"
+	// rather than "datacenter"
 	if q.Datacenter != "" {
 		r.params.Set("dc", q.Datacenter)
 	}
@@ -866,18 +1015,30 @@ func (r *request) toHTTP() (*http.Request, error) {
 		return nil, err
 	}
 
+	// validate that socket communications that do not use the host, detect
+	// slashes in the host name and replace it with local host.
+	// this is required since go started validating req.host in 1.20.6 and 1.19.11.
+	// prior to that they would strip out the slashes for you.  They removed that
+	// behavior and added more strict validation as part of a CVE.
+	// This issue is being tracked by the Go team:
+	// https://github.com/golang/go/issues/61431
+	// If there is a resolution in this issue, we will remove this code.
+	// In the time being, this is the accepted workaround.
+	if strings.HasPrefix(r.url.Host, "/") {
+		r.url.Host = "localhost"
+	}
+
 	req.URL.Host = r.url.Host
 	req.URL.Scheme = r.url.Scheme
 	req.Host = r.url.Host
 	req.Header = r.header
 
 	// Content-Type must always be set when a body is present
-	// See https://github.com/hashicorp/consul/issues/10011
 	if req.Body != nil && req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	}
 
-	// Setup auth
+	// Check for a token
 	if r.config.HttpAuth != nil {
 		req.SetBasicAuth(r.config.HttpAuth.Username, r.config.HttpAuth.Password)
 	}
@@ -896,7 +1057,7 @@ func (c *Client) newRequest(method, path string) *request {
 		url: &url.URL{
 			Scheme: c.config.Scheme,
 			Host:   c.config.Address,
-			Path:   path,
+			Path:   c.config.PathPrefix + path,
 		},
 		params: make(map[string][]string),
 		header: c.Headers(),
@@ -907,6 +1068,9 @@ func (c *Client) newRequest(method, path string) *request {
 	}
 	if c.config.Namespace != "" {
 		r.params.Set("ns", c.config.Namespace)
+	}
+	if c.config.Partition != "" {
+		r.params.Set("partition", c.config.Partition)
 	}
 	if c.config.WaitTime != 0 {
 		r.params.Set("wait", durToMsec(r.config.WaitTime))
@@ -923,8 +1087,23 @@ func (c *Client) doRequest(r *request) (time.Duration, *http.Response, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+
+	contentType := GetContentType(req)
+
+	if req != nil {
+		req.Header.Set(contentTypeHeader, contentType)
+	}
+
 	start := time.Now()
 	resp, err := c.config.HttpClient.Do(req)
+
+	if resp != nil {
+		respContentType := resp.Header.Get(contentTypeHeader)
+		if respContentType == "" || respContentType != contentType {
+			resp.Header.Set(contentTypeHeader, contentType)
+		}
+	}
+
 	diff := time.Since(start)
 	return diff, resp, err
 }
@@ -940,7 +1119,9 @@ func (c *Client) query(endpoint string, out interface{}, q *QueryOptions) (*Quer
 		return nil, err
 	}
 	defer closeResponseBody(resp)
-
+	if err := requireOK(resp); err != nil {
+		return nil, err
+	}
 	qm := &QueryMeta{}
 	parseQueryMeta(resp, qm)
 	qm.RequestTime = rtt
@@ -957,20 +1138,52 @@ func (c *Client) write(endpoint string, in, out interface{}, q *WriteOptions) (*
 	r := c.newRequest("PUT", endpoint)
 	r.setWriteOptions(q)
 	r.obj = in
-	rtt, resp, err := requireOK(c.doRequest(r))
+	rtt, resp, err := c.doRequest(r)
 	if err != nil {
 		return nil, err
 	}
 	defer closeResponseBody(resp)
+	if err := requireOK(resp); err != nil {
+		return nil, err
+	}
 
 	wm := &WriteMeta{RequestTime: rtt}
+
+	// Check for warning headers
+	if warning := resp.Header.Get("X-Consul-KV-Warning"); warning != "" {
+		wm.Warnings = append(wm.Warnings, warning)
+	}
+
 	if out != nil {
 		if err := decodeBody(resp, &out); err != nil {
 			return nil, err
 		}
-	} else if _, err := ioutil.ReadAll(resp.Body); err != nil {
+	} else if _, err := io.ReadAll(resp.Body); err != nil {
 		return nil, err
 	}
+	return wm, nil
+}
+
+// delete is used to do a DELETE request against an endpoint
+func (c *Client) delete(endpoint string, q *QueryOptions) (*WriteMeta, error) {
+	r := c.newRequest("DELETE", endpoint)
+	r.setQueryOptions(q)
+	rtt, resp, err := c.doRequest(r)
+	if err != nil {
+		return nil, err
+	}
+	defer closeResponseBody(resp)
+	if err = requireHttpCodes(resp, 204, 200); err != nil {
+		return nil, err
+	}
+
+	wm := &WriteMeta{RequestTime: rtt}
+
+	// Check for warning headers
+	if warning := resp.Header.Get("X-Consul-KV-Warning"); warning != "" {
+		wm.Warnings = append(wm.Warnings, warning)
+	}
+
 	return wm, nil
 }
 
@@ -996,6 +1209,9 @@ func parseQueryMeta(resp *http.Response, q *QueryMeta) error {
 	if err != nil {
 		return fmt.Errorf("Failed to parse X-Consul-LastContact: %v", err)
 	}
+	if last > math.MaxInt64 {
+		return fmt.Errorf("X-Consul-LastContact Header value is out of range: %d", last)
+	}
 	q.LastContact = time.Duration(last) * time.Millisecond
 
 	// Parse the X-Consul-KnownLeader
@@ -1020,6 +1236,14 @@ func parseQueryMeta(resp *http.Response, q *QueryMeta) error {
 		q.DefaultACLPolicy = v
 	}
 
+	// Parse the X-Consul-Results-Filtered-By-ACLs
+	switch header.Get("X-Consul-Results-Filtered-By-ACLs") {
+	case "true":
+		q.ResultsFilteredByACLs = true
+	default:
+		q.ResultsFilteredByACLs = false
+	}
+
 	// Parse Cache info
 	if cacheStr := header.Get("X-Cache"); cacheStr != "" {
 		q.CacheHit = strings.EqualFold(cacheStr, "HIT")
@@ -1029,9 +1253,16 @@ func parseQueryMeta(resp *http.Response, q *QueryMeta) error {
 		if err != nil {
 			return fmt.Errorf("Failed to parse Age Header: %v", err)
 		}
+		if age > math.MaxInt64 {
+			return fmt.Errorf("Age Header value is out of range: %d", last)
+		}
 		q.CacheAge = time.Duration(age) * time.Second
 	}
 
+	switch v := header.Get("X-Consul-Query-Backend"); v {
+	case QueryBackendStreaming, QueryBackendBlockingQuery:
+		q.QueryBackend = v
+	}
 	return nil
 }
 
@@ -1052,24 +1283,29 @@ func encodeBody(obj interface{}) (io.Reader, error) {
 }
 
 // requireOK is used to wrap doRequest and check for a 200
-func requireOK(d time.Duration, resp *http.Response, e error) (time.Duration, *http.Response, error) {
-	if e != nil {
-		if resp != nil {
-			closeResponseBody(resp)
+func requireOK(resp *http.Response) error {
+	return requireHttpCodes(resp, 200)
+}
+
+// requireHttpCodes checks for the "allowable" http codes for a response
+func requireHttpCodes(resp *http.Response, httpCodes ...int) error {
+	// if there is an http code that we require, return w no error
+	for _, httpCode := range httpCodes {
+		if resp.StatusCode == httpCode {
+			return nil
 		}
-		return d, nil, e
 	}
-	if resp.StatusCode != 200 {
-		return d, nil, generateUnexpectedResponseCodeError(resp)
-	}
-	return d, resp, nil
+
+	// if we reached here, then none of the http codes in resp matched any that we expected
+	// so err out
+	return generateUnexpectedResponseCodeError(resp)
 }
 
 // closeResponseBody reads resp.Body until EOF, and then closes it. The read
 // is necessary to ensure that the http.Client's underlying RoundTripper is able
 // to re-use the TCP connection. See godoc on net/http.Client.Do.
 func closeResponseBody(resp *http.Response) error {
-	_, _ = io.Copy(ioutil.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.Body.Close()
 }
 
@@ -1088,22 +1324,18 @@ func generateUnexpectedResponseCodeError(resp *http.Response) error {
 	var buf bytes.Buffer
 	io.Copy(&buf, resp.Body)
 	closeResponseBody(resp)
-	return fmt.Errorf("Unexpected response code: %d (%s)", resp.StatusCode, buf.Bytes())
+
+	trimmed := strings.TrimSpace(buf.String())
+	return StatusError{Code: resp.StatusCode, Body: trimmed}
 }
 
-func requireNotFoundOrOK(d time.Duration, resp *http.Response, e error) (bool, time.Duration, *http.Response, error) {
-	if e != nil {
-		if resp != nil {
-			closeResponseBody(resp)
-		}
-		return false, d, nil, e
-	}
+func requireNotFoundOrOK(resp *http.Response) (bool, *http.Response, error) {
 	switch resp.StatusCode {
 	case 200:
-		return true, d, resp, nil
+		return true, resp, nil
 	case 404:
-		return false, d, resp, nil
+		return false, resp, nil
 	default:
-		return false, d, nil, generateUnexpectedResponseCodeError(resp)
+		return false, nil, generateUnexpectedResponseCodeError(resp)
 	}
 }

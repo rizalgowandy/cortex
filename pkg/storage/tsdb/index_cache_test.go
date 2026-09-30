@@ -1,10 +1,12 @@
 package tsdb
 
 import (
+	"fmt"
 	"testing"
 
-	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func TestIndexCacheConfig_Validate(t *testing.T) {
@@ -29,15 +31,50 @@ func TestIndexCacheConfig_Validate(t *testing.T) {
 			cfg: IndexCacheConfig{
 				Backend: "memcached",
 			},
-			expected: errNoIndexCacheAddresses,
+			expected: errNoCacheAddresses,
 		},
 		"one memcached address should pass": {
 			cfg: IndexCacheConfig{
 				Backend: "memcached",
-				Memcached: MemcachedClientConfig{
-					Addresses: "dns+localhost:11211",
+				Memcached: MemcachedIndexCacheConfig{
+					ClientConfig: MemcachedClientConfig{
+						Addresses: "dns+localhost:11211",
+					},
 				},
 			},
+		},
+		"invalid enabled items memcached": {
+			cfg: IndexCacheConfig{
+				Backend: "memcached",
+				Memcached: MemcachedIndexCacheConfig{
+					ClientConfig: MemcachedClientConfig{
+						Addresses: "dns+localhost:11211",
+					},
+					EnabledItems: []string{"foo", "bar"},
+				},
+			},
+			expected: fmt.Errorf("unsupported item type foo"),
+		},
+		"invalid enabled items inmemory": {
+			cfg: IndexCacheConfig{
+				Backend: "inmemory",
+				InMemory: InMemoryIndexCacheConfig{
+					EnabledItems: []string{"foo", "bar"},
+				},
+			},
+			expected: fmt.Errorf("unsupported item type foo"),
+		},
+		"invalid enabled items redis": {
+			cfg: IndexCacheConfig{
+				Backend: "redis",
+				Redis: RedisIndexCacheConfig{
+					ClientConfig: RedisClientConfig{
+						Addresses: "test",
+					},
+					EnabledItems: []string{"foo", "bar"},
+				},
+			},
+			expected: fmt.Errorf("unsupported item type foo"),
 		},
 	}
 

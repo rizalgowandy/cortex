@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -14,27 +14,23 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/concurrency"
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/kv/consul"
-	"github.com/grafana/dskit/ring"
-	"github.com/grafana/dskit/services"
+	"github.com/prometheus/alertmanager/alert"
 	"github.com/prometheus/alertmanager/cluster/clusterpb"
 	"github.com/prometheus/alertmanager/notify"
-	"github.com/prometheus/alertmanager/pkg/labels"
-	"github.com/prometheus/alertmanager/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
@@ -45,9 +41,16 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
+	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/local"
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
+	"github.com/cortexproject/cortex/pkg/util/users"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -72,23 +75,16 @@ func mockAlertmanagerConfig(t *testing.T) *MultitenantAlertmanagerConfig {
 	err := externalURL.Set("http://localhost/api/prom")
 	require.NoError(t, err)
 
-	tempDir, err := ioutil.TempDir(os.TempDir(), "alertmanager")
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		err := os.RemoveAll(tempDir)
-		require.NoError(t, err)
-	})
-
 	cfg := &MultitenantAlertmanagerConfig{}
 	flagext.DefaultValues(cfg)
 
 	cfg.ExternalURL = externalURL
-	cfg.DataDir = tempDir
+	cfg.DataDir = t.TempDir()
 	cfg.ShardingRing.InstanceID = "test"
 	cfg.ShardingRing.InstanceAddr = "127.0.0.1"
 	cfg.PollInterval = time.Minute
-
+	cfg.ShardingRing.FinalSleep = 0
+	cfg.GCInterval = 30 * time.Minute
 	return cfg
 }
 
@@ -146,13 +142,6 @@ func TestMultitenantAlertmanagerConfig_Validate(t *testing.T) {
 			},
 			expected: errShardingUnsupportedStorage,
 		},
-		"should fail if sharding enabled and legacy store configuration given": {
-			setup: func(t *testing.T, cfg *MultitenantAlertmanagerConfig, storageCfg *alertstore.Config) {
-				cfg.ShardingEnabled = true
-				cfg.Store.Type = "s3"
-			},
-			expected: errShardingLegacyStorage,
-		},
 		"should fail if zone aware is enabled but zone is not set": {
 			setup: func(t *testing.T, cfg *MultitenantAlertmanagerConfig, storageCfg *alertstore.Config) {
 				cfg.ShardingEnabled = true
@@ -174,11 +163,55 @@ func TestMultitenantAlertmanagerConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestMultitenantAlertmanager_loadAndSyncConfigsLocalStorage(t *testing.T) {
+	storeDir := t.TempDir()
+	store, _ := local.NewStore(local.StoreConfig{Path: storeDir})
+	config := `global:
+  resolve_timeout: 1m
+  smtp_require_tls: false
+
+route:
+  receiver: 'email'
+
+receivers:
+- name: 'email'
+  email_configs:
+  - to: test@example.com
+    from: test@example.com
+    smarthost: smtp:2525
+`
+	user1Dir, user1TemplateDir := prepareUserDir(t, storeDir, "user-1")
+	user2Dir, _ := prepareUserDir(t, storeDir, "user-2")
+	require.NoError(t, os.WriteFile(filepath.Join(user1Dir, "user-1.yaml"), []byte(config), os.ModePerm))
+	require.NoError(t, os.WriteFile(filepath.Join(user2Dir, "user-2.yaml"), []byte(config), os.ModePerm))
+	require.NoError(t, os.WriteFile(filepath.Join(user1TemplateDir, "template.tpl"), []byte("testTemplate"), os.ModePerm))
+
+	originalFiles, err := listFiles(storeDir)
+	require.NoError(t, err)
+	require.Equal(t, 3, len(originalFiles))
+
+	cfg := mockAlertmanagerConfig(t)
+	cfg.DataDir = storeDir
+	reg := prometheus.NewPedanticRegistry()
+	am, err := createMultitenantAlertmanager(cfg, nil, nil, store, nil, nil, log.NewNopLogger(), reg)
+	require.NoError(t, err)
+	for range 5 {
+		err = am.loadAndSyncConfigs(context.Background(), reasonPeriodic)
+		require.NoError(t, err)
+		require.Len(t, am.alertmanagers, 2)
+		files, err := listFiles(storeDir)
+		require.NoError(t, err)
+		// Verify if the files were not deleted
+		require.Equal(t, originalFiles, files)
+	}
+}
+
 func TestMultitenantAlertmanager_loadAndSyncConfigs(t *testing.T) {
 	ctx := context.Background()
 
 	// Run this test using a real storage client.
-	store := prepareInMemoryAlertStore()
+	store, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 	require.NoError(t, store.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
 		User:      "user1",
 		RawConfig: simpleConfigOne,
@@ -192,6 +225,11 @@ func TestMultitenantAlertmanager_loadAndSyncConfigs(t *testing.T) {
 
 	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
+
+	// Using a relative directory here instead of a fully qualified one to test that files are cleaned up properly
+	relativeTmpDir := "TestMultitenantAlertmanager_loadAndSyncConfigs"
+	cfg.DataDir = relativeTmpDir
+
 	am, err := createMultitenantAlertmanager(cfg, nil, nil, store, nil, nil, log.NewNopLogger(), reg)
 	require.NoError(t, err)
 
@@ -336,9 +374,16 @@ templates:
 	require.True(t, dirExists(t, user3Dir))
 	require.True(t, fileExists(t, filepath.Join(user3Dir, templatesDir, "first.tpl")))
 	require.False(t, fileExists(t, filepath.Join(user3Dir, templatesDir, "second.tpl")))
+
+	// Cleaning up relative tmp directory
+	err = os.RemoveAll(relativeTmpDir)
+	require.NoError(t, err)
 }
 
 func TestMultitenantAlertmanager_FirewallShouldBlockHTTPBasedReceiversWhenEnabled(t *testing.T) {
+	// TODO: Pushover is probably blocked by the firewall already (it uses httpOpts with the firewall dialer),
+	// but we can't test it here because it has a hardcoded API URL (https://api.pushover.net/1/messages.json)
+	// with no configuration option to redirect requests to our test server.
 	tests := map[string]struct {
 		getAlertmanagerConfig func(backendURL string) string
 	}{
@@ -422,6 +467,189 @@ receivers:
 `, backendURL)
 			},
 		},
+		"msteams": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: msteams
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: msteams
+    msteams_configs:
+      - webhook_url: %s
+`, backendURL)
+			},
+		},
+		"msteamsv2": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: msteamsv2
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: msteamsv2
+    msteamsv2_configs:
+      - webhook_url: %s
+`, backendURL)
+			},
+		},
+		"jira": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: jira
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: jira
+    jira_configs:
+      - api_url: %s
+        project: test-project
+        issue_type: Incident
+`, backendURL)
+			},
+		},
+		"rocketchat": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: rocketchat
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: rocketchat
+    rocketchat_configs:
+      - api_url: %s
+        token: token
+        token_id: token-id
+`, backendURL)
+			},
+		},
+		"mattermost": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: mattermost
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: mattermost
+    mattermost_configs:
+      - webhook_url: %s
+`, backendURL)
+			},
+		},
+		"discord": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: discord
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: discord
+    discord_configs:
+      - webhook_url: %s
+`, backendURL)
+			},
+		},
+		"incidentio": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: incidentio
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: incidentio
+    incidentio_configs:
+      - url: %s
+        alert_source_token: secret
+`, backendURL)
+			},
+		},
+		"victorops": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: victorops
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: victorops
+    victorops_configs:
+      - api_url: %s
+        api_key: secret
+        routing_key: test-route
+`, backendURL)
+			},
+		},
+		"telegram": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: telegram
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: telegram
+    telegram_configs:
+      - api_url: %s
+        bot_token: secret
+        chat_id: 12345
+`, backendURL)
+			},
+		},
+		"sns": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: sns
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: sns
+    sns_configs:
+      - api_url: %s
+        topic_arn: arn:aws:sns:us-east-1:123456789012:test
+        sigv4:
+          region: us-east-1
+          access_key: test-access-key
+          secret_key: test-secret-key
+`, backendURL)
+			},
+		},
+		"webex": {
+			getAlertmanagerConfig: func(backendURL string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: webex
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: webex
+    webex_configs:
+      - api_url: %s
+        room_id: test-room
+        http_config:
+          authorization:
+            credentials: secret
+`, backendURL)
+			},
+		},
 	}
 
 	for receiverName, testData := range tests {
@@ -448,7 +676,8 @@ receivers:
 				alertmanagerCfg := testData.getAlertmanagerConfig(fmt.Sprintf("http://%s", server.Listener.Addr().String()))
 
 				// Store the alertmanager config in the bucket.
-				store := prepareInMemoryAlertStore()
+				store, err := prepareInMemoryAlertStore()
+				require.NoError(t, err)
 				require.NoError(t, store.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
 					User:      userID,
 					RawConfig: alertmanagerCfg,
@@ -462,8 +691,7 @@ receivers:
 				flagext.DefaultValues(&limits)
 				limits.AlertmanagerReceiversBlockPrivateAddresses = firewallEnabled
 
-				overrides, err := validation.NewOverrides(limits, nil)
-				require.NoError(t, err)
+				overrides := validation.NewOverrides(limits, nil)
 
 				// Start the alertmanager.
 				reg := prometheus.NewPedanticRegistry()
@@ -484,12 +712,10 @@ receivers:
 	`), "cortex_alertmanager_config_last_reload_successful"))
 
 				// Create an alert to push.
-				alerts := types.Alerts(&types.Alert{
-					Alert: model.Alert{
-						Labels:   map[model.LabelName]model.LabelValue{model.AlertNameLabel: "test"},
-						StartsAt: time.Now().Add(-time.Minute),
-						EndsAt:   time.Now().Add(time.Minute),
-					},
+				alerts := alert.Alerts(&alert.Alert{
+					Labels:    map[model.LabelName]model.LabelValue{model.AlertNameLabel: "test"},
+					StartsAt:  time.Now().Add(-time.Minute),
+					EndsAt:    time.Now().Add(time.Minute),
 					UpdatedAt: time.Now(),
 					Timeout:   false,
 				})
@@ -498,7 +724,7 @@ receivers:
 				require.NoError(t, err)
 
 				// Push an alert.
-				req := httptest.NewRequest(http.MethodPost, cfg.ExternalURL.String()+"/api/v1/alerts", bytes.NewReader(alertsPayload))
+				req := httptest.NewRequest(http.MethodPost, cfg.ExternalURL.String()+"/api/v2/alerts", bytes.NewReader(alertsPayload))
 				req.Header.Set("content-type", "application/json")
 				reqCtx := user.InjectOrgID(req.Context(), userID)
 				{
@@ -506,7 +732,7 @@ receivers:
 					am.ServeHTTP(w, req.WithContext(reqCtx))
 
 					resp := w.Result()
-					_, err := ioutil.ReadAll(resp.Body)
+					_, err := io.ReadAll(resp.Body)
 					require.NoError(t, err)
 					assert.Equal(t, http.StatusOK, w.Code)
 				}
@@ -514,10 +740,8 @@ receivers:
 				// Ensure the server endpoint has not been called if firewall is enabled. Since the alert is delivered
 				// asynchronously, we should pool it for a short period.
 				deadline := time.Now().Add(3 * time.Second)
-				for {
-					if time.Now().After(deadline) || serverInvoked.Load() {
-						break
-					}
+				for !time.Now().After(deadline) && !serverInvoked.Load() {
+
 					time.Sleep(100 * time.Millisecond)
 				}
 
@@ -528,39 +752,6 @@ receivers:
 			})
 		}
 	}
-}
-
-func TestMultitenantAlertmanager_migrateStateFilesToPerTenantDirectories(t *testing.T) {
-	ctx := context.Background()
-
-	const (
-		user1 = "user1"
-		user2 = "user2"
-	)
-
-	store := prepareInMemoryAlertStore()
-	require.NoError(t, store.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
-		User:      user2,
-		RawConfig: simpleConfigOne,
-		Templates: []*alertspb.TemplateDesc{},
-	}))
-
-	reg := prometheus.NewPedanticRegistry()
-	cfg := mockAlertmanagerConfig(t)
-	am, err := createMultitenantAlertmanager(cfg, nil, nil, store, nil, nil, log.NewNopLogger(), reg)
-	require.NoError(t, err)
-
-	createFile(t, filepath.Join(cfg.DataDir, "nflog:"+user1))
-	createFile(t, filepath.Join(cfg.DataDir, "silences:"+user1))
-	createFile(t, filepath.Join(cfg.DataDir, "nflog:"+user2))
-	createFile(t, filepath.Join(cfg.DataDir, "templates", user2, "template.tpl"))
-
-	require.NoError(t, am.migrateStateFilesToPerTenantDirectories())
-	require.True(t, fileExists(t, filepath.Join(cfg.DataDir, user1, notificationLogSnapshot)))
-	require.True(t, fileExists(t, filepath.Join(cfg.DataDir, user1, silencesSnapshot)))
-	require.True(t, fileExists(t, filepath.Join(cfg.DataDir, user2, notificationLogSnapshot)))
-	require.True(t, dirExists(t, filepath.Join(cfg.DataDir, user2, templatesDir)))
-	require.True(t, fileExists(t, filepath.Join(cfg.DataDir, user2, templatesDir, "template.tpl")))
 }
 
 func fileExists(t *testing.T, path string) bool {
@@ -592,7 +783,8 @@ func TestMultitenantAlertmanager_deleteUnusedLocalUserState(t *testing.T) {
 		user2 = "user2"
 	)
 
-	store := prepareInMemoryAlertStore()
+	store, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 	require.NoError(t, store.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
 		User:      user2,
 		RawConfig: simpleConfigOne,
@@ -627,7 +819,8 @@ func TestMultitenantAlertmanager_deleteUnusedLocalUserState(t *testing.T) {
 
 func TestMultitenantAlertmanager_zoneAwareSharding(t *testing.T) {
 	ctx := context.Background()
-	alertStore := prepareInMemoryAlertStore()
+	alertStore, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -666,6 +859,15 @@ func TestMultitenantAlertmanager_zoneAwareSharding(t *testing.T) {
 	am1ZoneA := createInstance(1, "zoneA", registriesZoneA)
 	am2ZoneA := createInstance(2, "zoneA", registriesZoneA)
 	am1ZoneB := createInstance(3, "zoneB", registriesZoneB)
+
+	// Wait until every instance's ring client sees all the instances, otherwise
+	// ownership is computed against a partial ring view and tenants may get
+	// double-counted.
+	for _, am := range []*MultitenantAlertmanager{am1ZoneA, am2ZoneA, am1ZoneB} {
+		test.Poll(t, 5*time.Second, 3, func() any {
+			return am.ring.InstancesCount()
+		})
+	}
 
 	{
 		require.NoError(t, alertStore.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
@@ -707,7 +909,8 @@ func TestMultitenantAlertmanager_deleteUnusedRemoteUserState(t *testing.T) {
 		user2 = "user2"
 	)
 
-	alertStore := prepareInMemoryAlertStore()
+	alertStore, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -815,12 +1018,13 @@ func TestMultitenantAlertmanager_NoExternalURL(t *testing.T) {
 
 func TestMultitenantAlertmanager_ServeHTTP(t *testing.T) {
 	// Run this test using a real storage client.
-	store := prepareInMemoryAlertStore()
+	store, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 
 	amConfig := mockAlertmanagerConfig(t)
 
 	externalURL := flagext.URLValue{}
-	err := externalURL.Set("http://localhost:8080/alertmanager")
+	err = externalURL.Set("http://localhost:8080/alertmanager")
 	require.NoError(t, err)
 
 	amConfig.ExternalURL = externalURL
@@ -842,7 +1046,7 @@ func TestMultitenantAlertmanager_ServeHTTP(t *testing.T) {
 		am.ServeHTTP(w, req.WithContext(ctx))
 
 		resp := w.Result()
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		require.Equal(t, 404, w.Code)
 		require.Equal(t, "the Alertmanager is not configured\n", string(body))
 	}
@@ -901,7 +1105,7 @@ func TestMultitenantAlertmanager_ServeHTTP(t *testing.T) {
 		am.ServeHTTP(w, req.WithContext(ctx))
 
 		resp := w.Result()
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		require.Equal(t, 404, w.Code)
 		require.Equal(t, "the Alertmanager is not configured\n", string(body))
 	}
@@ -920,10 +1124,11 @@ func TestMultitenantAlertmanager_ServeHTTPWithFallbackConfig(t *testing.T) {
 	amConfig := mockAlertmanagerConfig(t)
 
 	// Run this test using a real storage client.
-	store := prepareInMemoryAlertStore()
+	store, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 
 	externalURL := flagext.URLValue{}
-	err := externalURL.Set("http://localhost:8080/alertmanager")
+	err = externalURL.Set("http://localhost:8080/alertmanager")
 	require.NoError(t, err)
 
 	fallbackCfg := `
@@ -948,7 +1153,7 @@ receivers:
 	defer services.StopAndAwaitTerminated(ctx, am) //nolint:errcheck
 
 	// Request when no user configuration is present.
-	req := httptest.NewRequest("GET", externalURL.String()+"/api/v1/status", nil)
+	req := httptest.NewRequest("GET", externalURL.String()+"/api/v2/status", nil)
 	w := httptest.NewRecorder()
 
 	am.ServeHTTP(w, req.WithContext(user.InjectOrgID(req.Context(), "user1")))
@@ -983,7 +1188,62 @@ receivers:
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
+// TestMultitenantAlertmanager_NoFallbackCreateAfterShutdown verifies that a
+// request hitting the fallback lazy-create path after shutdown has begun does
+// not register (and leak) a new per-tenant Alertmanager: stopping() only stops
+// the alertmanagers present in the map when it runs, so one created afterwards
+// would never be stopped. serveRequest is exercised directly because requests
+// can reach it without passing ServeHTTP's service-state check (e.g. via the
+// gRPC HandleRequest path when sharding is enabled), or after passing that
+// check just before the state transition.
+func TestMultitenantAlertmanager_NoFallbackCreateAfterShutdown(t *testing.T) {
+	ctx := context.Background()
+	amConfig := mockAlertmanagerConfig(t)
+
+	// Run this test using a real storage client.
+	store, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
+
+	externalURL := flagext.URLValue{}
+	err = externalURL.Set("http://localhost:8080/alertmanager")
+	require.NoError(t, err)
+
+	fallbackCfg := `
+global:
+  smtp_smarthost: 'localhost:25'
+  smtp_from: 'youraddress@example.org'
+route:
+  receiver: example-email
+receivers:
+  - name: example-email
+    email_configs:
+    - to: 'youraddress@example.org'
+`
+	amConfig.ExternalURL = externalURL
+
+	// Create the Multitenant Alertmanager.
+	am, err := createMultitenantAlertmanager(amConfig, nil, nil, store, nil, nil, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+	am.fallbackConfig = fallbackCfg
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, am))
+
+	// Shut it down. No per-tenant alertmanager was ever created.
+	require.NoError(t, services.StopAndAwaitTerminated(ctx, am))
+
+	// A request for an unconfigured tenant must not lazily create a new
+	// per-tenant Alertmanager anymore.
+	req := httptest.NewRequest("GET", externalURL.String()+"/api/v2/status", nil)
+	w := httptest.NewRecorder()
+	am.serveRequest(w, req.WithContext(user.InjectOrgID(req.Context(), "user1")))
+
+	resp := w.Result()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Empty(t, am.alertmanagers)
+}
+
 func TestMultitenantAlertmanager_InitialSyncWithSharding(t *testing.T) {
+	tg := ring.NewRandomTokenGenerator()
 	tc := []struct {
 		name          string
 		existing      bool
@@ -1010,7 +1270,7 @@ func TestMultitenantAlertmanager_InitialSyncWithSharding(t *testing.T) {
 			name:          "with an instance already in the ring with ACTIVE state and all tokens",
 			existing:      true,
 			initialState:  ring.ACTIVE,
-			initialTokens: ring.GenerateTokens(128, nil),
+			initialTokens: tg.GenerateTokens(ring.NewDesc(), "id1", "", 128, true),
 		},
 		{
 			name:          "with an instance already in the ring with LEAVING state and all tokens",
@@ -1030,11 +1290,14 @@ func TestMultitenantAlertmanager_InitialSyncWithSharding(t *testing.T) {
 
 			// Use an alert store with a mocked backend.
 			bkt := &bucket.ClientMock{}
-			alertStore := bucketclient.NewBucketAlertStore(bkt, nil, log.NewNopLogger())
+			usersScannerConfig := users.UsersScannerConfig{Strategy: users.UserScanStrategyList}
+			reg := prometheus.NewPedanticRegistry()
+			alertStore, err := bucketclient.NewBucketAlertStore(bkt, usersScannerConfig, nil, log.NewNopLogger(), reg)
+			require.NoError(t, err)
 
 			// Setup the initial instance state in the ring.
 			if tt.existing {
-				require.NoError(t, ringStore.CAS(ctx, RingKey, func(in interface{}) (interface{}, bool, error) {
+				require.NoError(t, ringStore.CAS(ctx, RingKey, func(in any) (any, bool, error) {
 					ringDesc := ring.GetOrCreateRingDesc(in)
 					ringDesc.AddIngester(amConfig.ShardingRing.InstanceID, amConfig.ShardingRing.InstanceAddr, "", tt.initialTokens, tt.initialState, time.Now())
 					return ringDesc, true, nil
@@ -1057,6 +1320,7 @@ func TestMultitenantAlertmanager_InitialSyncWithSharding(t *testing.T) {
 				require.True(t, am.ringLifecycler.IsRegistered())
 				require.Equal(t, ring.JOINING.String(), am.ringLifecycler.GetState().String())
 			})
+			bkt.MockIter("alerts/__markers__", nil, nil)
 			bkt.MockIter("alertmanager/", nil, nil)
 
 			// Once successfully started, the instance should be ACTIVE in the ring.
@@ -1072,6 +1336,9 @@ func TestMultitenantAlertmanager_InitialSyncWithSharding(t *testing.T) {
 }
 
 func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
+	externalURL := flagext.URLValue{}
+	err := externalURL.Set("http://localhost:8080/alertmanager")
+	require.NoError(t, err)
 	tc := []struct {
 		name              string
 		tenantShardSize   int
@@ -1080,12 +1347,41 @@ func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
 		configs           int
 		expectedTenants   int
 		withSharding      bool
+		enabledTenants    []string
+		disabledTenants   []string
+		statusCode        func(user string) int
 	}{
 		{
 			name:            "sharding disabled, 1 instance",
 			instances:       1,
 			configs:         10,
 			expectedTenants: 10,
+		},
+		{
+			name:            "sharding disabled, 1 instance, single user allowed",
+			instances:       1,
+			configs:         10,
+			expectedTenants: 1,
+			enabledTenants:  []string{"u-1"},
+			statusCode: func(user string) int {
+				if user == "u-1" {
+					return http.StatusOK
+				}
+				return http.StatusUnauthorized
+			},
+		},
+		{
+			name:            "sharding disabled, 1 instance, single user disabled",
+			instances:       1,
+			configs:         10,
+			expectedTenants: 9,
+			disabledTenants: []string{"u-2"},
+			statusCode: func(user string) int {
+				if user == "u-2" {
+					return http.StatusUnauthorized
+				}
+				return http.StatusOK
+			},
 		},
 		{
 			name:            "sharding disabled, 2 instances",
@@ -1100,6 +1396,36 @@ func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
 			replicationFactor: 1,
 			configs:           10,
 			expectedTenants:   10, // same as no sharding and 1 instance
+		},
+		{
+			name:              "sharding enabled, 1 instance, enabled tenants, single user allowed",
+			withSharding:      true,
+			instances:         1,
+			replicationFactor: 1,
+			configs:           10,
+			expectedTenants:   1,
+			enabledTenants:    []string{"u-3"},
+			statusCode: func(user string) int {
+				if user == "u-3" {
+					return http.StatusOK
+				}
+				return http.StatusUnauthorized
+			},
+		},
+		{
+			name:              "sharding enabled, 1 instance, enabled tenants, single user disabled",
+			withSharding:      true,
+			instances:         1,
+			replicationFactor: 1,
+			configs:           10,
+			expectedTenants:   9,
+			disabledTenants:   []string{"u-4"},
+			statusCode: func(user string) int {
+				if user == "u-4" {
+					return http.StatusUnauthorized
+				}
+				return http.StatusOK
+			},
 		},
 		{
 			name:              "sharding enabled, 2 instances, RF = 1",
@@ -1125,6 +1451,24 @@ func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
 			configs:           10,
 			expectedTenants:   30, // configs * replication factor
 		},
+		{
+			name:              "sharding enabled, 5 instances, RF = 3, two users disabled",
+			withSharding:      true,
+			instances:         5,
+			replicationFactor: 3,
+			configs:           10,
+			expectedTenants:   24, // (configs - disabled-tenants) * replication factor
+			disabledTenants:   []string{"u-1", "u-2"},
+			statusCode: func(user string) int {
+				switch user {
+				case "u-1":
+					return http.StatusUnauthorized
+				case "u-2":
+					return http.StatusUnauthorized
+				}
+				return http.StatusOK
+			},
+		},
 	}
 
 	for _, tt := range tc {
@@ -1133,7 +1477,8 @@ func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
 			ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 			t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
-			alertStore := prepareInMemoryAlertStore()
+			alertStore, err := prepareInMemoryAlertStore()
+			require.NoError(t, err)
 
 			var instances []*MultitenantAlertmanager
 			var instanceIDs []string
@@ -1148,6 +1493,7 @@ func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
 					Templates: []*alertspb.TemplateDesc{},
 				}))
 			}
+			clientPool := newPassthroughAlertmanagerClientPool()
 
 			// Then, create the alertmanager instances, start them and add their registries to the slice.
 			for i := 1; i <= tt.instances; i++ {
@@ -1155,12 +1501,16 @@ func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
 				instanceID := fmt.Sprintf("alertmanager-%d", i)
 
 				amConfig := mockAlertmanagerConfig(t)
+				amConfig.ExternalURL = externalURL
 				amConfig.ShardingRing.ReplicationFactor = tt.replicationFactor
 				amConfig.ShardingRing.InstanceID = instanceID
 				amConfig.ShardingRing.InstanceAddr = fmt.Sprintf("127.0.0.%d", i)
 				// Do not check the ring topology changes or poll in an interval in this test (we explicitly sync alertmanagers).
 				amConfig.PollInterval = time.Hour
 				amConfig.ShardingRing.RingCheckPeriod = time.Hour
+
+				amConfig.EnabledTenants = tt.enabledTenants
+				amConfig.DisabledTenants = tt.disabledTenants
 
 				if tt.withSharding {
 					amConfig.ShardingEnabled = true
@@ -1176,6 +1526,11 @@ func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
 				instances = append(instances, am)
 				instanceIDs = append(instanceIDs, instanceID)
 				registries.AddUserRegistry(instanceID, reg)
+
+				if tt.withSharding {
+					clientPool.setServer(amConfig.ShardingRing.InstanceAddr+":0", am)
+					am.distributor.alertmanagerClientsPool = clientPool
+				}
 			}
 
 			// If we're testing sharding, we need make sure the ring is settled.
@@ -1205,6 +1560,23 @@ func TestMultitenantAlertmanager_PerTenantSharding(t *testing.T) {
 			assert.Equal(t, tt.expectedTenants, numInstances)
 			assert.Equal(t, float64(tt.expectedTenants), metrics.GetSumOfGauges("cortex_alertmanager_tenants_owned"))
 			assert.Equal(t, float64(tt.configs*tt.instances), metrics.GetSumOfGauges("cortex_alertmanager_tenants_discovered"))
+
+			statusCode := tt.statusCode
+			if statusCode == nil {
+				statusCode = func(user string) int {
+					return http.StatusOK
+				}
+			}
+			for ami, am := range instances {
+				for i := 1; i <= tt.configs; i++ {
+					u := fmt.Sprintf("u-%d", i)
+					req := httptest.NewRequest("GET", "http://localhost:8080/alertmanager/", nil)
+					w := httptest.NewRecorder()
+					am.ServeHTTP(w, req.WithContext(user.InjectOrgID(req.Context(), u)))
+					resp := w.Result()
+					require.Equal(t, statusCode(u), resp.StatusCode, ami)
+				}
+			}
 		})
 	}
 }
@@ -1322,13 +1694,14 @@ func TestMultitenantAlertmanager_SyncOnRingTopologyChanges(t *testing.T) {
 			ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 			t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
-			alertStore := prepareInMemoryAlertStore()
+			alertStore, err := prepareInMemoryAlertStore()
+			require.NoError(t, err)
 
 			reg := prometheus.NewPedanticRegistry()
 			am, err := createMultitenantAlertmanager(amConfig, nil, nil, alertStore, ringStore, nil, log.NewNopLogger(), reg)
 			require.NoError(t, err)
 
-			require.NoError(t, ringStore.CAS(ctx, RingKey, func(in interface{}) (interface{}, bool, error) {
+			require.NoError(t, ringStore.CAS(ctx, RingKey, func(in any) (any, bool, error) {
 				ringDesc := ring.GetOrCreateRingDesc(in)
 				tt.setupRing(ringDesc)
 				return ringDesc, true, nil
@@ -1344,7 +1717,7 @@ func TestMultitenantAlertmanager_SyncOnRingTopologyChanges(t *testing.T) {
 			assert.Equal(t, float64(1), metrics.GetSumOfCounters("cortex_alertmanager_sync_configs_total"))
 
 			// Change the ring topology.
-			require.NoError(t, ringStore.CAS(ctx, RingKey, func(in interface{}) (interface{}, bool, error) {
+			require.NoError(t, ringStore.CAS(ctx, RingKey, func(in any) (any, bool, error) {
 				ringDesc := ring.GetOrCreateRingDesc(in)
 				tt.updateRing(ringDesc)
 				return ringDesc, true, nil
@@ -1355,7 +1728,7 @@ func TestMultitenantAlertmanager_SyncOnRingTopologyChanges(t *testing.T) {
 			if tt.expected {
 				expectedSyncs++
 			}
-			test.Poll(t, 3*time.Second, float64(expectedSyncs), func() interface{} {
+			test.Poll(t, 3*time.Second, float64(expectedSyncs), func() any {
 				metrics := regs.BuildMetricFamiliesPerUser()
 				return metrics.GetSumOfCounters("cortex_alertmanager_sync_configs_total")
 			})
@@ -1375,23 +1748,25 @@ func TestMultitenantAlertmanager_RingLifecyclerShouldAutoForgetUnhealthyInstance
 	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
-	alertStore := prepareInMemoryAlertStore()
+	alertStore, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 
 	am, err := createMultitenantAlertmanager(amConfig, nil, nil, alertStore, ringStore, nil, log.NewNopLogger(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(ctx, am))
 	defer services.StopAndAwaitTerminated(ctx, am) //nolint:errcheck
 
-	require.NoError(t, ringStore.CAS(ctx, RingKey, func(in interface{}) (interface{}, bool, error) {
+	tg := ring.NewRandomTokenGenerator()
+	require.NoError(t, ringStore.CAS(ctx, RingKey, func(in any) (any, bool, error) {
 		ringDesc := ring.GetOrCreateRingDesc(in)
-		instance := ringDesc.AddIngester(unhealthyInstanceID, "127.0.0.1", "", ring.GenerateTokens(RingNumTokens, nil), ring.ACTIVE, time.Now())
+		instance := ringDesc.AddIngester(unhealthyInstanceID, "127.0.0.1", "", tg.GenerateTokens(ringDesc, unhealthyInstanceID, "", RingNumTokens, true), ring.ACTIVE, time.Now())
 		instance.Timestamp = time.Now().Add(-(ringAutoForgetUnhealthyPeriods + 1) * heartbeatTimeout).Unix()
 		ringDesc.Ingesters[unhealthyInstanceID] = instance
 
 		return ringDesc, true, nil
 	}))
 
-	test.Poll(t, time.Second, false, func() interface{} {
+	test.Poll(t, time.Second, false, func() any {
 		d, err := ringStore.Get(ctx, RingKey)
 		if err != nil {
 			return err
@@ -1413,7 +1788,10 @@ func TestMultitenantAlertmanager_InitialSyncFailureWithSharding(t *testing.T) {
 	bkt := &bucket.ClientMock{}
 	bkt.MockIter("alerts/", nil, errors.New("failed to list alerts"))
 	bkt.MockIter("alertmanager/", nil, nil)
-	store := bucketclient.NewBucketAlertStore(bkt, nil, log.NewNopLogger())
+	usersScannerConfig := users.UsersScannerConfig{Strategy: users.UserScanStrategyList}
+	reg := prometheus.NewPedanticRegistry()
+	store, err := bucketclient.NewBucketAlertStore(bkt, usersScannerConfig, nil, log.NewNopLogger(), reg)
+	require.NoError(t, err)
 
 	am, err := createMultitenantAlertmanager(amConfig, nil, nil, store, ringStore, nil, log.NewNopLogger(), nil)
 	require.NoError(t, err)
@@ -1423,7 +1801,12 @@ func TestMultitenantAlertmanager_InitialSyncFailureWithSharding(t *testing.T) {
 	err = am.AwaitRunning(ctx)
 	require.Error(t, err)
 	require.Equal(t, services.Failed, am.State())
-	require.False(t, am.ringLifecycler.IsRegistered())
+
+	// The lifecycler's background goroutine may briefly re-register the instance
+	// before the stopping function fully unregisters it. Poll until unregistered.
+	require.Eventually(t, func() bool {
+		return !am.ringLifecycler.IsRegistered()
+	}, 5*time.Second, 100*time.Millisecond)
 	require.NotNil(t, am.ring)
 }
 
@@ -1432,7 +1815,8 @@ func TestAlertmanager_ReplicasPosition(t *testing.T) {
 	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
-	mockStore := prepareInMemoryAlertStore()
+	mockStore, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 	require.NoError(t, mockStore.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
 		User:      "user-1",
 		RawConfig: simpleConfigOne,
@@ -1533,10 +1917,11 @@ func TestAlertmanager_StateReplicationWithSharding(t *testing.T) {
 			ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 			t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
-			mockStore := prepareInMemoryAlertStore()
+			mockStore, err := prepareInMemoryAlertStore()
+			require.NoError(t, err)
 			clientPool := newPassthroughAlertmanagerClientPool()
 			externalURL := flagext.URLValue{}
-			err := externalURL.Set("http://localhost:8080/alertmanager")
+			err = externalURL.Set("http://localhost:8080/alertmanager")
 			require.NoError(t, err)
 
 			var instances []*MultitenantAlertmanager
@@ -1572,8 +1957,13 @@ func TestAlertmanager_StateReplicationWithSharding(t *testing.T) {
 					amConfig.ShardingEnabled = true
 				}
 
+				var limits validation.Limits
+				flagext.DefaultValues(&limits)
+
+				overrides := validation.NewOverrides(limits, nil)
+
 				reg := prometheus.NewPedanticRegistry()
-				am, err := createMultitenantAlertmanager(amConfig, nil, nil, mockStore, ringStore, nil, log.NewNopLogger(), reg)
+				am, err := createMultitenantAlertmanager(amConfig, nil, nil, mockStore, ringStore, overrides, log.NewNopLogger(), reg)
 				require.NoError(t, err)
 				defer services.StopAndAwaitTerminated(ctx, am) //nolint:errcheck
 
@@ -1641,15 +2031,17 @@ func TestAlertmanager_StateReplicationWithSharding(t *testing.T) {
 			multitenantAM.alertmanagersMtx.Unlock()
 
 			// 3. Now that we have our alertmanager user, let's create a silence and make sure it is replicated.
-			silence := types.Silence{
-				Matchers: labels.Matchers{
-					{Name: "instance", Value: "prometheus-one"},
+			now := time.Now()
+			silenceReq := map[string]any{
+				"matchers": []map[string]any{
+					{"name": "instance", "value": "prometheus-one", "isRegex": false, "isEqual": true},
 				},
-				Comment:  "Created for a test case.",
-				StartsAt: time.Now(),
-				EndsAt:   time.Now().Add(time.Hour),
+				"comment":   "Created for a test case.",
+				"createdBy": "test",
+				"startsAt":  now.UTC().Format(time.RFC3339),
+				"endsAt":    now.Add(time.Hour).UTC().Format(time.RFC3339),
 			}
-			data, err := json.Marshal(silence)
+			data, err := json.Marshal(silenceReq)
 			require.NoError(t, err)
 
 			// 4. Create the silence in one of the alertmanagers
@@ -1661,7 +2053,7 @@ func TestAlertmanager_StateReplicationWithSharding(t *testing.T) {
 				multitenantAM.serveRequest(w, req.WithContext(reqCtx))
 
 				resp := w.Result()
-				body, _ := ioutil.ReadAll(resp.Body)
+				body, _ := io.ReadAll(resp.Body)
 				assert.Equal(t, http.StatusOK, w.Code)
 				require.Regexp(t, regexp.MustCompile(`{"silenceID":".+"}`), string(body))
 			}
@@ -1728,10 +2120,11 @@ func TestAlertmanager_StateReplicationWithSharding_InitialSyncFromPeers(t *testi
 			ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 			t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
-			mockStore := prepareInMemoryAlertStore()
+			mockStore, err := prepareInMemoryAlertStore()
+			require.NoError(t, err)
 			clientPool := newPassthroughAlertmanagerClientPool()
 			externalURL := flagext.URLValue{}
-			err := externalURL.Set("http://localhost:8080/alertmanager")
+			err = externalURL.Set("http://localhost:8080/alertmanager")
 			require.NoError(t, err)
 
 			var instances []*MultitenantAlertmanager
@@ -1764,8 +2157,13 @@ func TestAlertmanager_StateReplicationWithSharding_InitialSyncFromPeers(t *testi
 
 				amConfig.ShardingEnabled = true
 
+				var limits validation.Limits
+				flagext.DefaultValues(&limits)
+
+				overrides := validation.NewOverrides(limits, nil)
+
 				reg := prometheus.NewPedanticRegistry()
-				am, err := createMultitenantAlertmanager(amConfig, nil, nil, mockStore, ringStore, nil, log.NewNopLogger(), reg)
+				am, err := createMultitenantAlertmanager(amConfig, nil, nil, mockStore, ringStore, overrides, log.NewNopLogger(), reg)
 				require.NoError(t, err)
 
 				clientPool.setServer(amConfig.ShardingRing.InstanceAddr+":0", am)
@@ -1800,15 +2198,17 @@ func TestAlertmanager_StateReplicationWithSharding_InitialSyncFromPeers(t *testi
 			}
 
 			writeSilence := func(i *MultitenantAlertmanager, userID string) {
-				silence := types.Silence{
-					Matchers: labels.Matchers{
-						{Name: "instance", Value: "prometheus-one"},
+				now := time.Now()
+				silenceReq := map[string]any{
+					"matchers": []map[string]any{
+						{"name": "instance", "value": "prometheus-one", "isRegex": false, "isEqual": true},
 					},
-					Comment:  "Created for a test case.",
-					StartsAt: time.Now(),
-					EndsAt:   time.Now().Add(time.Hour),
+					"comment":   "Created for a test case.",
+					"createdBy": "test",
+					"startsAt":  now.UTC().Format(time.RFC3339),
+					"endsAt":    now.Add(time.Hour).UTC().Format(time.RFC3339),
 				}
-				data, err := json.Marshal(silence)
+				data, err := json.Marshal(silenceReq)
 				require.NoError(t, err)
 
 				req := httptest.NewRequest(http.MethodPost, externalURL.String()+"/api/v2/silences", bytes.NewReader(data))
@@ -1819,7 +2219,7 @@ func TestAlertmanager_StateReplicationWithSharding_InitialSyncFromPeers(t *testi
 					i.serveRequest(w, req.WithContext(reqCtx))
 
 					resp := w.Result()
-					body, _ := ioutil.ReadAll(resp.Body)
+					body, _ := io.ReadAll(resp.Body)
 					assert.Equal(t, http.StatusOK, w.Code)
 					require.Regexp(t, regexp.MustCompile(`{"silenceID":".+"}`), string(body))
 				}
@@ -1834,7 +2234,7 @@ func TestAlertmanager_StateReplicationWithSharding_InitialSyncFromPeers(t *testi
 					i.serveRequest(w, req.WithContext(reqCtx))
 
 					resp := w.Result()
-					body, _ := ioutil.ReadAll(resp.Body)
+					body, _ := io.ReadAll(resp.Body)
 					assert.Equal(t, http.StatusOK, w.Code)
 					require.Regexp(t, regexp.MustCompile(`"comment":"Created for a test case."`), string(body))
 				}
@@ -1854,7 +2254,7 @@ func TestAlertmanager_StateReplicationWithSharding_InitialSyncFromPeers(t *testi
 			}
 			// 2.c. Wait for the silence replication to be attempted; note this is asynchronous.
 			{
-				test.Poll(t, 5*time.Second, float64(1), func() interface{} {
+				test.Poll(t, 5*time.Second, float64(1), func() any {
 					metrics := registries.BuildMetricFamiliesPerUser()
 					return metrics.GetSumOfCounters("cortex_alertmanager_state_replication_total")
 				})
@@ -1896,8 +2296,33 @@ func TestAlertmanager_StateReplicationWithSharding_InitialSyncFromPeers(t *testi
 }
 
 // prepareInMemoryAlertStore builds and returns an in-memory alert store.
-func prepareInMemoryAlertStore() alertstore.AlertStore {
-	return bucketclient.NewBucketAlertStore(objstore.NewInMemBucket(), nil, log.NewNopLogger())
+func prepareInMemoryAlertStore() (alertstore.AlertStore, error) {
+	usersScannerConfig := users.UsersScannerConfig{Strategy: users.UserScanStrategyList}
+	reg := prometheus.NewPedanticRegistry()
+	bucket := objstore.NewInMemBucket()
+	mBucketClient := &alertstore.MockBucket{Bucket: bucket}
+	return bucketclient.NewBucketAlertStore(mBucketClient, usersScannerConfig, nil, log.NewNopLogger(), reg)
+}
+
+func prepareUserDir(t *testing.T, storeDir string, user string) (userDir string, templateDir string) {
+	userDir = filepath.Join(storeDir, user)
+	templateDir = filepath.Join(userDir, templatesDir)
+	require.NoError(t, os.MkdirAll(userDir, os.ModePerm))
+	require.NoError(t, os.MkdirAll(templateDir, os.ModePerm))
+	return
+}
+
+func listFiles(dir string) ([]string, error) {
+	var r []string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			r = append(r, path)
+		}
+		return nil
+	})
+	sort.Strings(r)
+
+	return r, err
 }
 
 func TestSafeTemplateFilepath(t *testing.T) {
@@ -1929,14 +2354,7 @@ func TestSafeTemplateFilepath(t *testing.T) {
 }
 
 func TestStoreTemplateFile(t *testing.T) {
-	tempDir, err := ioutil.TempDir(os.TempDir(), "alertmanager")
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		require.NoError(t, os.RemoveAll(tempDir))
-	})
-
-	testTemplateDir := filepath.Join(tempDir, templatesDir)
+	testTemplateDir := filepath.Join(t.TempDir(), templatesDir)
 
 	changed, err := storeTemplateFile(filepath.Join(testTemplateDir, "some-template"), "content")
 	require.NoError(t, err)
@@ -1970,7 +2388,8 @@ receivers:
 `
 
 	// Run this test using a real storage client.
-	store := prepareInMemoryAlertStore()
+	store, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
 	require.NoError(t, store.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
 		User:      "user",
 		RawConfig: config,
@@ -2000,9 +2419,10 @@ receivers:
 	ctx = notify.WithReceiverName(ctx, "email")
 	ctx = notify.WithGroupKey(ctx, "key")
 	ctx = notify.WithRepeatInterval(ctx, time.Minute)
+	ctx = notify.WithRouteID(ctx, "routeId")
 
 	// Verify that rate-limiter is in place for email notifier.
-	_, _, err = uam.lastPipeline.Exec(ctx, log.NewNopLogger(), &types.Alert{})
+	_, _, err = uam.lastPipeline.Exec(ctx, promslog.NewNopLogger(), &alert.Alert{})
 	require.NotNil(t, err)
 	require.Contains(t, err.Error(), errRateLimited.Error())
 }
@@ -2019,8 +2439,8 @@ func (am *passthroughAlertmanagerClient) ReadState(ctx context.Context, in *aler
 	return am.server.ReadState(ctx, in)
 }
 
-func (am *passthroughAlertmanagerClient) HandleRequest(context.Context, *httpgrpc.HTTPRequest, ...grpc.CallOption) (*httpgrpc.HTTPResponse, error) {
-	return nil, fmt.Errorf("unexpected call to HandleRequest")
+func (am *passthroughAlertmanagerClient) HandleRequest(ctx context.Context, in *httpgrpc.HTTPRequest, opts ...grpc.CallOption) (*httpgrpc.HTTPResponse, error) {
+	return am.server.HandleRequest(ctx, in)
 }
 
 func (am *passthroughAlertmanagerClient) RemoteAddress() string {
@@ -2065,6 +2485,8 @@ type mockAlertManagerLimits struct {
 	maxDispatcherAggregationGroups int
 	maxAlertsCount                 int
 	maxAlertsSizeBytes             int
+	maxSilencesCount               int
+	maxSilencesSizeBytes           int
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerMaxConfigSize(tenant string) int {
@@ -2105,4 +2527,135 @@ func (m *mockAlertManagerLimits) AlertmanagerMaxAlertsCount(_ string) int {
 
 func (m *mockAlertManagerLimits) AlertmanagerMaxAlertsSizeBytes(_ string) int {
 	return m.maxAlertsSizeBytes
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMaxSilencesCount(_ string) int {
+	return m.maxSilencesCount
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMaxSilenceSizeBytes(_ string) int {
+	return m.maxSilencesSizeBytes
+}
+
+func TestMultitenantAlertmanager_isUserOwned(t *testing.T) {
+	amConfig := mockAlertmanagerConfig(t)
+	amConfig.ShardingEnabled = true
+
+	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	alertStore, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
+
+	am, err := createMultitenantAlertmanager(amConfig, nil, nil, alertStore, ringStore, nil, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+
+	// We don't start the AM, so the ring is empty.
+	// When sharding is enabled, isUserOwned will call am.ring.Get, which should fail because the ring is empty.
+	owned, err := am.isUserOwned("user-1")
+	require.Error(t, err)
+	require.Equal(t, ring.ErrEmptyRing, err)
+	require.False(t, owned)
+
+	// If sharding is disabled, it should return true, nil
+	am.cfg.ShardingEnabled = false
+	owned, err = am.isUserOwned("user-1")
+	require.NoError(t, err)
+	require.True(t, owned)
+}
+
+func TestMultitenantAlertmanager_loadAndSyncConfigs_deletesUserFromStore(t *testing.T) {
+	ctx := context.Background()
+	amConfig := mockAlertmanagerConfig(t)
+	amConfig.ShardingEnabled = true
+
+	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	alertStore, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
+
+	am, err := createMultitenantAlertmanager(amConfig, nil, nil, alertStore, ringStore, nil, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+
+	// We don't start the AM. We just manually insert state, then call loadAndSyncConfigs.
+	user1 := "user-1"
+
+	// 1. Create a FullState (remote state) for user1 in the store.
+	fullState := alertspb.FullStateDesc{
+		State: &clusterpb.FullState{},
+	}
+	err = alertStore.SetFullState(ctx, user1, fullState)
+	require.NoError(t, err)
+
+	// Since we did NOT SetAlertConfig for user1, the store.ListAllUsers will return empty.
+	allUsers, err := alertStore.ListAllUsers(ctx)
+	require.NoError(t, err)
+	require.Empty(t, allUsers)
+
+	// Verify user1's FullState is written to the store.
+	_, err = alertStore.GetFullState(ctx, user1)
+	require.NoError(t, err)
+
+	// 2. Call loadAndSyncConfigs. It should fetch all users (which is empty),
+	// and since sharding is enabled, it should clean up unused remote state for any users not in the list.
+	// user1 has state but no config, so its state should be pruned.
+	err = am.loadAndSyncConfigs(ctx, reasonPeriodic)
+	require.NoError(t, err)
+
+	// 3. Verify user1's FullState is deleted from the store.
+	_, err = alertStore.GetFullState(ctx, user1)
+	require.Error(t, err)
+	require.Equal(t, alertspb.ErrNotFound, err)
+}
+
+func TestMultitenantAlertmanager_loadAndSyncConfigs_DoesNotDeleteUserFromStoreWhenRingUnreachable(t *testing.T) {
+	ctx := context.Background()
+	amConfig := mockAlertmanagerConfig(t)
+	amConfig.ShardingEnabled = true
+
+	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	alertStore, err := prepareInMemoryAlertStore()
+	require.NoError(t, err)
+
+	am, err := createMultitenantAlertmanager(amConfig, nil, nil, alertStore, ringStore, nil, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+
+	user1 := "user-1"
+
+	// 1. Create a FullState (remote state) for user1 in the store.
+	fullState := alertspb.FullStateDesc{
+		State: &clusterpb.FullState{},
+	}
+	err = alertStore.SetFullState(ctx, user1, fullState)
+	require.NoError(t, err)
+
+	// Since we DO SetAlertConfig for user1, the store.ListAllUsers will return the user.
+	err = alertStore.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
+		User:      user1,
+		RawConfig: simpleConfigOne,
+		Templates: []*alertspb.TemplateDesc{},
+	})
+	require.NoError(t, err)
+
+	allUsers, err := alertStore.ListAllUsers(ctx)
+	require.NoError(t, err)
+	require.Len(t, allUsers, 1)
+
+	// Verify user1's FullState is written to the store.
+	_, err = alertStore.GetFullState(ctx, user1)
+	require.NoError(t, err)
+
+	// 2. Call loadAndSyncConfigs. It should fetch all users.
+	// Since sharding is enabled but ring is empty (unreachable), isUserOwned will fail.
+	// loadAndSyncConfigs will return early with an error before pruning any states!
+	err = am.loadAndSyncConfigs(ctx, reasonPeriodic)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), ring.ErrEmptyRing.Error())
+
+	// 3. Verify user1's FullState is STILL in the store.
+	_, err = alertStore.GetFullState(ctx, user1)
+	require.NoError(t, err)
 }

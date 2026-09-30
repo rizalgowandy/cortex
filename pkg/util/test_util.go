@@ -1,0 +1,75 @@
+package util
+
+import (
+	"math/rand"
+	"strings"
+	"time"
+
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cortexproject/cortex/pkg/chunk"
+	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
+	histogram_util "github.com/cortexproject/cortex/pkg/util/histogram"
+)
+
+func GenerateRandomStrings() []string {
+	randomChar := "0123456789abcdef"
+	randomStrings := make([]string, 0, 1000000)
+	sb := strings.Builder{}
+	for range 1000000 {
+		sb.Reset()
+		sb.WriteString("pod://")
+		for range 14 {
+			sb.WriteByte(randomChar[rand.Int()%len(randomChar)])
+		}
+		randomStrings = append(randomStrings, sb.String())
+	}
+	return randomStrings
+}
+
+func GenerateChunk(t require.TestingT, step time.Duration, from model.Time, points int, enc promchunk.Encoding, additionalLabels ...labels.Label) chunk.Chunk {
+	var hasMetricName bool
+	for _, lbl := range additionalLabels {
+		if lbl.Name == model.MetricNameLabel {
+			hasMetricName = true
+		}
+	}
+	metric := labels.NewBuilder(labels.New(additionalLabels...))
+	if !hasMetricName {
+		metric = metric.Set(model.MetricNameLabel, "foo")
+	}
+	pe := enc.PromChunkEncoding()
+	pc, err := chunkenc.NewEmptyChunk(pe)
+	require.NoError(t, err)
+	appender, err := pc.Appender()
+	require.NoError(t, err)
+	ts := from
+
+	switch pe {
+	case chunkenc.EncXOR:
+		for range points {
+			appender.Append(int64(ts), float64(ts))
+			ts = ts.Add(step)
+		}
+	case chunkenc.EncHistogram:
+		histograms := histogram_util.GenerateTestHistograms(int(from), int(step/time.Millisecond), points)
+		for i := range points {
+			_, _, appender, err = appender.AppendHistogram(nil, int64(ts), histograms[i], true)
+			require.NoError(t, err)
+			ts = ts.Add(step)
+		}
+	case chunkenc.EncFloatHistogram:
+		histograms := histogram_util.GenerateTestHistograms(int(from), int(step/time.Millisecond), points)
+		for i := range points {
+			_, _, appender, err = appender.AppendFloatHistogram(nil, int64(ts), histograms[i].ToFloat(nil), true)
+			require.NoError(t, err)
+			ts = ts.Add(step)
+		}
+	}
+
+	ts = ts.Add(-step) // undo the add that we did just before exiting the loop
+	return chunk.NewChunk(metric.Labels(), pc, from, ts)
+}

@@ -4,13 +4,10 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"io/ioutil"
 	"path"
 
-	"github.com/oklog/ulid"
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block"
-	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/objstore"
 )
 
 // globalMarkersBucket is a bucket client which stores markers (eg. block deletion marks) in a per-tenant
@@ -21,33 +18,36 @@ type globalMarkersBucket struct {
 
 // BucketWithGlobalMarkers wraps the input bucket into a bucket which also keeps track of markers
 // in the global markers location.
-func BucketWithGlobalMarkers(b objstore.Bucket) objstore.Bucket {
+func BucketWithGlobalMarkers(b objstore.InstrumentedBucket) objstore.InstrumentedBucket {
 	return &globalMarkersBucket{
 		parent: b,
 	}
 }
 
+func (b *globalMarkersBucket) Provider() objstore.ObjProvider {
+	return b.parent.Provider()
+}
+
 // Upload implements objstore.Bucket.
-func (b *globalMarkersBucket) Upload(ctx context.Context, name string, r io.Reader) error {
-	blockID, ok := b.isBlockDeletionMark(name)
+func (b *globalMarkersBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
+	globalMarkPath, ok := b.isMark(name)
 	if !ok {
-		return b.parent.Upload(ctx, name, r)
+		return b.parent.Upload(ctx, name, r, opts...)
 	}
 
 	// Read the marker.
-	body, err := ioutil.ReadAll(r)
+	body, err := io.ReadAll(r)
 	if err != nil {
 		return err
 	}
 
-	// Upload it to the original location.
-	if err := b.parent.Upload(ctx, name, bytes.NewBuffer(body)); err != nil {
+	// Upload it to the global marker's location.
+	if err := b.parent.Upload(ctx, globalMarkPath, bytes.NewReader(body), opts...); err != nil {
 		return err
 	}
 
-	// Upload it to the global markers location too.
-	globalMarkPath := path.Clean(path.Join(path.Dir(name), "../", BlockDeletionMarkFilepath(blockID)))
-	return b.parent.Upload(ctx, globalMarkPath, bytes.NewBuffer(body))
+	// Upload it to the original location too.
+	return b.parent.Upload(ctx, name, bytes.NewReader(body), opts...)
 }
 
 // Delete implements objstore.Bucket.
@@ -58,8 +58,7 @@ func (b *globalMarkersBucket) Delete(ctx context.Context, name string) error {
 	}
 
 	// Delete the marker in the global markers location too.
-	if blockID, ok := b.isBlockDeletionMark(name); ok {
-		globalMarkPath := path.Clean(path.Join(path.Dir(name), "../", BlockDeletionMarkFilepath(blockID)))
+	if globalMarkPath, ok := b.isMark(name); ok {
 		if err := b.parent.Delete(ctx, globalMarkPath); err != nil {
 			if !b.parent.IsObjNotFoundErr(err) {
 				return err
@@ -78,6 +77,16 @@ func (b *globalMarkersBucket) Name() string {
 // Close implements objstore.Bucket.
 func (b *globalMarkersBucket) Close() error {
 	return b.parent.Close()
+}
+
+// IterWithAttributes implements objstore.Bucket.
+func (b *globalMarkersBucket) IterWithAttributes(ctx context.Context, dir string, f func(attrs objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	return b.parent.IterWithAttributes(ctx, dir, f, options...)
+}
+
+// SupportedIterOptions implements objstore.Bucket.
+func (b *globalMarkersBucket) SupportedIterOptions() []objstore.IterOptionType {
+	return b.parent.SupportedIterOptions()
 }
 
 // Iter implements objstore.Bucket.
@@ -105,6 +114,11 @@ func (b *globalMarkersBucket) IsObjNotFoundErr(err error) bool {
 	return b.parent.IsObjNotFoundErr(err)
 }
 
+// IsAccessDeniedErr returns true if access to object is denied.
+func (b *globalMarkersBucket) IsAccessDeniedErr(err error) bool {
+	return b.parent.IsAccessDeniedErr(err)
+}
+
 // Attributes implements objstore.Bucket.
 func (b *globalMarkersBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	return b.parent.Attributes(ctx, name)
@@ -128,12 +142,21 @@ func (b *globalMarkersBucket) ReaderWithExpectedErrs(fn objstore.IsOpFailureExpe
 	return b
 }
 
-func (b *globalMarkersBucket) isBlockDeletionMark(name string) (ulid.ULID, bool) {
-	if path.Base(name) != metadata.DeletionMarkFilename {
-		return ulid.ULID{}, false
+func (b *globalMarkersBucket) isMark(name string) (string, bool) {
+
+	for mark, globalFilePath := range MarkersMap {
+		if path.Base(name) == mark {
+			// Parse the block ID in the path. If there's not block ID, then it's not the per-block
+			// deletion mark.
+			id, ok := block.IsBlockDir(path.Dir(name))
+
+			if ok {
+				return path.Clean(path.Join(path.Dir(name), "../", globalFilePath(id))), ok
+			}
+
+			return "", ok
+		}
 	}
 
-	// Parse the block ID in the path. If there's not block ID, then it's not the per-block
-	// deletion mark.
-	return block.IsBlockDir(path.Dir(name))
+	return "", false
 }

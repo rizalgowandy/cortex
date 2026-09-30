@@ -147,12 +147,27 @@ compactor:
   # CLI flag: -compactor.tenant-cleanup-delay
   [tenant_cleanup_delay: <duration> | default = 6h]
 
+  # When enabled, mark blocks containing index with out-of-order chunks for no
+  # compact instead of halting the compaction.
+  # CLI flag: -compactor.skip-blocks-with-out-of-order-chunks-enabled
+  [skip_blocks_with_out_of_order_chunks_enabled: <boolean> | default = false]
+
+  # Number of goroutines to use when fetching/uploading block files from object
+  # storage.
+  # CLI flag: -compactor.block-files-concurrency
+  [block_files_concurrency: <int> | default = 10]
+
+  # Number of goroutines to use when fetching blocks from object storage when
+  # compacting.
+  # CLI flag: -compactor.blocks-fetch-concurrency
+  [blocks_fetch_concurrency: <int> | default = 3]
+
   # When enabled, at compactor startup the bucket will be scanned and all found
   # deletion marks inside the block location will be copied to the markers
   # global location too. This option can (and should) be safely disabled as soon
   # as the compactor has successfully run at least once.
   # CLI flag: -compactor.block-deletion-marks-migration-enabled
-  [block_deletion_marks_migration_enabled: <boolean> | default = true]
+  [block_deletion_marks_migration_enabled: <boolean> | default = false]
 
   # Comma separated list of tenants that can be compacted. If specified, only
   # these tenants will be compacted by compactor, otherwise all tenants can be
@@ -173,10 +188,15 @@ compactor:
   # CLI flag: -compactor.sharding-enabled
   [sharding_enabled: <boolean> | default = false]
 
+  # The sharding strategy to use. Supported values are: default,
+  # shuffle-sharding.
+  # CLI flag: -compactor.sharding-strategy
+  [sharding_strategy: <string> | default = "default"]
+
   sharding_ring:
     kvstore:
-      # Backend storage to use for the ring. Supported values are: consul, etcd,
-      # inmemory, memberlist, multi.
+      # Backend storage to use for the ring. Supported values are: consul,
+      # dynamodb, etcd, inmemory, memberlist, multi.
       # CLI flag: -compactor.ring.store
       [store: <string> | default = "consul"]
 
@@ -187,6 +207,31 @@ compactor:
       # The consul_config configures the consul client.
       # The CLI flags prefix for this block config is: compactor.ring
       [consul: <consul_config>]
+
+      dynamodb:
+        # Region to access dynamodb.
+        # CLI flag: -compactor.ring.dynamodb.region
+        [region: <string> | default = ""]
+
+        # Table name to use on dynamodb.
+        # CLI flag: -compactor.ring.dynamodb.table-name
+        [table_name: <string> | default = ""]
+
+        # Time to expire items on dynamodb.
+        # CLI flag: -compactor.ring.dynamodb.ttl-time
+        [ttl: <duration> | default = 0s]
+
+        # Time to refresh local ring with information on dynamodb.
+        # CLI flag: -compactor.ring.dynamodb.puller-sync-time
+        [puller_sync_time: <duration> | default = 1m]
+
+        # Maximum number of retries for DDB KV CAS.
+        # CLI flag: -compactor.ring.dynamodb.max-cas-retries
+        [max_cas_retries: <int> | default = 10]
+
+        # Timeout of dynamoDbClient requests. Default is 2m.
+        # CLI flag: -compactor.ring.dynamodb.timeout
+        [timeout: <duration> | default = 2m]
 
       # The etcd_config configures the etcd client.
       # The CLI flags prefix for this block config is: compactor.ring
@@ -218,6 +263,17 @@ compactor:
     # CLI flag: -compactor.ring.heartbeat-timeout
     [heartbeat_timeout: <duration> | default = 1m]
 
+    # Time since last heartbeat before compactor will be removed from ring. 0 to
+    # disable
+    # CLI flag: -compactor.auto-forget-delay
+    [auto_forget_delay: <duration> | default = 2m]
+
+    # Set to true to enable ring detailed metrics. These metrics provide
+    # detailed information, such as token count and ownership per tenant.
+    # Disabling them can significantly decrease the number of metrics emitted.
+    # CLI flag: -compactor.ring.detailed-metrics-enabled
+    [detailed_metrics_enabled: <boolean> | default = true]
+
     # Minimum time to wait for ring stability at startup. 0 to disable.
     # CLI flag: -compactor.ring.wait-stability-min-duration
     [wait_stability_min_duration: <duration> | default = 1m]
@@ -231,7 +287,60 @@ compactor:
     # CLI flag: -compactor.ring.instance-interface-names
     [instance_interface_names: <list of string> | default = [eth0 en0]]
 
+    # File path where tokens are stored. If empty, tokens are not stored at
+    # shutdown and restored at startup.
+    # CLI flag: -compactor.ring.tokens-file-path
+    [tokens_file_path: <string> | default = ""]
+
+    # Unregister the compactor during shutdown if true.
+    # CLI flag: -compactor.ring.unregister-on-shutdown
+    [unregister_on_shutdown: <boolean> | default = true]
+
     # Timeout for waiting on compactor to become ACTIVE in the ring.
     # CLI flag: -compactor.ring.wait-active-instance-timeout
     [wait_active_instance_timeout: <duration> | default = 10m]
+
+  # How long shuffle sharding planner would wait before running planning code.
+  # This delay would prevent double compaction when two compactors claimed same
+  # partition in grouper at same time.
+  # CLI flag: -compactor.sharding-planner-delay
+  [sharding_planner_delay: <duration> | default = 10s]
+
+  # The compaction strategy to use. Supported values are: default, partitioning.
+  # CLI flag: -compactor.compaction-strategy
+  [compaction_strategy: <string> | default = "default"]
+
+  # How long compaction visit marker file should be considered as expired and
+  # able to be picked up by compactor again.
+  # CLI flag: -compactor.compaction-visit-marker-timeout
+  [compaction_visit_marker_timeout: <duration> | default = 10m]
+
+  # How frequently compaction visit marker file should be updated duration
+  # compaction.
+  # CLI flag: -compactor.compaction-visit-marker-file-update-interval
+  [compaction_visit_marker_file_update_interval: <duration> | default = 1m]
+
+  # How long cleaner visit marker file should be considered as expired and able
+  # to be picked up by cleaner again. The value should be smaller than
+  # -compactor.cleanup-interval
+  # CLI flag: -compactor.cleaner-visit-marker-timeout
+  [cleaner_visit_marker_timeout: <duration> | default = 10m]
+
+  # How frequently cleaner visit marker file should be updated when cleaning
+  # user.
+  # CLI flag: -compactor.cleaner-visit-marker-file-update-interval
+  [cleaner_visit_marker_file_update_interval: <duration> | default = 5m]
+
+  # When enabled, index verification will ignore out of order label names.
+  # CLI flag: -compactor.accept-malformed-index
+  [accept_malformed_index: <boolean> | default = false]
+
+  # When enabled, caching bucket will be used for compactor, except cleaner
+  # service, which serves as the source of truth for block status
+  # CLI flag: -compactor.caching-bucket-enabled
+  [caching_bucket_enabled: <boolean> | default = false]
+
+  # When enabled, caching bucket will be used for cleaner
+  # CLI flag: -compactor.cleaner-caching-bucket-enabled
+  [cleaner_caching_bucket_enabled: <boolean> | default = false]
 ```

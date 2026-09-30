@@ -6,8 +6,8 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/prometheus/storage"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 
-	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/util"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
@@ -35,13 +35,13 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 		errors := make(chan error)
 		for i, qr := range req.Queries {
 			go func(i int, qr *client.QueryRequest) {
-				from, to, matchers, err := client.FromQueryRequest(qr)
+				from, to, matchers, err := client.FromQueryRequest(storecache.NoopMatchersCache, qr)
 				if err != nil {
 					errors <- err
 					return
 				}
 
-				querier, err := q.Querier(ctx, int64(from), int64(to))
+				querier, err := q.Querier(int64(from), int64(to))
 				if err != nil {
 					errors <- err
 					return
@@ -51,8 +51,8 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 					Start: int64(from),
 					End:   int64(to),
 				}
-				seriesSet := querier.Select(false, params, matchers...)
-				resp.Results[i], err = seriesSetToQueryResponse(seriesSet)
+				seriesSet := querier.Select(ctx, false, params, matchers...)
+				resp.Results[i], err = client.SeriesSetToQueryResponse(seriesSet)
 				errors <- err
 			}(i, qr)
 		}
@@ -73,30 +73,4 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 			level.Error(logger).Log("msg", "error sending remote read response", "err", err)
 		}
 	})
-}
-
-func seriesSetToQueryResponse(s storage.SeriesSet) (*client.QueryResponse, error) {
-	result := &client.QueryResponse{}
-
-	for s.Next() {
-		series := s.At()
-		samples := []cortexpb.Sample{}
-		it := series.Iterator()
-		for it.Next() {
-			t, v := it.At()
-			samples = append(samples, cortexpb.Sample{
-				TimestampMs: t,
-				Value:       v,
-			})
-		}
-		if err := it.Err(); err != nil {
-			return nil, err
-		}
-		result.Timeseries = append(result.Timeseries, cortexpb.TimeSeries{
-			Labels:  cortexpb.FromLabelsToLabelAdapters(series.Labels()),
-			Samples: samples,
-		})
-	}
-
-	return result, s.Err()
 }

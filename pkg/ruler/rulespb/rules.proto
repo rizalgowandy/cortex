@@ -5,7 +5,7 @@ package rules;
 
 option go_package = "rulespb";
 
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "gogoproto/gogo.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/any.proto";
 import "github.com/cortexproject/cortex/pkg/cortexpb/cortex.proto";
@@ -27,6 +27,16 @@ message RuleGroupDesc {
   // to create custom `ManagerOpts` based on rule configs which can then be passed
   // to the Prometheus Manager.
   repeated google.protobuf.Any options = 9;
+  int64 limit =10;
+  google.protobuf.Duration queryOffset = 11
+      [(gogoproto.nullable) = true, (gogoproto.stdduration) = true];
+  repeated cortexpb.LabelPair labels = 12 [
+    (gogoproto.nullable) = false,
+    (gogoproto.customtype) = "github.com/cortexproject/cortex/pkg/cortexpb.LabelAdapter"
+  ];
+  // Tenants whose data is queried when evaluating this group. Empty means the
+  // owning tenant only. Non-empty makes this a federated rule group.
+  repeated string source_tenants = 13;
 }
 
 // RuleDesc is a proto representation of a Prometheus Rule
@@ -44,4 +54,5 @@ message RuleDesc {
     (gogoproto.nullable) = false,
     (gogoproto.customtype) = "github.com/cortexproject/cortex/pkg/cortexpb.LabelAdapter"
   ];
+  google.protobuf.Duration keepFiringFor = 13 [(gogoproto.nullable) = false,(gogoproto.stdduration) = true, (gogoproto.jsontag) = "keep_firing_for"];
 }
